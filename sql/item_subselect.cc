@@ -36,6 +36,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -53,6 +54,7 @@
 #include "scope_guard.h"
 #include "sql-common/my_decimal.h"
 #include "sql/check_stack.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/current_thd.h"  // current_thd
 #include "sql/debug_sync.h"   // DEBUG_SYNC
 #include "sql/derror.h"       // ER_THD
@@ -94,6 +96,7 @@
 #include "sql/temp_table_param.h"
 #include "sql/thd_raii.h"
 #include "sql/window.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql_string.h"
 #include "string_with_len.h"
 #include "template_utils.h"
@@ -102,6 +105,130 @@ class Json_wrapper;
 
 static const enum_walk walk_options =
     enum_walk::PREFIX | enum_walk::POSTFIX | enum_walk::SUBQUERY;
+
+namespace {
+
+constexpr size_t kWzgSubqueryMaxExpressionBytes = 512;
+
+std::string wzg_subquery_clip(std::string value, size_t max_bytes) {
+  if (value.size() <= max_bytes) return value;
+  value.resize(max_bytes);
+  value.append("...");
+  return value;
+}
+
+std::string wzg_subquery_to_string(ha_rows value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
+}
+
+std::string wzg_subquery_sql(THD *thd, Query_expression *unit) {
+  if (unit == nullptr) return "未知";
+  char buffer[1024];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  unit->print(thd, &text, QT_ORDINARY);
+  return wzg_subquery_clip(std::string(text.ptr(), text.length()),
+                           kWzgSubqueryMaxExpressionBytes);
+}
+
+const char *wzg_subquery_type_text(Item_subselect::Subquery_type type) {
+  switch (type) {
+    case Item_subselect::SCALAR_SUBQUERY:
+      return "标量子查询";
+    case Item_subselect::EXISTS_SUBQUERY:
+      return "EXISTS 子查询";
+    case Item_subselect::IN_SUBQUERY:
+      return "IN 子查询";
+    case Item_subselect::ALL_SUBQUERY:
+      return "ALL 子查询";
+    case Item_subselect::ANY_SUBQUERY:
+      return "ANY/SOME 子查询";
+  }
+  return "未知子查询";
+}
+
+const char *wzg_subquery_engine_text(Item_subselect::enum_engine_type type) {
+  switch (type) {
+    case Item_subselect::OTHER_ENGINE:
+      return "普通子查询执行";
+    case Item_subselect::INDEXSUBQUERY_ENGINE:
+      return "index subquery engine";
+    case Item_subselect::HASH_SJ_ENGINE:
+      return "hash semi-join / 子查询物化";
+  }
+  return "未知执行方式";
+}
+
+std::uint64_t wzg_subquery_select_number(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  return query_block == nullptr ? 0
+                                : static_cast<std::uint64_t>(
+                                      query_block->select_number);
+}
+
+std::uint64_t wzg_subquery_outer_select_number(Query_expression *unit) {
+  Query_block *outer = unit == nullptr ? nullptr : unit->outer_query_block();
+  return outer == nullptr ? 0 : static_cast<std::uint64_t>(outer->select_number);
+}
+
+void wzg_emit_executor_subquery_start(THD *thd, Item_subselect *item,
+                                      const char *execution_mode,
+                                      const char *result_destination) {
+  if (item == nullptr) return;
+  Query_expression *unit = item->query_expr();
+  WZG_PROBE_EVENT(thd, "executor.subquery_start")
+      .message("开始执行子查询，准备生成外层查询可使用的判断结果")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("subquery_type", wzg_subquery_type_text(item->subquery_type()))
+      .field("subquery_number", wzg_subquery_select_number(unit))
+      .field("parent_query_number", wzg_subquery_outer_select_number(unit))
+      .field("execution_mode",
+             execution_mode == nullptr ? wzg_subquery_engine_text(item->engine_type())
+                                       : execution_mode)
+      .field("subquery_sql", wzg_subquery_sql(thd, unit))
+      .field("result_destination",
+             result_destination == nullptr ? "返回给外层查询继续判断"
+                                           : result_destination)
+      .field("next_step", "执行子查询内部计划，读取需要的表并产生匹配结果")
+      .emit();
+}
+
+void wzg_emit_executor_subquery_finish(THD *thd, Item_subselect *item,
+                                       const char *execution_mode,
+                                       const char *result_destination,
+                                       const char *match_result, bool error) {
+  if (item == nullptr) return;
+  Query_expression *unit = item->query_expr();
+  JOIN *join = unit == nullptr || unit->first_query_block() == nullptr
+                   ? nullptr
+                   : unit->first_query_block()->join;
+  WZG_PROBE_EVENT(thd, "executor.subquery_finish")
+      .message(error ? "子查询执行结束，但执行过程中出现错误或被中断"
+                     : "子查询执行完成，结果已交给外层查询使用")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("subquery_type", wzg_subquery_type_text(item->subquery_type()))
+      .field("subquery_number", wzg_subquery_select_number(unit))
+      .field("parent_query_number", wzg_subquery_outer_select_number(unit))
+      .field("execution_mode",
+             execution_mode == nullptr ? wzg_subquery_engine_text(item->engine_type())
+                                       : execution_mode)
+      .field("execution_result", error ? "error" : "success")
+      .field("match_result", match_result == nullptr ? "已生成子查询判断结果"
+                                                     : match_result)
+      .field("examined_rows_from_subquery",
+             join == nullptr ? "未知" : wzg_subquery_to_string(join->examined_rows))
+      .field("sent_rows_from_subquery",
+             join == nullptr ? "未知" : wzg_subquery_to_string(join->send_records))
+      .field("result_destination",
+             result_destination == nullptr ? "返回给外层查询继续判断"
+                                           : result_destination)
+      .field("note", "这里记录子查询执行结果，不表示最终整条 SQL 已结束")
+      .emit();
+}
+
+}  // namespace
 
 /// Query result class for scalar and row subqueries
 class Query_result_scalar_subquery : public Query_result_subquery {
@@ -676,6 +803,22 @@ bool Item_subselect::exec(THD *thd) {
     out of memory or query being killed conditions.
   */
   DBUG_EXECUTE_IF("subselect_exec_fail", return true;);
+  const bool wzg_hash_subquery_engine =
+      indexsubquery_engine != nullptr &&
+      indexsubquery_engine->engine_type() ==
+          subselect_indexsubquery_engine::HASH_SJ_ENGINE;
+  if (!wzg_hash_subquery_engine)
+    wzg_emit_executor_subquery_start(thd, this, nullptr,
+                                     "返回给外层查询继续判断");
+  bool wzg_subquery_finish_emitted = false;
+  auto wzg_subquery_finish = create_scope_guard([&] {
+    if (!wzg_hash_subquery_engine && !wzg_subquery_finish_emitted) {
+      wzg_emit_executor_subquery_finish(
+          thd, this, nullptr, "返回给外层查询继续判断",
+          "子查询执行结束，外层查询将根据该结果继续判断",
+          thd->is_error() || thd->killed);
+    }
+  });
 
   /*
     Disable tracing of subquery execution if
@@ -725,11 +868,21 @@ bool Item_subselect::exec(THD *thd) {
     if (query_expr()->force_create_iterators(thd)) return true;
   }
   if (indexsubquery_engine != nullptr) {
-    return indexsubquery_engine->exec(thd);
+    const bool error = indexsubquery_engine->exec(thd);
+    if (!wzg_hash_subquery_engine)
+      wzg_emit_executor_subquery_finish(
+          thd, this, nullptr, "返回给外层查询继续判断",
+          "子查询已生成当前外层值的匹配判断结果", error);
+    wzg_subquery_finish_emitted = true;
+    return error;
   } else {
     char const *save_where = thd->where;
     const bool res = query_expr()->execute(thd);
     thd->where = save_where;
+    wzg_emit_executor_subquery_finish(
+        thd, this, nullptr, "返回给外层查询继续判断",
+        "子查询已执行完成，结果交给外层表达式使用", res);
+    wzg_subquery_finish_emitted = true;
     return res;
   }
 }
@@ -3268,6 +3421,17 @@ bool subselect_indexsubquery_engine::exec(THD *thd) {
   }
   item->m_value = found;
   item->set_value_assigned();
+  WZG_PROBE_EVENT(thd, "executor.subquery_apply")
+      .message("外层查询使用 index subquery engine 判断当前值是否有匹配行")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("subquery_number", wzg_subquery_select_number(qe))
+      .field("parent_query_number", wzg_subquery_outer_select_number(qe))
+      .field("execution_mode", "index subquery engine")
+      .field("operation", "用外层当前值到子查询表中做一次索引匹配")
+      .field("match_result", found ? "找到匹配行" : "没有找到匹配行")
+      .field("result_destination", "当前 IN/EXISTS 条件的布尔结果")
+      .field("note", "这个事件可能随外层行多次出现，表示子查询被按需执行了一次")
+      .emit();
   return false;
 }
 
@@ -3630,6 +3794,10 @@ static int safe_index_read(TABLE *table, const Index_lookup &ref) {
 
 bool subselect_hash_sj_engine::exec(THD *thd) {
   DBUG_TRACE;
+  wzg_emit_executor_subquery_start(
+      thd, item, "hash semi-join / 子查询物化",
+      is_materialized ? "复用已经生成的内部临时结果"
+                      : "先生成内部临时结果，再供外层查询匹配");
 
   /*
     Optimize and materialize the subquery during the first execution of
@@ -3645,7 +3813,12 @@ bool subselect_hash_sj_engine::exec(THD *thd) {
     // (It also triggers some unneeded setup of the RefIterator, but it is
     // cheap.)
     bool error = m_iterator->Init();
-    if (error || thd->is_fatal_error()) return true;
+    if (error || thd->is_fatal_error()) {
+      wzg_emit_executor_subquery_finish(
+          thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+          "物化子查询时发生错误", true);
+      return true;
+    }
 
     /*
       TODO:
@@ -3670,6 +3843,9 @@ bool subselect_hash_sj_engine::exec(THD *thd) {
                              /*examined_rows=*/nullptr);
       const int ret = scan.Read();
       if (ret == 1 || thd->is_error()) {
+        wzg_emit_executor_subquery_finish(
+            thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+            "检查物化结果是否为空时发生错误", true);
         return true;
       }
       has_zero_rows = (ret == -1);
@@ -3679,6 +3855,9 @@ bool subselect_hash_sj_engine::exec(THD *thd) {
   if (has_zero_rows) {
     // The correct answer is FALSE.
     item->m_value = false;
+    wzg_emit_executor_subquery_finish(
+        thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+        "物化结果为空，当前 IN 条件判断为不匹配", false);
     return false;
   }
   /*
@@ -3700,16 +3879,34 @@ bool subselect_hash_sj_engine::exec(THD *thd) {
     assert(item->left_expr->element_index(0)->is_nullable());
     assert(item->left_expr->cols() == 1);
     item->m_value = true;
+    wzg_emit_executor_subquery_finish(
+        thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+        "外层当前值为 NULL，子查询判断结果按 NULL 语义继续处理", false);
     return false;
   }
 
   m_hash = 0;
   bool found;
   if (ExecuteExistsQuery(thd, item->query_expr(), m_iterator.get(), &found)) {
+    wzg_emit_executor_subquery_finish(
+        thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+        "查询物化结果时发生错误", true);
     return true;
   }
   item->m_value = found;
   item->set_value_assigned();
+  WZG_PROBE_EVENT(thd, "executor.subquery_apply")
+      .message("外层查询正在用当前值查询子查询物化结果")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("subquery_number", wzg_subquery_select_number(item->query_expr()))
+      .field("parent_query_number",
+             wzg_subquery_outer_select_number(item->query_expr()))
+      .field("execution_mode", "hash semi-join / 子查询物化")
+      .field("operation", "到内部临时结果中检查当前外层值是否存在")
+      .field("match_result", found ? "找到匹配值" : "没有找到匹配值")
+      .field("result_destination", "当前 IN 条件的布尔结果")
+      .field("note", "物化结果可被外层多次复用")
+      .emit();
 
   if (!found &&  // no exact match
       mat_table_has_nulls != NEX_IRRELEVANT_OR_FALSE) {
@@ -3725,7 +3922,12 @@ bool subselect_hash_sj_engine::exec(THD *thd) {
       if (!table->file->inited &&
           table->file->ha_index_init(ref.key, false /* sorted */))
         return true;
-      if (safe_index_read(table, ref) == 1) return true;
+      if (safe_index_read(table, ref) == 1) {
+        wzg_emit_executor_subquery_finish(
+            thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+            "检查物化结果中的 NULL 时发生错误", true);
+        return true;
+      }
       *ref.null_ref_key = 0;  // prepare for next searches of non-NULL
       mat_table_has_nulls =
           table->has_row() ? NEX_TRUE : NEX_IRRELEVANT_OR_FALSE;
@@ -3741,6 +3943,10 @@ bool subselect_hash_sj_engine::exec(THD *thd) {
       item->m_was_null = true;
     }
   }
+  wzg_emit_executor_subquery_finish(
+      thd, item, "hash semi-join / 子查询物化", "内部临时结果",
+      found ? "物化结果中找到匹配值" : "物化结果中没有找到精确匹配值",
+      false);
   return false;
 }
 

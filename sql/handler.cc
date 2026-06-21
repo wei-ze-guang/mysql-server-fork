@@ -125,6 +125,7 @@
 #include "sql/thr_malloc.h"
 #include "sql/transaction.h"  // trans_commit_implicit
 #include "sql/transaction_info.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql/xa.h"
 #include "sql/xa/sql_cmd_xa.h"  // Sql_cmd_xa_*
 #include "sql_string.h"
@@ -221,6 +222,420 @@ using std::list;
 using std::log2;
 using std::max;
 using std::min;
+
+namespace {
+
+bool wzg_handler_should_log(const TABLE *table) {
+  THD *thd = current_thd;
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr || table->s == nullptr)
+    return false;
+  if (table->s->db.str == nullptr) return true;
+
+  std::string_view db(table->s->db.str, table->s->db.length);
+  return db != "mysql" && db != "performance_schema" &&
+         db != "information_schema" && db != "sys";
+}
+
+std::string wzg_handler_table_name(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr) return "无";
+  std::string value;
+  if (table->s->db.str != nullptr && table->s->db.length > 0) {
+    value.append(table->s->db.str, table->s->db.length);
+    value.push_back('.');
+  }
+  if (table->s->table_name.str != nullptr && table->s->table_name.length > 0)
+    value.append(table->s->table_name.str, table->s->table_name.length);
+  return value.empty() ? "<unknown>" : value;
+}
+
+std::string wzg_handler_key_parts(const KEY &key) {
+  std::string value;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (part_no > 0) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    if (part.field != nullptr && part.field->field_name != nullptr)
+      value.append(part.field->field_name);
+    else
+      value.append("<expression>");
+  }
+  return value.empty() ? "<unknown>" : value;
+}
+
+std::string wzg_handler_index_name(const TABLE *table, uint key_no) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no == MAX_KEY || key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value(key.name == nullptr ? "<unnamed>" : key.name);
+  value.push_back('(');
+  value.append(wzg_handler_key_parts(key));
+  value.push_back(')');
+  return value;
+}
+
+std::string wzg_handler_used_key_parts(const TABLE *table, uint key_no,
+                                       key_part_map keypart_map) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no == MAX_KEY || key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value;
+  key_part_map bit = 1;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (keypart_map & bit) {
+      if (!value.empty()) value.append(", ");
+      const KEY_PART_INFO &part = key.key_part[part_no];
+      if (part.field != nullptr && part.field->field_name != nullptr)
+        value.append(part.field->field_name);
+      else
+        value.append("<expression>");
+    }
+    bit <<= 1;
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_handler_keypart_map_text(key_part_map keypart_map) {
+  return std::to_string(static_cast<unsigned long long>(keypart_map));
+}
+
+std::string wzg_handler_keypart_map_meaning(const TABLE *table, uint key_no,
+                                            key_part_map keypart_map) {
+  const std::string used_parts =
+      wzg_handler_used_key_parts(table, key_no, keypart_map);
+  if (used_parts == "无") return "没有使用可识别的索引字段";
+  std::string value("表示这次查找使用索引中的字段：");
+  value.append(used_parts);
+  value.append("；复合索引中 bit=1 的位置表示对应 keypart 参与本次查找");
+  return value;
+}
+
+const char *wzg_handler_find_flag_name(enum ha_rkey_function flag) {
+  switch (flag) {
+    case HA_READ_KEY_EXACT:
+      return "HA_READ_KEY_EXACT";
+    case HA_READ_KEY_OR_NEXT:
+      return "HA_READ_KEY_OR_NEXT";
+    case HA_READ_KEY_OR_PREV:
+      return "HA_READ_KEY_OR_PREV";
+    case HA_READ_AFTER_KEY:
+      return "HA_READ_AFTER_KEY";
+    case HA_READ_BEFORE_KEY:
+      return "HA_READ_BEFORE_KEY";
+    case HA_READ_PREFIX:
+      return "HA_READ_PREFIX";
+    case HA_READ_PREFIX_LAST:
+      return "HA_READ_PREFIX_LAST";
+    case HA_READ_PREFIX_LAST_OR_PREV:
+      return "HA_READ_PREFIX_LAST_OR_PREV";
+    case HA_READ_MBR_CONTAIN:
+      return "HA_READ_MBR_CONTAIN";
+    case HA_READ_MBR_INTERSECT:
+      return "HA_READ_MBR_INTERSECT";
+    case HA_READ_MBR_WITHIN:
+      return "HA_READ_MBR_WITHIN";
+    case HA_READ_MBR_DISJOINT:
+      return "HA_READ_MBR_DISJOINT";
+    case HA_READ_MBR_EQUAL:
+      return "HA_READ_MBR_EQUAL";
+    case HA_READ_NEAREST_NEIGHBOR:
+      return "HA_READ_NEAREST_NEIGHBOR";
+    case HA_READ_INVALID:
+      return "HA_READ_INVALID";
+  }
+  return "UNKNOWN_HA_READ_FLAG";
+}
+
+const char *wzg_handler_find_flag_meaning(enum ha_rkey_function flag) {
+  switch (flag) {
+    case HA_READ_KEY_EXACT:
+      return "要求存储引擎定位到 key 完全等于查找值的记录";
+    case HA_READ_KEY_OR_NEXT:
+      return "定位到等于 key 的记录；如果没有正好相等，则定位到下一条更大的记录";
+    case HA_READ_KEY_OR_PREV:
+      return "定位到等于 key 的记录；如果没有正好相等，则定位到上一条更小的记录";
+    case HA_READ_AFTER_KEY:
+      return "定位到严格大于 key 的下一条记录";
+    case HA_READ_BEFORE_KEY:
+      return "定位到严格小于 key 的上一条记录";
+    case HA_READ_PREFIX:
+      return "按 key 前缀查找第一条匹配记录";
+    case HA_READ_PREFIX_LAST:
+      return "按 key 前缀查找最后一条匹配记录";
+    case HA_READ_PREFIX_LAST_OR_PREV:
+      return "按 key 前缀查找最后一条匹配记录；没有匹配时定位到前一条";
+    case HA_READ_MBR_CONTAIN:
+    case HA_READ_MBR_INTERSECT:
+    case HA_READ_MBR_WITHIN:
+    case HA_READ_MBR_DISJOINT:
+    case HA_READ_MBR_EQUAL:
+      return "空间索引 MBR 条件查找";
+    case HA_READ_NEAREST_NEIGHBOR:
+      return "向量或近邻索引查找，要求返回距离最近的候选记录";
+    case HA_READ_INVALID:
+      return "无效读取标记";
+  }
+  return "未知读取标记";
+}
+
+std::string wzg_handler_return_code_text(int result) {
+  switch (result) {
+    case 0:
+      return "0";
+    case HA_ERR_KEY_NOT_FOUND:
+      return "HA_ERR_KEY_NOT_FOUND";
+    case HA_ERR_END_OF_FILE:
+      return "HA_ERR_END_OF_FILE";
+    case HA_ERR_RECORD_DELETED:
+      return "HA_ERR_RECORD_DELETED";
+    case HA_ERR_FOUND_DUPP_KEY:
+      return "HA_ERR_FOUND_DUPP_KEY";
+    default:
+      return std::to_string(result);
+  }
+}
+
+const char *wzg_handler_return_meaning(int result) {
+  switch (result) {
+    case 0:
+      return "找到一行；存储引擎已经把记录写入传入的 record buffer";
+    case HA_ERR_KEY_NOT_FOUND:
+      return "没有找到匹配 key 的记录；索引游标可能已经定位到附近位置";
+    case HA_ERR_END_OF_FILE:
+      return "没有可返回的记录，已经到达索引或范围末尾";
+    case HA_ERR_RECORD_DELETED:
+      return "读到的内部记录已删除，SQL 层通常会继续尝试下一条";
+    case HA_ERR_FOUND_DUPP_KEY:
+      return "发现重复 key，常见于写入或唯一性检查路径";
+    default:
+      return "非 0 状态码，表示存储引擎返回了错误或特殊状态";
+  }
+}
+
+const char *wzg_handler_next_step(int result) {
+  switch (result) {
+    case 0:
+      return "SQL 层从 record buffer 读取字段，继续过滤、JOIN 或返回客户端";
+    case HA_ERR_KEY_NOT_FOUND:
+      return "SQL 层认为这次索引查找没有匹配行";
+    case HA_ERR_END_OF_FILE:
+      return "SQL 层停止当前索引读取或范围扫描";
+    default:
+      return "SQL 层进入对应的错误或特殊状态处理路径";
+  }
+}
+
+std::string wzg_handler_range_key_buffer_text(const key_range *range) {
+  if (range == nullptr) return "无边界";
+  if (range->key == nullptr) return "空 key 指针";
+  return "二进制 key 缓冲区，存放按索引字段类型和存储格式编码后的范围边界值";
+}
+
+std::string wzg_handler_range_length_text(const key_range *range) {
+  if (range == nullptr) return "0";
+  return std::to_string(range->length);
+}
+
+std::string wzg_handler_range_keypart_map_text(const key_range *range) {
+  if (range == nullptr) return "0";
+  return wzg_handler_keypart_map_text(range->keypart_map);
+}
+
+std::string wzg_handler_range_keypart_map_meaning(const TABLE *table,
+                                                  uint key_no,
+                                                  const key_range *range) {
+  if (range == nullptr) return "没有这个范围边界";
+  return wzg_handler_keypart_map_meaning(table, key_no, range->keypart_map);
+}
+
+std::string wzg_handler_range_flag_text(const key_range *range) {
+  if (range == nullptr) return "无";
+  return wzg_handler_find_flag_name(range->flag);
+}
+
+std::string wzg_handler_range_flag_meaning(const key_range *range,
+                                           bool is_start_key) {
+  if (range == nullptr)
+    return is_start_key ? "没有下界，范围从索引开头开始"
+                        : "没有上界，范围一直读到索引末尾或扫描停止";
+  return wzg_handler_find_flag_meaning(range->flag);
+}
+
+const char *wzg_handler_eq_range_meaning(bool eq_range) {
+  return eq_range ? "这是等值范围；后续读取会继续取相同 key 的记录"
+                  : "这不是等值范围；后续读取会向后扫描并检查是否超过 end_key";
+}
+
+const char *wzg_handler_sorted_meaning(bool sorted) {
+  return sorted ? "调用方希望按索引顺序读取范围结果"
+                : "调用方不要求 handler 额外保证范围结果顺序";
+}
+
+std::string wzg_handler_range_flags_text(uint flags) {
+  if (flags == 0) return "无特殊标记";
+  std::string value;
+  auto append_flag = [&value, flags](uint bit, const char *name) {
+    if (!(flags & bit)) return;
+    if (!value.empty()) value.append(", ");
+    value.append(name);
+  };
+  append_flag(NO_MIN_RANGE, "NO_MIN_RANGE");
+  append_flag(NO_MAX_RANGE, "NO_MAX_RANGE");
+  append_flag(NEAR_MIN, "NEAR_MIN");
+  append_flag(NEAR_MAX, "NEAR_MAX");
+  append_flag(UNIQUE_RANGE, "UNIQUE_RANGE");
+  append_flag(EQ_RANGE, "EQ_RANGE");
+  append_flag(NULL_RANGE, "NULL_RANGE");
+  append_flag(GEOM_FLAG, "GEOM_FLAG");
+  append_flag(SKIP_RANGE, "SKIP_RANGE");
+  append_flag(SKIP_RECORDS_IN_RANGE, "SKIP_RECORDS_IN_RANGE");
+  append_flag(DESC_FLAG, "DESC_FLAG");
+  return value.empty() ? std::to_string(flags) : value;
+}
+
+std::string wzg_handler_range_flags_meaning(uint flags) {
+  if (flags == 0) return "这是普通索引范围，没有额外边界或去重标记";
+  std::string value;
+  auto append_text = [&value](const char *text) {
+    if (!value.empty()) value.append("；");
+    value.append(text);
+  };
+  if (flags & NO_MIN_RANGE) append_text("没有下界，从索引开头方向开始");
+  if (flags & NO_MAX_RANGE) append_text("没有上界，读到索引末尾方向");
+  if (flags & NEAR_MIN) append_text("不包含左边界值");
+  if (flags & NEAR_MAX) append_text("不包含右边界值");
+  if (flags & UNIQUE_RANGE) append_text("唯一索引上的等值范围，最多命中一行");
+  if (flags & EQ_RANGE) append_text("等值范围，边界来自 key = 常量这一类条件");
+  if (flags & NULL_RANGE) append_text("范围中包含 IS NULL 条件");
+  if (flags & GEOM_FLAG) append_text("空间索引范围条件");
+  if (flags & SKIP_RANGE) append_text("调用方要求跳过这个范围");
+  if (flags & SKIP_RECORDS_IN_RANGE)
+    append_text("优化器允许用统计信息估算，不一定逐条探测范围");
+  if (flags & DESC_FLAG) append_text("按降序索引方向扫描");
+  return value;
+}
+
+void wzg_emit_handler_index_read_start(TABLE *table, const char *api,
+                                       uint key_no, const uchar *key,
+                                       key_part_map keypart_map,
+                                       enum ha_rkey_function find_flag) {
+  if (!wzg_handler_should_log(table)) return;
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "handler.index_read_start")
+      .message("SQL 层正在请求存储引擎按索引 key 定位记录")
+      .field("handler_api", api)
+      .field("table", wzg_handler_table_name(table))
+      .field("index", wzg_handler_index_name(table, key_no))
+      .field("key_buffer",
+             key == nullptr
+                 ? "空 key 指针"
+                 : "二进制 key 缓冲区，存放按索引字段类型和存储格式编码后的查找值")
+      .field("key_buffer_readable", "暂未解码；可结合上游 executor.ref_lookup_key 查看 SQL 表达式")
+      .field("keypart_map", wzg_handler_keypart_map_text(keypart_map))
+      .field("keypart_map_meaning",
+             wzg_handler_keypart_map_meaning(table, key_no, keypart_map))
+      .field("find_flag", wzg_handler_find_flag_name(find_flag))
+      .field("find_flag_meaning", wzg_handler_find_flag_meaning(find_flag))
+      .field("return_type", "int 状态码")
+      .field("return_contract",
+             "0=成功读到一行；HA_ERR_KEY_NOT_FOUND=没有匹配 key；HA_ERR_END_OF_FILE=读到末尾；其他非 0=读取错误或特殊状态")
+      .field("record_buffer",
+             "buf 参数，通常是 table->record[0]；成功时存储引擎会把当前行写入这里")
+      .field("next_step", "调用具体存储引擎的 index_read_map/index_read_idx_map 实现")
+      .emit();
+}
+
+void wzg_emit_handler_index_read_finish(TABLE *table, const char *api,
+                                        uint key_no, int result) {
+  if (!wzg_handler_should_log(table)) return;
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "handler.index_read_finish")
+      .message(result == 0 ? "存储引擎索引读取调用已返回，并找到一行"
+                           : "存储引擎索引读取调用已返回，但没有产生可用行或返回了错误")
+      .field("handler_api", api)
+      .field("table", wzg_handler_table_name(table))
+      .field("index", wzg_handler_index_name(table, key_no))
+      .field("return_code", wzg_handler_return_code_text(result))
+      .field("return_meaning", wzg_handler_return_meaning(result))
+      .field("record_buffer", "buf 参数 / table->record[0]")
+      .field("record_buffer_status",
+             result == 0 ? "已填充当前行" : "没有新的有效行可供 SQL 层读取")
+      .field("return_type", "int 状态码")
+      .field("next_step", wzg_handler_next_step(result))
+      .emit();
+}
+
+void wzg_emit_handler_range_read_start(TABLE *table, const char *api,
+                                       const key_range *start_key,
+                                       const key_range *end_key, bool eq_range,
+                                       bool sorted, uint range_flags) {
+  if (!wzg_handler_should_log(table)) return;
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "handler.range_read_start")
+      .message("SQL 层正在请求存储引擎按索引范围读取第一行")
+      .field("handler_api", api)
+      .field("table", wzg_handler_table_name(table))
+      .field("index", wzg_handler_index_name(table, table->file->active_index))
+      .field("start_key", wzg_handler_range_key_buffer_text(start_key))
+      .field("start_key_meaning", "范围下界；决定从索引的哪个位置开始读")
+      .field("start_key_length_bytes", wzg_handler_range_length_text(start_key))
+      .field("start_keypart_map", wzg_handler_range_keypart_map_text(start_key))
+      .field("start_keypart_map_meaning",
+             wzg_handler_range_keypart_map_meaning(
+                 table, table->file->active_index, start_key))
+      .field("start_find_flag", wzg_handler_range_flag_text(start_key))
+      .field("start_find_flag_meaning",
+             wzg_handler_range_flag_meaning(start_key, true))
+      .field("end_key", wzg_handler_range_key_buffer_text(end_key))
+      .field("end_key_meaning", "范围上界；SQL 层会用它判断读取是否已经越界")
+      .field("end_key_length_bytes", wzg_handler_range_length_text(end_key))
+      .field("end_keypart_map", wzg_handler_range_keypart_map_text(end_key))
+      .field("end_keypart_map_meaning",
+             wzg_handler_range_keypart_map_meaning(
+                 table, table->file->active_index, end_key))
+      .field("end_find_flag", wzg_handler_range_flag_text(end_key))
+      .field("end_find_flag_meaning",
+             wzg_handler_range_flag_meaning(end_key, false))
+      .field("eq_range", eq_range ? "true" : "false")
+      .field("eq_range_meaning", wzg_handler_eq_range_meaning(eq_range))
+      .field("sorted", sorted ? "true" : "false")
+      .field("sorted_meaning", wzg_handler_sorted_meaning(sorted))
+      .field("range_flags", wzg_handler_range_flags_text(range_flags))
+      .field("range_flags_meaning",
+             wzg_handler_range_flags_meaning(range_flags))
+      .field("return_type", "int 状态码")
+      .field("return_contract",
+             "0=成功读到范围内第一行；HA_ERR_END_OF_FILE=范围内没有行或已经越界；其他非 0=读取错误或特殊状态")
+      .field("record_buffer",
+             "table->record[0]；成功时存储引擎会把范围内第一行写入这里")
+      .field("next_step",
+             "handler 先按 start_key 定位索引游标，再用 end_key 检查这一行是否仍在范围内")
+      .emit();
+}
+
+void wzg_emit_handler_range_read_finish(TABLE *table, const char *api,
+                                        int result) {
+  if (!wzg_handler_should_log(table)) return;
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "handler.range_read_finish")
+      .message(result == 0 ? "存储引擎范围读取调用已返回，并找到范围内第一行"
+                           : "存储引擎范围读取调用已返回，但范围内没有可用行或返回了错误")
+      .field("handler_api", api)
+      .field("table", wzg_handler_table_name(table))
+      .field("index", wzg_handler_index_name(table, table->file->active_index))
+      .field("return_code", wzg_handler_return_code_text(result))
+      .field("return_meaning", wzg_handler_return_meaning(result))
+      .field("record_buffer", "table->record[0]")
+      .field("record_buffer_status",
+             result == 0 ? "已填充范围内第一行"
+                         : "没有新的有效行可供 SQL 层读取")
+      .field("return_type", "int 状态码")
+      .field("next_step", wzg_handler_next_step(result))
+      .emit();
+}
+
+}  // namespace
 
 /**
   While we have legacy_db_type, we have this array to
@@ -3284,6 +3699,8 @@ int handler::ha_index_read_map(uchar *buf, const uchar *key,
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
 
+  wzg_emit_handler_index_read_start(table, "ha_index_read_map", active_index,
+                                    key, keypart_map, find_flag);
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_FETCH_ROW, active_index, result, {
     result = index_read_map(buf, key, keypart_map, find_flag);
   })
@@ -3299,6 +3716,8 @@ int handler::ha_index_read_map(uchar *buf, const uchar *key,
     result = HA_ERR_KEY_NOT_FOUND;
 
   table->set_row_status_from_handler(result);
+  wzg_emit_handler_index_read_finish(table, "ha_index_read_map", active_index,
+                                     result);
   return result;
 }
 
@@ -3345,6 +3764,8 @@ int handler::ha_index_read_idx_map(uchar *buf, uint index, const uchar *key,
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
 
+  wzg_emit_handler_index_read_start(table, "ha_index_read_idx_map", index, key,
+                                    keypart_map, find_flag);
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_FETCH_ROW, index, result, {
     result = index_read_idx_map(buf, index, key, keypart_map, find_flag);
   })
@@ -3353,6 +3774,8 @@ int handler::ha_index_read_idx_map(uchar *buf, uint index, const uchar *key,
     m_update_generated_read_fields = false;
   }
   table->set_row_status_from_handler(result);
+  wzg_emit_handler_index_read_finish(table, "ha_index_read_idx_map", index,
+                                     result);
   assert(inited == NONE);
   return result;
 }
@@ -6550,11 +6973,20 @@ int handler::multi_range_read_next(char **range_info) {
     /* Try the next range(s) until one matches a record. */
     while (!(range_res = mrr_funcs.next(mrr_iter, &mrr_cur_range))) {
     scan_it_again:
-      result = read_range_first(
+      const key_range *start_key =
           mrr_cur_range.start_key.keypart_map ? &mrr_cur_range.start_key
-                                              : nullptr,
-          mrr_cur_range.end_key.keypart_map ? &mrr_cur_range.end_key : nullptr,
-          mrr_cur_range.range_flag & EQ_RANGE, mrr_is_output_sorted);
+                                              : nullptr;
+      const key_range *end_key =
+          mrr_cur_range.end_key.keypart_map ? &mrr_cur_range.end_key : nullptr;
+      wzg_emit_handler_range_read_start(
+          table, "multi_range_read_next/read_range_first", start_key, end_key,
+          mrr_cur_range.range_flag & EQ_RANGE, mrr_is_output_sorted,
+          mrr_cur_range.range_flag);
+      result = read_range_first(
+          start_key, end_key, mrr_cur_range.range_flag & EQ_RANGE,
+          mrr_is_output_sorted);
+      wzg_emit_handler_range_read_finish(
+          table, "multi_range_read_next/read_range_first", result);
       if (result != HA_ERR_END_OF_FILE) break;
     }
   } while (((result == HA_ERR_END_OF_FILE) ||
@@ -7427,6 +7859,9 @@ int handler::ha_read_range_first(const key_range *start_key,
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
 
+  wzg_emit_handler_range_read_start(table, "ha_read_range_first", start_key,
+                                    end_key, eq_range, sorted,
+                                    eq_range ? EQ_RANGE : 0);
   result = read_range_first(start_key, end_key, eq_range, sorted);
   if (!result && m_update_generated_read_fields) {
     result =
@@ -7434,6 +7869,7 @@ int handler::ha_read_range_first(const key_range *start_key,
     m_update_generated_read_fields = false;
   }
   table->set_row_status_from_handler(result);
+  wzg_emit_handler_range_read_finish(table, "ha_read_range_first", result);
   return result;
 }
 

@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "mem_root_deque.h"
@@ -33,6 +35,7 @@
 #include "my_dbug.h"
 #include "mysql/components/services/bits/psi_bits.h"
 #include "prealloced_array.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/field.h"
 #include "sql/filesort.h"
 #include "sql/handler.h"
@@ -64,6 +67,7 @@
 #include "sql/range_optimizer/index_range_scan.h"
 #include "sql/range_optimizer/index_skip_scan.h"
 #include "sql/range_optimizer/index_skip_scan_plan.h"
+#include "sql/range_optimizer/internal.h"
 #include "sql/range_optimizer/range_optimizer.h"
 #include "sql/range_optimizer/reverse_index_range_scan.h"
 #include "sql/range_optimizer/rowid_ordered_retrieval.h"
@@ -78,6 +82,7 @@
 #include "sql/system_variables.h"
 #include "sql/table.h"
 #include "sql/visible_fields.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "template_utils.h"
 
 using pack_rows::TableCollection;
@@ -417,6 +422,1435 @@ struct IteratorToBeCreated {
             mem_root, num_children);
   }
 };
+
+std::string WzgIteratorDoubleToString(double value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
+}
+
+std::string WzgIteratorTableName(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr) return "无";
+  std::string value;
+  if (table->s->db.str != nullptr && table->s->db.length > 0) {
+    value.append(table->s->db.str, table->s->db.length);
+    value.push_back('.');
+  }
+  if (table->s->table_name.str != nullptr && table->s->table_name.length > 0)
+    value.append(table->s->table_name.str, table->s->table_name.length);
+  return value.empty() ? "<unknown>" : value;
+}
+
+std::string WzgIteratorKeyParts(const KEY &key) {
+  std::string value;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (part_no > 0) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    if (part.field != nullptr && part.field->field_name != nullptr)
+      value.append(part.field->field_name);
+    else
+      value.append("<expression>");
+  }
+  return value.empty() ? "<unknown>" : value;
+}
+
+std::string WzgIteratorIndexName(const TABLE *table, uint key_no) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no == MAX_KEY || key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value(key.name == nullptr ? "<unnamed>" : key.name);
+  value.push_back('(');
+  value.append(WzgIteratorKeyParts(key));
+  value.push_back(')');
+  return value;
+}
+
+const char *WzgIteratorAccessPathName(AccessPath::Type type) {
+  switch (type) {
+    case AccessPath::TABLE_SCAN:
+      return "TABLE_SCAN";
+    case AccessPath::SAMPLE_SCAN:
+      return "SAMPLE_SCAN";
+    case AccessPath::INDEX_SCAN:
+      return "INDEX_SCAN";
+    case AccessPath::INDEX_DISTANCE_SCAN:
+      return "INDEX_DISTANCE_SCAN";
+    case AccessPath::REF:
+      return "REF";
+    case AccessPath::REF_OR_NULL:
+      return "REF_OR_NULL";
+    case AccessPath::EQ_REF:
+      return "EQ_REF";
+    case AccessPath::PUSHED_JOIN_REF:
+      return "PUSHED_JOIN_REF";
+    case AccessPath::FULL_TEXT_SEARCH:
+      return "FULL_TEXT_SEARCH";
+    case AccessPath::CONST_TABLE:
+      return "CONST_TABLE";
+    case AccessPath::MRR:
+      return "MRR";
+    case AccessPath::FOLLOW_TAIL:
+      return "FOLLOW_TAIL";
+    case AccessPath::INDEX_RANGE_SCAN:
+      return "INDEX_RANGE_SCAN";
+    case AccessPath::INDEX_MERGE:
+      return "INDEX_MERGE";
+    case AccessPath::ROWID_INTERSECTION:
+      return "ROWID_INTERSECTION";
+    case AccessPath::ROWID_UNION:
+      return "ROWID_UNION";
+    case AccessPath::INDEX_SKIP_SCAN:
+      return "INDEX_SKIP_SCAN";
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      return "GROUP_INDEX_SKIP_SCAN";
+    case AccessPath::DYNAMIC_INDEX_RANGE_SCAN:
+      return "DYNAMIC_INDEX_RANGE_SCAN";
+    case AccessPath::TABLE_VALUE_CONSTRUCTOR:
+      return "TABLE_VALUE_CONSTRUCTOR";
+    case AccessPath::FAKE_SINGLE_ROW:
+      return "FAKE_SINGLE_ROW";
+    case AccessPath::ZERO_ROWS:
+      return "ZERO_ROWS";
+    case AccessPath::ZERO_ROWS_AGGREGATED:
+      return "ZERO_ROWS_AGGREGATED";
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      return "MATERIALIZED_TABLE_FUNCTION";
+    case AccessPath::UNQUALIFIED_COUNT:
+      return "UNQUALIFIED_COUNT";
+    case AccessPath::NESTED_LOOP_JOIN:
+      return "NESTED_LOOP_JOIN";
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      return "NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL";
+    case AccessPath::BKA_JOIN:
+      return "BKA_JOIN";
+    case AccessPath::HASH_JOIN:
+      return "HASH_JOIN";
+    case AccessPath::FILTER:
+      return "FILTER";
+    case AccessPath::SORT:
+      return "SORT";
+    case AccessPath::AGGREGATE:
+      return "AGGREGATE";
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      return "TEMPTABLE_AGGREGATE";
+    case AccessPath::LIMIT_OFFSET:
+      return "LIMIT_OFFSET";
+    case AccessPath::STREAM:
+      return "STREAM";
+    case AccessPath::MATERIALIZE:
+      return "MATERIALIZE";
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      return "MATERIALIZE_INFORMATION_SCHEMA_TABLE";
+    case AccessPath::APPEND:
+      return "APPEND";
+    case AccessPath::WINDOW:
+      return "WINDOW";
+    case AccessPath::WEEDOUT:
+      return "WEEDOUT";
+    case AccessPath::REMOVE_DUPLICATES:
+      return "REMOVE_DUPLICATES";
+    case AccessPath::REMOVE_DUPLICATES_ON_INDEX:
+      return "REMOVE_DUPLICATES_ON_INDEX";
+    case AccessPath::ALTERNATIVE:
+      return "ALTERNATIVE";
+    case AccessPath::CACHE_INVALIDATOR:
+      return "CACHE_INVALIDATOR";
+    case AccessPath::DELETE_ROWS:
+      return "DELETE_ROWS";
+    case AccessPath::UPDATE_ROWS:
+      return "UPDATE_ROWS";
+  }
+  return "UNKNOWN";
+}
+
+const char *WzgIteratorReadableName(AccessPath::Type type) {
+  switch (type) {
+    case AccessPath::TABLE_SCAN:
+      return "全表扫描读取器";
+    case AccessPath::INDEX_SCAN:
+      return "索引扫描读取器";
+    case AccessPath::INDEX_DISTANCE_SCAN:
+      return "向量距离索引读取器";
+    case AccessPath::REF:
+      return "普通索引匹配读取器";
+    case AccessPath::REF_OR_NULL:
+      return "索引匹配或 NULL 读取器";
+    case AccessPath::EQ_REF:
+      return "唯一索引匹配读取器";
+    case AccessPath::PUSHED_JOIN_REF:
+      return "下推 JOIN 索引读取器";
+    case AccessPath::FULL_TEXT_SEARCH:
+      return "全文索引读取器";
+    case AccessPath::CONST_TABLE:
+      return "常量表读取器";
+    case AccessPath::MRR:
+      return "Multi-Range Read 批量读取器";
+    case AccessPath::FOLLOW_TAIL:
+      return "递归查询增量读取器";
+    case AccessPath::INDEX_RANGE_SCAN:
+      return "索引范围读取器";
+    case AccessPath::INDEX_MERGE:
+      return "多个索引合并读取器";
+    case AccessPath::ROWID_INTERSECTION:
+      return "多个索引取交集读取器";
+    case AccessPath::ROWID_UNION:
+      return "多个索引取并集读取器";
+    case AccessPath::INDEX_SKIP_SCAN:
+      return "索引 skip scan 读取器";
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      return "GROUP BY 索引 skip scan 读取器";
+    case AccessPath::DYNAMIC_INDEX_RANGE_SCAN:
+      return "动态索引范围读取器";
+    case AccessPath::NESTED_LOOP_JOIN:
+      return "嵌套循环 JOIN 读取器";
+    case AccessPath::HASH_JOIN:
+      return "Hash Join 读取器";
+    case AccessPath::FILTER:
+      return "过滤条件读取器";
+    case AccessPath::SORT:
+      return "排序读取器";
+    case AccessPath::MATERIALIZE:
+      return "物化中间结果读取器";
+    case AccessPath::STREAM:
+      return "流式写入临时结果读取器";
+    case AccessPath::LIMIT_OFFSET:
+      return "LIMIT/OFFSET 读取器";
+    case AccessPath::AGGREGATE:
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      return "聚合读取器";
+    case AccessPath::WINDOW:
+      return "窗口函数读取器";
+    case AccessPath::TABLE_VALUE_CONSTRUCTOR:
+      return "VALUES 行构造读取器";
+    case AccessPath::FAKE_SINGLE_ROW:
+      return "单行虚拟读取器";
+    case AccessPath::ZERO_ROWS:
+      return "空结果读取器";
+    case AccessPath::ZERO_ROWS_AGGREGATED:
+      return "空结果聚合读取器";
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      return "物化表函数读取器";
+    case AccessPath::UNQUALIFIED_COUNT:
+      return "无需条件的 COUNT 读取器";
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      return "去重半连接嵌套循环读取器";
+    case AccessPath::BKA_JOIN:
+      return "Batched Key Access JOIN 读取器";
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      return "物化 information_schema 表读取器";
+    case AccessPath::APPEND:
+      return "追加多个输入的读取器";
+    case AccessPath::WEEDOUT:
+      return "半连接去重读取器";
+    case AccessPath::REMOVE_DUPLICATES:
+      return "去重读取器";
+    case AccessPath::REMOVE_DUPLICATES_ON_INDEX:
+      return "按索引去重读取器";
+    case AccessPath::ALTERNATIVE:
+      return "运行时二选一读取器";
+    case AccessPath::CACHE_INVALIDATOR:
+      return "缓存失效包装读取器";
+    case AccessPath::DELETE_ROWS:
+      return "删除行读取器";
+    case AccessPath::UPDATE_ROWS:
+      return "更新行读取器";
+    case AccessPath::SAMPLE_SCAN:
+      return "采样扫描读取器";
+  }
+  return "未知读取器";
+}
+
+TABLE *WzgIteratorTargetTable(const AccessPath *path) {
+  switch (path->type) {
+    case AccessPath::TABLE_SCAN:
+      return path->table_scan().table;
+    case AccessPath::INDEX_SCAN:
+      return path->index_scan().table;
+    case AccessPath::INDEX_DISTANCE_SCAN:
+      return path->index_distance_scan().table;
+    case AccessPath::REF:
+      return path->ref().table;
+    case AccessPath::REF_OR_NULL:
+      return path->ref_or_null().table;
+    case AccessPath::EQ_REF:
+      return path->eq_ref().table;
+    case AccessPath::PUSHED_JOIN_REF:
+      return path->pushed_join_ref().table;
+    case AccessPath::FULL_TEXT_SEARCH:
+      return path->full_text_search().table;
+    case AccessPath::CONST_TABLE:
+      return path->const_table().table;
+    case AccessPath::MRR:
+      return path->mrr().table;
+    case AccessPath::FOLLOW_TAIL:
+      return path->follow_tail().table;
+    case AccessPath::INDEX_RANGE_SCAN:
+      return path->index_range_scan().used_key_part[0].field->table;
+    case AccessPath::INDEX_MERGE:
+      return path->index_merge().table;
+    case AccessPath::ROWID_INTERSECTION:
+      return path->rowid_intersection().table;
+    case AccessPath::ROWID_UNION:
+      return path->rowid_union().table;
+    case AccessPath::INDEX_SKIP_SCAN:
+      return path->index_skip_scan().table;
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      return path->group_index_skip_scan().table;
+    case AccessPath::DYNAMIC_INDEX_RANGE_SCAN:
+      return path->dynamic_index_range_scan().table;
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      return path->materialized_table_function().table;
+    case AccessPath::STREAM:
+      return path->stream().table;
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      return path->materialize_information_schema_table().table_list == nullptr
+                 ? nullptr
+                 : path->materialize_information_schema_table()
+                       .table_list->table;
+    default:
+      return nullptr;
+  }
+}
+
+std::string WzgIteratorChosenIndex(const AccessPath *path) {
+  TABLE *table = WzgIteratorTargetTable(path);
+  uint key_no = MAX_KEY;
+  switch (path->type) {
+    case AccessPath::INDEX_SCAN:
+      key_no = path->index_scan().idx;
+      break;
+    case AccessPath::INDEX_DISTANCE_SCAN:
+      key_no = path->index_distance_scan().idx;
+      break;
+    case AccessPath::REF:
+      key_no = path->ref().ref->key;
+      break;
+    case AccessPath::REF_OR_NULL:
+      key_no = path->ref_or_null().ref->key;
+      break;
+    case AccessPath::EQ_REF:
+      key_no = path->eq_ref().ref->key;
+      break;
+    case AccessPath::PUSHED_JOIN_REF:
+      key_no = path->pushed_join_ref().ref->key;
+      break;
+    case AccessPath::FULL_TEXT_SEARCH:
+      key_no = path->full_text_search().ref->key;
+      break;
+    case AccessPath::CONST_TABLE:
+      key_no = path->const_table().ref->key;
+      break;
+    case AccessPath::MRR:
+      key_no = path->mrr().ref->key;
+      break;
+    case AccessPath::INDEX_RANGE_SCAN:
+      key_no = path->index_range_scan().index;
+      break;
+    case AccessPath::INDEX_SKIP_SCAN:
+      key_no = path->index_skip_scan().index;
+      break;
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      key_no = path->group_index_skip_scan().index;
+      break;
+    default:
+      break;
+  }
+  return WzgIteratorIndexName(table, key_no);
+}
+
+std::string WzgIteratorPurpose(const AccessPath *path) {
+  switch (path->type) {
+    case AccessPath::TABLE_SCAN:
+      return "逐行读取整张表，把行交给上层过滤或 JOIN";
+    case AccessPath::INDEX_SCAN:
+      return "按索引顺序扫描记录，把行交给上层处理";
+    case AccessPath::REF:
+    case AccessPath::REF_OR_NULL:
+    case AccessPath::EQ_REF:
+    case AccessPath::PUSHED_JOIN_REF:
+      return "根据常量或前面表的值，通过索引查找匹配行";
+    case AccessPath::INDEX_RANGE_SCAN:
+      return "按索引范围读取一段记录";
+    case AccessPath::INDEX_MERGE:
+      return "合并多个索引扫描结果后再读取匹配行";
+    case AccessPath::ROWID_INTERSECTION:
+      return "对多个索引结果取交集，得到更精确的候选行";
+    case AccessPath::ROWID_UNION:
+      return "对多个索引结果取并集，覆盖 OR 等多分支条件";
+    case AccessPath::NESTED_LOOP_JOIN:
+      return "外层每产生一行，再驱动内层读取匹配行";
+    case AccessPath::HASH_JOIN:
+      return "先构建哈希表，再用另一侧输入进行匹配";
+    case AccessPath::FILTER:
+      return "读取子节点结果后判断过滤条件";
+    case AccessPath::SORT:
+      return "读取子节点结果后执行 filesort 排序";
+    case AccessPath::MATERIALIZE:
+      return "把子查询或中间结果写入内部临时结果，后续再读取";
+    case AccessPath::STREAM:
+      return "把上游结果流式写入临时表或上层结果";
+    case AccessPath::LIMIT_OFFSET:
+      return "跳过 OFFSET 并限制最多返回 LIMIT 行";
+    case AccessPath::AGGREGATE:
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      return "对输入行做聚合计算";
+    case AccessPath::WINDOW:
+      return "对输入行计算窗口函数";
+    default:
+      return "把这个执行计划节点转换成可读取的 RowIterator";
+  }
+}
+
+const char *WzgRangeFlagName(enum ha_rkey_function flag) {
+  switch (flag) {
+    case HA_READ_KEY_EXACT:
+      return "HA_READ_KEY_EXACT";
+    case HA_READ_KEY_OR_NEXT:
+      return "HA_READ_KEY_OR_NEXT";
+    case HA_READ_KEY_OR_PREV:
+      return "HA_READ_KEY_OR_PREV";
+    case HA_READ_AFTER_KEY:
+      return "HA_READ_AFTER_KEY";
+    case HA_READ_BEFORE_KEY:
+      return "HA_READ_BEFORE_KEY";
+    default:
+      return "OTHER_HA_READ_FLAG";
+  }
+}
+
+const char *WzgRangeFlagMeaning(enum ha_rkey_function flag, bool start_key) {
+  switch (flag) {
+    case HA_READ_KEY_EXACT:
+      return "等值定位，要求 key 正好匹配这个边界";
+    case HA_READ_KEY_OR_NEXT:
+      return start_key ? "起点包含边界值，找不到正好等于边界时从下一条开始"
+                       : "终点方向使用 key 或后一条";
+    case HA_READ_KEY_OR_PREV:
+      return start_key ? "起点方向使用 key 或前一条"
+                       : "终点包含边界值，找不到正好等于边界时到前一条为止";
+    case HA_READ_AFTER_KEY:
+      return start_key ? "起点不包含边界值，从大于该 key 的下一条开始"
+                       : "终点包含该 key 前缀范围，用于结束边界比较";
+    case HA_READ_BEFORE_KEY:
+      return start_key ? "起点方向读取边界之前的记录"
+                       : "终点不包含边界值，到小于该 key 的记录为止";
+    default:
+      return "其他 handler 读取标记";
+  }
+}
+
+std::string WzgKeypartMapToString(key_part_map map) {
+  std::ostringstream out;
+  out << map;
+  return out.str();
+}
+
+std::string WzgRangeEndpointText(const key_range &range, bool start_key,
+                                 uint range_flags) {
+  std::string value(start_key ? "start_key: " : "end_key: ");
+  const bool no_boundary =
+      start_key ? (range_flags & NO_MIN_RANGE) : (range_flags & NO_MAX_RANGE);
+  value.append("flag=");
+  value.append(WzgRangeFlagName(range.flag));
+  value.append("，length=");
+  value.append(std::to_string(range.length));
+  value.append("，keypart_map=");
+  value.append(WzgKeypartMapToString(range.keypart_map));
+  value.append("，meaning=");
+  if (no_boundary) {
+    value.append(start_key ? "没有下界，从索引可用范围的起点开始扫描"
+                           : "没有上界，一直扫描到索引可用范围结束");
+  } else {
+    value.append(WzgRangeFlagMeaning(range.flag, start_key));
+  }
+  return value;
+}
+
+std::string WzgRangeFlagsText(uint flags) {
+  std::string value;
+  auto append = [&value](const char *name) {
+    if (!value.empty()) value.append(", ");
+    value.append(name);
+  };
+  if (flags & NO_MIN_RANGE) append("NO_MIN_RANGE");
+  if (flags & NO_MAX_RANGE) append("NO_MAX_RANGE");
+  if (flags & NEAR_MIN) append("NEAR_MIN");
+  if (flags & NEAR_MAX) append("NEAR_MAX");
+  if (flags & UNIQUE_RANGE) append("UNIQUE_RANGE");
+  if (flags & EQ_RANGE) append("EQ_RANGE");
+  if (flags & NULL_RANGE) append("NULL_RANGE");
+  if (flags & GEOM_FLAG) append("GEOM_FLAG");
+  if (flags & SKIP_RANGE) append("SKIP_RANGE");
+  if (flags & SKIP_RECORDS_IN_RANGE) append("SKIP_RECORDS_IN_RANGE");
+  if (flags & DESC_FLAG) append("DESC_FLAG");
+  return value.empty() ? "无特殊标记" : value;
+}
+
+std::string WzgRangeReadableText(const QUICK_RANGE *range,
+                                 const KEY_PART_INFO *key_part) {
+  if (range == nullptr || key_part == nullptr) return "未知范围";
+  String text;
+  append_range_to_string(range, key_part, &text);
+  return text.length() == 0 ? "未知范围"
+                            : std::string(text.ptr(), text.length());
+}
+
+std::string WzgRangeParameterText(const QUICK_RANGE *range,
+                                  const KEY_PART_INFO *key_part,
+                                  unsigned range_idx) {
+  if (range == nullptr) return "未知范围";
+  key_range start_key;
+  key_range end_key;
+  start_key.key = range->min_key;
+  start_key.length = range->min_length;
+  start_key.keypart_map = range->min_keypart_map;
+  start_key.flag = ((range->flag & NEAR_MIN)   ? HA_READ_AFTER_KEY
+                    : (range->flag & EQ_RANGE) ? HA_READ_KEY_EXACT
+                                                : HA_READ_KEY_OR_NEXT);
+  end_key.key = range->max_key;
+  end_key.length = range->max_length;
+  end_key.keypart_map = range->max_keypart_map;
+  end_key.flag =
+      (range->flag & NEAR_MAX ? HA_READ_BEFORE_KEY : HA_READ_AFTER_KEY);
+  std::string value("range ");
+  value.append(std::to_string(range_idx + 1));
+  value.append(": ");
+  value.append(WzgRangeReadableText(range, key_part));
+  value.append("；");
+  value.append(WzgRangeEndpointText(start_key, true, range->flag));
+  value.append("；");
+  value.append(WzgRangeEndpointText(end_key, false, range->flag));
+  value.append("；range_flags=");
+  value.append(WzgRangeFlagsText(range->flag));
+  return value;
+}
+
+std::string WzgRangeParametersList(const QUICK_RANGE *const *ranges,
+                                   unsigned num_ranges,
+                                   const KEY_PART_INFO *key_part) {
+  if (ranges == nullptr || num_ranges == 0) return "无范围参数";
+  constexpr unsigned kMaxPrintedRanges = 6;
+  std::string value;
+  const unsigned printed = std::min(num_ranges, kMaxPrintedRanges);
+  for (unsigned i = 0; i < printed; ++i) {
+    if (i > 0) value.append(" | ");
+    value.append(WzgRangeParameterText(ranges[i], key_part, i));
+  }
+  if (num_ranges > printed) {
+    value.append(" | 还有 ");
+    value.append(std::to_string(num_ranges - printed));
+    value.append(" 个范围未展开");
+  }
+  return value;
+}
+
+std::string WzgUsedKeyPartsText(const KEY &key, key_part_map used_map) {
+  std::string value;
+  key_part_map bit = 1;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (used_map & bit) {
+      if (!value.empty()) value.append(", ");
+      const KEY_PART_INFO &part = key.key_part[part_no];
+      if (part.field != nullptr && part.field->field_name != nullptr)
+        value.append(part.field->field_name);
+      else
+        value.append("<expression>");
+    }
+    bit <<= 1;
+  }
+  return value.empty() ? "无" : value;
+}
+
+Index_lookup *WzgRefLookup(const AccessPath *path) {
+  switch (path->type) {
+    case AccessPath::REF:
+      return path->ref().ref;
+    case AccessPath::REF_OR_NULL:
+      return path->ref_or_null().ref;
+    case AccessPath::EQ_REF:
+      return path->eq_ref().ref;
+    case AccessPath::PUSHED_JOIN_REF:
+      return path->pushed_join_ref().ref;
+    case AccessPath::CONST_TABLE:
+      return path->const_table().ref;
+    default:
+      return nullptr;
+  }
+}
+
+const char *WzgRefLookupTypeText(AccessPath::Type type) {
+  switch (type) {
+    case AccessPath::REF:
+      return "REF，按普通索引值查找，可能返回多行";
+    case AccessPath::REF_OR_NULL:
+      return "REF_OR_NULL，先按索引值查找，再额外处理 NULL 匹配";
+    case AccessPath::EQ_REF:
+      return "EQ_REF，按唯一索引或主键查找，每次最多返回一行";
+    case AccessPath::PUSHED_JOIN_REF:
+      return "PUSHED_JOIN_REF，下推到存储引擎的 JOIN 索引查找";
+    case AccessPath::CONST_TABLE:
+      return "CONST_TABLE，按唯一索引提前读取成常量表";
+    default:
+      return "不是 ref 类索引查找";
+  }
+}
+
+std::string WzgRefLookupKeyParts(const TABLE *table, const Index_lookup *ref) {
+  if (table == nullptr || table->key_info == nullptr || table->s == nullptr ||
+      ref == nullptr || ref->key < 0 || static_cast<uint>(ref->key) >= table->s->keys)
+    return "无";
+
+  const KEY &key = table->key_info[ref->key];
+  std::string value;
+  const uint parts = std::min(ref->key_parts, key.user_defined_key_parts);
+  for (uint part_no = 0; part_no < parts; ++part_no) {
+    if (!value.empty()) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    if (part.field != nullptr && part.field->field_name != nullptr)
+      value.append(part.field->field_name);
+    else
+      value.append("<expression>");
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string WzgRefLookupValues(THD *thd, const Index_lookup *ref) {
+  if (ref == nullptr || ref->items == nullptr || ref->key_parts == 0)
+    return "无";
+
+  constexpr uint kMaxPrintedParts = 8;
+  std::string value;
+  const uint printed = std::min(ref->key_parts, kMaxPrintedParts);
+  for (uint part_no = 0; part_no < printed; ++part_no) {
+    if (!value.empty()) value.append("；");
+    value.append("keypart ");
+    value.append(std::to_string(part_no + 1));
+    value.append(" = ");
+    Item *item = ref->items[part_no];
+    if (item == nullptr) {
+      value.append("未知表达式");
+      continue;
+    }
+    char buffer[512];
+    String text(buffer, sizeof(buffer), system_charset_info);
+    text.length(0);
+    item->print(thd, &text, QT_ORDINARY);
+    value.append(text.length() == 0 ? "未知表达式"
+                                    : std::string(text.ptr(), text.length()));
+  }
+  if (ref->key_parts > printed) {
+    value.append("；还有 ");
+    value.append(std::to_string(ref->key_parts - printed));
+    value.append(" 个 keypart 未展开");
+  }
+  return value;
+}
+
+std::string WzgRefLookupNullRejecting(const Index_lookup *ref) {
+  if (ref == nullptr || ref->key_parts == 0) return "无";
+  std::string value;
+  for (uint part_no = 0; part_no < ref->key_parts; ++part_no) {
+    if (ref->null_rejecting & (key_part_map{1} << part_no)) {
+      if (!value.empty()) value.append(", ");
+      value.append("keypart ");
+      value.append(std::to_string(part_no + 1));
+    }
+  }
+  return value.empty() ? "无；查找值为 NULL 时仍需按访问方式继续处理"
+                       : value + "；这些列的查找值为 NULL 时不会产生匹配行";
+}
+
+std::string WzgRefLookupSource(const Index_lookup *ref) {
+  if (ref == nullptr) return "未知";
+  if (ref->depend_map == 0)
+    return "常量、系统已知值，或优化阶段已经确定的值";
+  return "来自前面已经读到的表、外层查询，或运行时表达式";
+}
+
+std::string WzgRefLookupCacheText(const Index_lookup *ref) {
+  if (ref == nullptr) return "未知";
+  if (ref->disable_cache)
+    return "不复用上一次相同 key 的查找结果，通常因为索引条件下推等执行细节可能影响结果";
+  return "允许复用相同 key 的查找结果，避免重复定位";
+}
+
+std::string WzgSortItemText(THD *thd, const st_sort_field &sort_field) {
+  if (sort_field.item == nullptr) return "未知表达式";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  sort_field.item->print(thd, &text, QT_ORDINARY);
+  std::string value =
+      text.length() == 0 ? "未知表达式" : std::string(text.ptr(), text.length());
+  value.append(sort_field.reverse ? " DESC" : " ASC");
+  return value;
+}
+
+std::string WzgSortOrderText(THD *thd, const Filesort *filesort) {
+  if (filesort == nullptr || filesort->sortorder == nullptr ||
+      filesort->sort_order_length() == 0)
+    return "无排序表达式";
+
+  constexpr uint kMaxPrintedSortFields = 8;
+  std::string value;
+  const uint sort_fields =
+      std::min(filesort->sort_order_length(), kMaxPrintedSortFields);
+  for (uint i = 0; i < sort_fields; ++i) {
+    if (!value.empty()) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". ");
+    value.append(WzgSortItemText(thd, filesort->sortorder[i]));
+  }
+  if (filesort->sort_order_length() > sort_fields) {
+    value.append("；还有 ");
+    value.append(std::to_string(filesort->sort_order_length() - sort_fields));
+    value.append(" 个排序字段未展开");
+  }
+  return value;
+}
+
+std::string WzgSortTablesText(const Filesort *filesort) {
+  if (filesort == nullptr || filesort->tables.empty()) return "无";
+  constexpr size_t kMaxPrintedTables = 8;
+  std::string value;
+  const size_t tables = std::min(filesort->tables.size(), kMaxPrintedTables);
+  for (size_t i = 0; i < tables; ++i) {
+    if (!value.empty()) value.append(", ");
+    value.append(WzgIteratorTableName(filesort->tables[i]));
+  }
+  if (filesort->tables.size() > tables) {
+    value.append(", 还有 ");
+    value.append(std::to_string(filesort->tables.size() - tables));
+    value.append(" 张表未展开");
+  }
+  return value;
+}
+
+std::string WzgSortPayloadText(const AccessPath *path, Filesort *filesort) {
+  if (path == nullptr || path->type != AccessPath::SORT || filesort == nullptr)
+    return "未知";
+  if (path->sort().force_sort_rowids)
+    return "排序记录 rowid，排序后再回表定位原始行";
+  return filesort->using_addon_fields()
+             ? "排序记录会带上需要返回的附加字段，排序后可直接继续处理"
+             : "排序记录只保存 rowid，排序后需要按 rowid 取回原始行";
+}
+
+std::string WzgSortLimitText(ha_rows limit) {
+  if (limit == HA_POS_ERROR) return "无限制";
+  return std::to_string(limit);
+}
+
+std::string WzgSortRowsEstimateText(double rows) {
+  if (rows < 0.0) return "未知";
+  return WzgIteratorDoubleToString(rows);
+}
+
+std::string WzgJoinInputText(const AccessPath *input);
+
+std::string WzgItemExpressionText(THD *thd, const Item *item) {
+  if (item == nullptr) return "无";
+  char buffer[1024];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  item->print(thd, &text, QT_ORDINARY);
+  return text.length() == 0 ? "未知表达式"
+                            : std::string(text.ptr(), text.length());
+}
+
+void WzgEmitFilterEval(THD *thd, const AccessPath *path, const JOIN *join) {
+  if (path == nullptr || path->type != AccessPath::FILTER || thd == nullptr ||
+      thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  const auto &param = path->filter();
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  WZG_PROBE_EVENT(thd, "executor.filter_eval")
+      .message("执行器准备在读取到行后判断过滤条件")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("filter_condition", WzgItemExpressionText(thd, param.condition))
+      .field("input_source", WzgJoinInputText(param.child))
+      .field("estimated_input_rows",
+             param.child == nullptr
+                 ? "未知"
+                 : WzgSortRowsEstimateText(param.child->num_output_rows()))
+      .field("estimated_output_rows",
+             WzgSortRowsEstimateText(path->num_output_rows()))
+      .field("materialize_subqueries_before_filter",
+             param.materialize_subqueries
+                 ? "是；判断条件前会先完成条件中的可物化子查询"
+                 : "否")
+      .field("when_checked", "子节点每返回一行后立即判断这个条件")
+      .field("pass_behavior", "条件结果为 TRUE 的行继续交给上层执行节点")
+      .field("reject_behavior",
+             "条件结果为 FALSE 或 NULL 的行不会继续向上返回")
+      .field("note", "这里记录过滤节点准备判断的条件，不是逐行判断结果")
+      .field("next_step", "FilterIterator 调用子节点 Read，拿到一行后计算条件表达式")
+      .emit();
+}
+
+std::string WzgLimitRowsText(ha_rows rows) {
+  if (rows == HA_POS_ERROR) return "无限制";
+  return std::to_string(rows);
+}
+
+std::string WzgLimitReturnRowsText(ha_rows limit, ha_rows offset) {
+  if (limit == HA_POS_ERROR) return "无限制";
+  if (limit <= offset) return "0";
+  return std::to_string(limit - offset);
+}
+
+void WzgEmitLimitOffset(THD *thd, const AccessPath *path, const JOIN *join) {
+  if (path == nullptr || path->type != AccessPath::LIMIT_OFFSET ||
+      thd == nullptr || thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  const auto &param = path->limit_offset();
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  WZG_PROBE_EVENT(thd, "executor.limit_offset")
+      .message("执行器准备应用 LIMIT/OFFSET，控制最多向上返回多少行")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("offset", WzgLimitRowsText(param.offset))
+      .field("return_limit",
+             WzgLimitReturnRowsText(param.limit, param.offset))
+      .field("read_until_row", WzgLimitRowsText(param.limit))
+      .field("internal_limit_meaning",
+             "MySQL 这里的 read_until_row 包含被 OFFSET 跳过的行；SQL 层最多返回 return_limit 行")
+      .field("count_all_rows",
+             param.count_all_rows
+                 ? "是；即使达到 LIMIT，也会继续读取子节点以统计完整行数"
+                 : "否；达到 LIMIT 后可以停止继续读取")
+      .field("reject_multiple_rows",
+             param.reject_multiple_rows
+                 ? "是；如果子节点返回超过允许行数，会按标量子查询等语义报错"
+                 : "否")
+      .field("input_source", WzgJoinInputText(param.child))
+      .field("estimated_input_rows",
+             param.child == nullptr
+                 ? "未知"
+                 : WzgSortRowsEstimateText(param.child->num_output_rows()))
+      .field("estimated_output_rows",
+             WzgSortRowsEstimateText(path->num_output_rows()))
+      .field("when_applied",
+             "子节点每返回一行后，先跳过 OFFSET 指定的行数，再最多放行 LIMIT 指定的行数")
+      .field("pass_behavior", "位于 LIMIT/OFFSET 范围内的行继续交给上层节点或客户端")
+      .field("stop_behavior",
+             param.count_all_rows
+                 ? "达到 LIMIT 后仍继续读完子节点，只是不再向上返回额外行"
+                 : "看到 read_until_row 指定的行数后停止继续向子节点读取")
+      .field("note",
+             "这里解释 LIMIT/OFFSET 节点；如果 filesort.limit 显示无限制，LIMIT 可能就在这个节点处理")
+      .field("next_step",
+             "LimitOffsetIterator 调用子节点 Read，并按 offset/limit 计数决定是否返回这一行")
+      .emit();
+}
+
+void WzgEmitSortPlan(THD *thd, const AccessPath *path, const JOIN *join) {
+  if (path == nullptr || path->type != AccessPath::SORT || thd == nullptr ||
+      thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  const auto &param = path->sort();
+  Filesort *filesort = param.filesort;
+  if (filesort == nullptr) return;
+
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  WZG_PROBE_EVENT(thd, "executor.sort")
+      .message(filesort->m_remove_duplicates
+                   ? "执行器准备对结果做 filesort，并在排序过程中去重"
+                   : "执行器准备对读取结果做 filesort 排序")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("sort_type", "filesort")
+      .field("sort_by", WzgSortOrderText(thd, filesort))
+      .field("sort_tables", WzgSortTablesText(filesort))
+      .field("remove_duplicates", filesort->m_remove_duplicates)
+      .field("limit", WzgSortLimitText(filesort->limit))
+      .field("estimated_input_rows",
+             param.child == nullptr ? "未知"
+                                    : WzgSortRowsEstimateText(
+                                          param.child->num_output_rows()))
+      .field("estimated_output_rows", WzgSortRowsEstimateText(path->num_output_rows()))
+      .field("sort_payload", WzgSortPayloadText(path, filesort))
+      .field("needs_rowid_fetch",
+             param.tables_to_get_rowid_for == 0
+                 ? "否"
+                 : "是；排序后需要按 rowid 回到相关表取完整行")
+      .field("reason",
+             filesort->m_remove_duplicates
+                 ? "当前计划需要排序后的唯一结果，执行器使用 filesort 完成排序和去重"
+                 : "当前执行计划不能直接按目标顺序返回结果，需要额外排序")
+      .field("result_destination", "排序后的行继续交给上层执行节点或返回客户端")
+      .field("next_step", "SortingIterator 从子节点读取行，生成排序 key，再调用 filesort 排序")
+      .emit();
+}
+
+std::string WzgMaterializeLimitText(ha_rows limit) {
+  if (limit == HA_POS_ERROR) return "无限制";
+  return std::to_string(limit);
+}
+
+std::string WzgMaterializeAccessTypeText(AccessPath::Type type) {
+  switch (type) {
+    case AccessPath::MATERIALIZE:
+      return "MATERIALIZE，物化子查询、派生表、CTE 或 UNION 等中间结果";
+    case AccessPath::STREAM:
+      return "STREAM，把上游结果流式写入内部临时结果";
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      return "TEMPTABLE_AGGREGATE，先写临时表再读取聚合结果";
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      return "MATERIALIZED_TABLE_FUNCTION，先执行表函数并写成内部表";
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      return "MATERIALIZE_INFORMATION_SCHEMA_TABLE，物化 information_schema 查询结果";
+    default:
+      return "不是物化节点";
+  }
+}
+
+std::string WzgMaterializeOperandText(const MaterializePathParameters *param) {
+  if (param == nullptr || param->m_operands.empty()) return "无输入查询块";
+  constexpr size_t kMaxPrintedOperands = 8;
+  std::string value;
+  const size_t count = std::min(param->m_operands.size(), kMaxPrintedOperands);
+  for (size_t i = 0; i < count; ++i) {
+    const MaterializePathParameters::Operand &operand = param->m_operands[i];
+    if (!value.empty()) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". 查询块 ");
+    value.append(std::to_string(operand.select_number));
+    value.append("，预计输出 ");
+    value.append(operand.subquery_path == nullptr
+                     ? "未知"
+                     : WzgSortRowsEstimateText(
+                           operand.subquery_path->num_output_rows()));
+    value.append(" 行");
+    if (operand.copy_items) value.append("，写入时复制表达式结果");
+    if (operand.is_recursive_reference) value.append("，递归引用输入");
+    if (operand.disable_deduplication_by_hash_field)
+      value.append("，这一支不使用 hash 字段去重");
+  }
+  if (param->m_operands.size() > count) {
+    value.append("；还有 ");
+    value.append(std::to_string(param->m_operands.size() - count));
+    value.append(" 个输入未展开");
+  }
+  return value;
+}
+
+std::string WzgMaterializeDedupText(const MaterializePathParameters *param) {
+  if (param == nullptr || param->m_operands.empty()) return "未知";
+  if (param->m_operands.size() > 1)
+    return "可能需要按 UNION/INTERSECT/EXCEPT 等集合语义去重或计数，具体由各输入和临时表参数决定";
+  const MaterializePathParameters::Operand &operand = param->m_operands[0];
+  if (operand.disable_deduplication_by_hash_field)
+    return "不使用 hash 字段去重";
+  return "单个输入，通常只是写入中间结果；是否唯一由临时表键和上层计划决定";
+}
+
+std::string WzgMaterializeTargetText(const TABLE *table) {
+  if (table == nullptr) return "内部临时结果";
+  std::string name = WzgIteratorTableName(table);
+  return name == "<unknown>" || name == "无" ? "内部临时结果" : name;
+}
+
+std::string WzgMaterializeReasonText(const AccessPath *path) {
+  if (path == nullptr) return "未知";
+  switch (path->type) {
+    case AccessPath::MATERIALIZE:
+      return "当前计划需要先生成一份中间结果，再由外层查询、集合操作或后续读取器继续使用";
+    case AccessPath::STREAM:
+      return "当前计划需要把上游行流式写入临时结果，供后续节点读取";
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      return "当前计划使用临时表保存分组或聚合中间结果，再读取聚合后的行";
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      return "表函数需要先产出行并写入内部表，再像普通表一样读取";
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      return "information_schema 的结果需要先生成内部表，再应用读取或过滤";
+    default:
+      return "不是物化节点";
+  }
+}
+
+TABLE *WzgMaterializeTargetTable(const AccessPath *path) {
+  switch (path->type) {
+    case AccessPath::MATERIALIZE:
+      return path->materialize().param == nullptr ? nullptr
+                                                  : path->materialize().param->table;
+    case AccessPath::STREAM:
+      return path->stream().table;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      return path->temptable_aggregate().table;
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      return path->materialized_table_function().table;
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      return path->materialize_information_schema_table().table_list == nullptr
+                 ? nullptr
+                 : path->materialize_information_schema_table().table_list->table;
+    default:
+      return nullptr;
+  }
+}
+
+void WzgEmitMaterializePlan(THD *thd, const AccessPath *path,
+                            const JOIN *join) {
+  if (path == nullptr || thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  wzg_probe::Event event(thd, "executor.materialize", "instant");
+  event.message("执行器准备把中间结果写入内部临时结果，后续再读取或匹配")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("materialize_type", WzgMaterializeAccessTypeText(path->type))
+      .field("result_table",
+             WzgMaterializeTargetText(WzgMaterializeTargetTable(path)))
+      .field("estimated_output_rows",
+             WzgSortRowsEstimateText(path->num_output_rows()))
+      .field("reason", WzgMaterializeReasonText(path))
+      .field("result_destination",
+             "内部临时结果，后续由执行计划中的其他读取器继续读取");
+
+  switch (path->type) {
+    case AccessPath::MATERIALIZE: {
+      const MaterializePathParameters *param = path->materialize().param;
+      if (param == nullptr) return;
+      event.field("operand_count",
+                  static_cast<std::uint64_t>(param->m_operands.size()))
+          .field("input_sources", WzgMaterializeOperandText(param))
+          .field("deduplication", WzgMaterializeDedupText(param))
+          .field("rematerialize_each_scan", param->rematerialize)
+          .field("limit_rows", WzgMaterializeLimitText(param->limit_rows))
+          .field("reject_multiple_rows", param->reject_multiple_rows)
+          .field("cte_materialization", param->cte == nullptr ? "否" : "是")
+          .field("next_step",
+                 "MaterializeIterator 执行输入计划，把产生的行写入内部临时结果");
+      break;
+    }
+    case AccessPath::STREAM:
+      event.field("operand_count", std::uint64_t{1})
+          .field("input_sources", "上游子节点的输出行")
+          .field("deduplication", "不在 STREAM 节点去重")
+          .field("provide_rowid",
+                 path->stream().provide_rowid
+                     ? "需要提供 rowid，供上层之后回到原始行"
+                     : "不需要提供 rowid")
+          .field("next_step", "StreamingIterator 读取上游行并写入内部临时结果");
+      break;
+    case AccessPath::TEMPTABLE_AGGREGATE:
+      event.field("operand_count", std::uint64_t{1})
+          .field("input_sources", "聚合输入子计划")
+          .field("deduplication", "按聚合/分组临时表规则合并同组行")
+          .field("next_step",
+                 "TemptableAggregateIterator 先写聚合临时表，再读取聚合结果");
+      break;
+    case AccessPath::MATERIALIZED_TABLE_FUNCTION:
+      event.field("operand_count", std::uint64_t{1})
+          .field("input_sources", "表函数输出")
+          .field("deduplication", "不在表函数物化节点去重")
+          .field("next_step",
+                 "MaterializedTableFunctionIterator 执行表函数并写入内部表");
+      break;
+    case AccessPath::MATERIALIZE_INFORMATION_SCHEMA_TABLE:
+      event.field("operand_count", std::uint64_t{1})
+          .field("input_sources", "information_schema 内部查询结果")
+          .field("deduplication", "不在该节点单独说明去重")
+          .field("next_step",
+                 "MaterializeInformationSchemaTableIterator 生成内部结果表并应用条件");
+      break;
+    default:
+      return;
+  }
+  event.emit();
+}
+
+const char *WzgJoinTypeName(JoinType join_type) {
+  switch (join_type) {
+    case JoinType::INNER:
+      return "INNER JOIN";
+    case JoinType::OUTER:
+      return "LEFT JOIN";
+    case JoinType::ANTI:
+      return "ANTI JOIN";
+    case JoinType::SEMI:
+      return "SEMI JOIN";
+    case JoinType::FULL_OUTER:
+      return "FULL OUTER JOIN";
+  }
+  return "UNKNOWN JOIN";
+}
+
+const char *WzgJoinTypeMeaning(JoinType join_type) {
+  switch (join_type) {
+    case JoinType::INNER:
+      return "只返回两边都匹配的行";
+    case JoinType::OUTER:
+      return "保留外层输入的行，内层没有匹配时补 NULL";
+    case JoinType::ANTI:
+      return "返回外层中找不到内层匹配的行，常见于 NOT EXISTS";
+    case JoinType::SEMI:
+      return "只判断外层行是否存在匹配，常见于 EXISTS/IN，不需要返回内层重复行";
+    case JoinType::FULL_OUTER:
+      return "保留左右两边未匹配的行";
+  }
+  return "未知 JOIN 类型";
+}
+
+std::string WzgJoinInputText(const AccessPath *input) {
+  if (input == nullptr) return "未知输入";
+  TABLE *table = WzgIteratorTargetTable(input);
+  std::string value = WzgIteratorReadableName(input->type);
+  if (table != nullptr) {
+    value.append("，目标表 ");
+    value.append(WzgIteratorTableName(table));
+  } else {
+    value.append("，输入来自子计划");
+  }
+  value.append("，预计输出 ");
+  value.append(WzgSortRowsEstimateText(input->num_output_rows()));
+  value.append(" 行");
+  return value;
+}
+
+std::string WzgJoinConditionText(THD *thd, const JoinPredicate *predicate) {
+  if (predicate == nullptr || predicate->expr == nullptr)
+    return "无可直接展示的 JOIN 条件";
+
+  std::string value;
+  constexpr size_t kMaxPrintedConditions = 6;
+  size_t printed = 0;
+  for (Item_eq_base *cond : predicate->expr->equijoin_conditions) {
+    if (cond == nullptr) continue;
+    if (!value.empty()) value.append("；");
+    if (printed >= kMaxPrintedConditions) {
+      value.append("还有更多等值条件未展开");
+      break;
+    }
+    char buffer[512];
+    String text(buffer, sizeof(buffer), system_charset_info);
+    text.length(0);
+    cond->print(thd, &text, QT_ORDINARY);
+    value.append(text.length() == 0 ? "未知等值条件"
+                                    : std::string(text.ptr(), text.length()));
+    ++printed;
+  }
+  return value.empty() ? "无等值 JOIN 条件或条件已在其他节点处理" : value;
+}
+
+std::string WzgJoinMethodName(AccessPath::Type type) {
+  switch (type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+      return "Nested Loop Join，嵌套循环 JOIN";
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      return "Nested Loop Semijoin With Duplicate Removal，带去重的半连接嵌套循环";
+    case AccessPath::BKA_JOIN:
+      return "Batched Key Access Join，批量索引 JOIN";
+    case AccessPath::HASH_JOIN:
+      return "Hash Join，哈希 JOIN";
+    default:
+      return "不是 JOIN 执行节点";
+  }
+}
+
+std::string WzgJoinMethodMeaning(const AccessPath *path) {
+  if (path == nullptr) return "未知";
+  switch (path->type) {
+    case AccessPath::NESTED_LOOP_JOIN:
+      return "先读外层输入，每得到一行就驱动内层输入读取匹配行";
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL:
+      return "先读外层输入，再读内层匹配行；对指定 key 去重，避免同一个外层 key 产生重复半连接结果";
+    case AccessPath::BKA_JOIN:
+      return "先攒一批外层行的 key，再批量请求内层索引读取，减少逐行随机访问";
+    case AccessPath::HASH_JOIN:
+      return "先读取 build 侧建立哈希表，再读取 probe 侧用 JOIN key 到哈希表中匹配";
+    default:
+      return "不是 JOIN 执行节点";
+  }
+}
+
+void WzgEmitJoinMethod(THD *thd, const AccessPath *path, const JOIN *join) {
+  if (path == nullptr || thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+  if (path->type != AccessPath::NESTED_LOOP_JOIN &&
+      path->type != AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL &&
+      path->type != AccessPath::BKA_JOIN && path->type != AccessPath::HASH_JOIN)
+    return;
+
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+
+  switch (path->type) {
+    case AccessPath::NESTED_LOOP_JOIN: {
+      const auto &param = path->nested_loop_join();
+      WZG_PROBE_EVENT(thd, "executor.join_method")
+          .message("执行器准备按嵌套循环方式执行 JOIN")
+          .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("join_method", WzgJoinMethodName(path->type))
+          .field("join_type", WzgJoinTypeName(param.join_type))
+          .field("join_type_meaning", WzgJoinTypeMeaning(param.join_type))
+          .field("outer_input", WzgJoinInputText(param.outer))
+          .field("inner_input", WzgJoinInputText(param.inner))
+          .field("execution_order",
+                 "先读取 outer_input；outer 每产生一行，再进入 inner_input 查找或扫描匹配行")
+          .field("join_condition",
+                 WzgJoinConditionText(thd, param.join_predicate))
+          .field("batch_mode", param.pfs_batch_mode)
+          .field("method_meaning", WzgJoinMethodMeaning(path))
+          .field("next_step",
+                 "NestedLoopIterator 调用外层 Read，随后反复初始化并读取内层迭代器")
+          .emit();
+      break;
+    }
+    case AccessPath::NESTED_LOOP_SEMIJOIN_WITH_DUPLICATE_REMOVAL: {
+      const auto &param = path->nested_loop_semijoin_with_duplicate_removal();
+      std::string key_name =
+          param.key == nullptr || param.key->name == nullptr ? "未知 key"
+                                                             : param.key->name;
+      WZG_PROBE_EVENT(thd, "executor.join_method")
+          .message("执行器准备按带去重的半连接嵌套循环方式执行 JOIN")
+          .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("join_method", WzgJoinMethodName(path->type))
+          .field("join_type", "SEMI JOIN")
+          .field("join_type_meaning", WzgJoinTypeMeaning(JoinType::SEMI))
+          .field("outer_input", WzgJoinInputText(param.outer))
+          .field("inner_input", WzgJoinInputText(param.inner))
+          .field("duplicate_removal_table", WzgIteratorTableName(param.table))
+          .field("duplicate_removal_key", key_name)
+          .field("duplicate_removal_key_length",
+                 static_cast<std::uint64_t>(param.key_len))
+          .field("execution_order",
+                 "先读外层输入，再找内层匹配；同一个去重 key 已产生过结果时会跳过重复输出")
+          .field("method_meaning", WzgJoinMethodMeaning(path))
+          .field("next_step",
+                 "NestedLoopSemiJoinWithDuplicateRemovalIterator 按 key 去重并返回半连接结果")
+          .emit();
+      break;
+    }
+    case AccessPath::BKA_JOIN: {
+      const auto &param = path->bka_join();
+      WZG_PROBE_EVENT(thd, "executor.join_method")
+          .message("执行器准备按 BKA 批量索引方式执行 JOIN")
+          .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("join_method", WzgJoinMethodName(path->type))
+          .field("join_type", WzgJoinTypeName(param.join_type))
+          .field("join_type_meaning", WzgJoinTypeMeaning(param.join_type))
+          .field("outer_input", WzgJoinInputText(param.outer))
+          .field("inner_input", WzgJoinInputText(param.inner))
+          .field("join_buffer_size",
+                 static_cast<std::uint64_t>(thd->variables.join_buff_size))
+          .field("mrr_length_per_record",
+                 static_cast<std::uint64_t>(param.mrr_length_per_rec))
+          .field("records_per_key_estimate",
+                 WzgIteratorDoubleToString(param.rec_per_key))
+          .field("store_rowids", param.store_rowids)
+          .field("execution_order",
+                 "先收集一批 outer_input 的查找 key，再让 inner_input 通过 MRR 批量读取匹配行")
+          .field("method_meaning", WzgJoinMethodMeaning(path))
+          .field("next_step",
+                 "BKAIterator 使用 join buffer 收集 key，并驱动 MultiRangeRowIterator 批量查内层表")
+          .emit();
+      break;
+    }
+    case AccessPath::HASH_JOIN: {
+      const auto &param = path->hash_join();
+      const JoinPredicate *predicate = param.join_predicate;
+      JoinType join_type{JoinType::INNER};
+      if (predicate != nullptr && predicate->expr != nullptr) {
+        switch (predicate->expr->type) {
+          case RelationalExpression::INNER_JOIN:
+          case RelationalExpression::STRAIGHT_INNER_JOIN:
+            join_type = JoinType::INNER;
+            break;
+          case RelationalExpression::LEFT_JOIN:
+            join_type = JoinType::OUTER;
+            break;
+          case RelationalExpression::ANTIJOIN:
+            join_type = JoinType::ANTI;
+            break;
+          case RelationalExpression::SEMIJOIN:
+            join_type =
+                param.rewrite_semi_to_inner ? JoinType::INNER : JoinType::SEMI;
+            break;
+          case RelationalExpression::FULL_OUTER_JOIN:
+            join_type = JoinType::FULL_OUTER;
+            break;
+          case RelationalExpression::TABLE:
+          default:
+            join_type = JoinType::INNER;
+            break;
+        }
+      }
+      const std::uint64_t condition_count =
+          predicate == nullptr || predicate->expr == nullptr
+              ? std::uint64_t{0}
+              : static_cast<std::uint64_t>(
+                    predicate->expr->equijoin_conditions.size());
+      WZG_PROBE_EVENT(thd, "executor.join_method")
+          .message("执行器准备按 Hash Join 方式执行 JOIN")
+          .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("join_method", WzgJoinMethodName(path->type))
+          .field("join_type", WzgJoinTypeName(join_type))
+          .field("join_type_meaning", WzgJoinTypeMeaning(join_type))
+          .field("build_input", WzgJoinInputText(param.inner))
+          .field("probe_input", WzgJoinInputText(param.outer))
+          .field("hash_key_conditions", WzgJoinConditionText(thd, predicate))
+          .field("hash_key_condition_count", condition_count)
+          .field("allow_spill_to_disk", param.allow_spill_to_disk)
+          .field("store_rowids", param.store_rowids)
+          .field("rewrite_semi_to_inner", param.rewrite_semi_to_inner)
+          .field("execution_order",
+                 "先读取 build_input 建哈希表；再读取 probe_input，用 JOIN key 到哈希表中查匹配")
+          .field("method_meaning", WzgJoinMethodMeaning(path))
+          .field("next_step",
+                 "HashJoinIterator 构建哈希表，并按 JOIN 类型返回匹配行、保留行或反匹配行")
+          .emit();
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void WzgEmitRefLookupKey(THD *thd, const AccessPath *path, const JOIN *join) {
+  if (path == nullptr || thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+
+  Index_lookup *ref = WzgRefLookup(path);
+  TABLE *table = WzgIteratorTargetTable(path);
+  if (ref == nullptr || table == nullptr || table->key_info == nullptr ||
+      table->s == nullptr || ref->key < 0 ||
+      static_cast<uint>(ref->key) >= table->s->keys)
+    return;
+
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  WZG_PROBE_EVENT(thd, "executor.ref_lookup_key")
+      .message("索引精确查找读取器已准备好 key 参数，后续会用这些值到索引中查找匹配行")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("table", WzgIteratorTableName(table))
+      .field("index", WzgIteratorIndexName(table, ref->key))
+      .field("lookup_type", WzgRefLookupTypeText(path->type))
+      .field("lookup_key_parts", WzgRefLookupKeyParts(table, ref))
+      .field("lookup_values", WzgRefLookupValues(thd, ref))
+      .field("lookup_value_source", WzgRefLookupSource(ref))
+      .field("key_parts_count", static_cast<std::uint64_t>(ref->key_parts))
+      .field("key_length", static_cast<std::uint64_t>(ref->key_length))
+      .field("null_rejecting", WzgRefLookupNullRejecting(ref))
+      .field("has_guarded_conditions", ref->has_guarded_conds())
+      .field("cache_behavior", WzgRefLookupCacheText(ref))
+      .field("parameter_meaning",
+             "lookup_values 是本次索引查找要写入 key_buff 的表达式；key_length 是编码后的 key 字节长度；lookup_key_parts 是这些值对应的索引列")
+      .field("next_step",
+             "RefIterator/EQRefIterator 调用 handler 索引读取接口，存储引擎按这个 key 定位匹配记录")
+      .emit();
+}
+
+void WzgEmitIndexRangeBounds(THD *thd, const AccessPath *path,
+                             const JOIN *join) {
+  if (path == nullptr || path->type != AccessPath::INDEX_RANGE_SCAN ||
+      thd == nullptr || thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  const auto &param = path->index_range_scan();
+  if (param.ranges == nullptr || param.num_ranges == 0 ||
+      param.used_key_part == nullptr || param.used_key_part[0].field == nullptr)
+    return;
+
+  TABLE *table = param.used_key_part[0].field->table;
+  if (table == nullptr || table->key_info == nullptr || table->s == nullptr ||
+      param.index >= table->s->keys)
+    return;
+
+  const KEY &key = table->key_info[param.index];
+  key_part_map used_map = 0;
+  for (unsigned i = 0; i < param.num_ranges; ++i) {
+    used_map |= param.ranges[i]->min_keypart_map;
+    used_map |= param.ranges[i]->max_keypart_map;
+  }
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  WZG_PROBE_EVENT(thd, "executor.index_range_bounds")
+      .message("索引范围读取器已准备好边界参数，后续会按这些边界请求存储引擎读取")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("table", WzgIteratorTableName(table))
+      .field("index", WzgIteratorIndexName(table, param.index))
+      .field("range_count", static_cast<std::uint64_t>(param.num_ranges))
+      .field("used_key_parts", WzgUsedKeyPartsText(key, used_map))
+      .field("range_parameters",
+             WzgRangeParametersList(param.ranges, param.num_ranges,
+                                    key.key_part))
+      .field("parameter_meaning",
+             "start_key/end_key 是传给 handler 的索引边界；length 是编码后的 key 字节长度；keypart_map 表示使用了哪些索引列；flag 表示是否包含边界以及如何定位第一条记录")
+      .field("next_step",
+             "IndexRangeScanIterator 调用 handler 接口，存储引擎根据这些边界在索引 B+Tree 中定位和扫描")
+      .emit();
+}
+
+void WzgEmitIteratorCreate(THD *thd, const AccessPath *path, const JOIN *join) {
+  if (path == nullptr || thd == nullptr) return;
+  if (thd->query().str == nullptr || thd->query().length == 0) return;
+  Query_block *query_block = join == nullptr ? nullptr : join->query_block;
+  WZG_PROBE_EVENT(thd, "executor.iterator_create")
+      .message("执行器已根据访问路径创建读取器")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("access_path_type", WzgIteratorAccessPathName(path->type))
+      .field("iterator_kind", WzgIteratorReadableName(path->type))
+      .field("target_table", WzgIteratorTableName(WzgIteratorTargetTable(path)))
+      .field("chosen_index", WzgIteratorChosenIndex(path))
+      .field("estimated_output_rows",
+             WzgIteratorDoubleToString(path->num_output_rows()))
+      .field("estimated_cost", WzgIteratorDoubleToString(path->cost()))
+      .field("counts_examined_rows", path->count_examined_rows)
+      .field("purpose", WzgIteratorPurpose(path))
+      .field("next_step", "执行阶段调用这个读取器的 Init 和 Read 方法获取数据")
+      .emit();
+}
 
 void SetupJobsForChildren(MEM_ROOT *mem_root, AccessPath *child, JOIN *join,
                           bool eligible_for_batch_mode,
@@ -1332,6 +2766,14 @@ unique_ptr_destroy_only<RowIterator> CreateIteratorFromAccessPath(
       return nullptr;
     }
 
+    WzgEmitIteratorCreate(thd, path, join);
+    WzgEmitFilterEval(thd, path, join);
+    WzgEmitLimitOffset(thd, path, join);
+    WzgEmitSortPlan(thd, path, join);
+    WzgEmitMaterializePlan(thd, path, join);
+    WzgEmitJoinMethod(thd, path, join);
+    WzgEmitRefLookupKey(thd, path, join);
+    WzgEmitIndexRangeBounds(thd, path, join);
     path->iterator = iterator.get();
     *job.destination = std::move(iterator);
   }

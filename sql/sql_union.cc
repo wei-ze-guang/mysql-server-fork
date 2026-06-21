@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +59,7 @@
 #include "prealloced_array.h"  // Prealloced_array
 #include "scope_guard.h"
 #include "sql/auth/auth_acls.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/current_thd.h"
 #include "sql/debug_sync.h"  // DEBUG_SYNC
 #include "sql/field.h"
@@ -96,6 +98,7 @@
 #include "sql/thd_raii.h"
 #include "sql/visible_fields.h"
 #include "sql/window.h"  // Window
+#include "sql/wzg_probe/wzg_probe.h"
 #include "template_utils.h"
 
 using std::vector;
@@ -103,6 +106,273 @@ using std::vector;
 class Item_rollup_group_item;
 class Item_rollup_sum_switcher;
 class Opt_trace_context;
+
+namespace {
+
+constexpr int kWzgExecutorMaxListItems = 12;
+constexpr size_t kWzgExecutorMaxExpressionBytes = 512;
+
+std::string wzg_executor_clip(std::string value, size_t max_bytes) {
+  if (value.size() <= max_bytes) return value;
+  value.resize(max_bytes);
+  value.append("...");
+  return value;
+}
+
+std::string wzg_executor_to_string(ha_rows value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
+}
+
+std::string wzg_executor_double_to_string(double value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
+}
+
+std::string wzg_executor_table_name(const Table_ref *table_ref) {
+  if (table_ref == nullptr) return "<unknown>";
+  std::string value;
+  if (table_ref->db != nullptr && table_ref->db_length > 0) {
+    value.append(table_ref->db, table_ref->db_length);
+    value.push_back('.');
+  }
+  if (table_ref->table_name != nullptr && table_ref->table_name_length > 0)
+    value.append(table_ref->table_name, table_ref->table_name_length);
+  else if (table_ref->alias != nullptr)
+    value.append(table_ref->alias);
+  else
+    value.append("<anonymous>");
+  return value;
+}
+
+std::string wzg_executor_item_text(THD *thd, const Item *item) {
+  if (item == nullptr) return "无";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  item->print(thd, &text, QT_ORDINARY);
+  return wzg_executor_clip(std::string(text.ptr(), text.length()),
+                           kWzgExecutorMaxExpressionBytes);
+}
+
+std::string wzg_executor_key_parts(const KEY &key) {
+  std::string value;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (part_no > 0) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    if (part.field != nullptr && part.field->field_name != nullptr)
+      value.append(part.field->field_name);
+    else
+      value.append("<expression>");
+  }
+  return value.empty() ? "<unknown>" : value;
+}
+
+std::string wzg_executor_chosen_index(const QEP_TAB *tab) {
+  if (tab == nullptr || tab->table() == nullptr) return "无";
+  const uint key_no = tab->effective_index();
+  TABLE *table = tab->table();
+  if (key_no == MAX_KEY || table->key_info == nullptr || table->s == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value(key.name == nullptr ? "<unnamed>" : key.name);
+  value.push_back('(');
+  value.append(wzg_executor_key_parts(key));
+  value.push_back(')');
+  return value;
+}
+
+std::string wzg_executor_read_order(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->qep_tab == nullptr || join->primary_tables == 0)
+    return "无表，可能是 SELECT 常量或系统变量";
+
+  std::string value;
+  int count = 0;
+  for (uint i = 0; i < join->primary_tables; ++i) {
+    QEP_TAB *tab = &join->qep_tab[i];
+    if (tab->table_ref == nullptr) continue;
+    if (count > 0) value.append("；");
+    if (count >= kWzgExecutorMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(std::to_string(count + 1));
+    value.append(". 读取 ");
+    value.append(wzg_executor_table_name(tab->table_ref));
+    ++count;
+  }
+  return count == 0 ? "无表，可能是 SELECT 常量或系统变量" : value;
+}
+
+std::string wzg_executor_access_methods(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->qep_tab == nullptr || join->primary_tables == 0)
+    return "不需要读取用户表";
+
+  std::string value;
+  int count = 0;
+  for (uint i = 0; i < join->primary_tables; ++i) {
+    QEP_TAB *tab = &join->qep_tab[i];
+    if (tab->table_ref == nullptr) continue;
+    if (count > 0) value.append("；");
+    if (count >= kWzgExecutorMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(wzg_executor_table_name(tab->table_ref));
+    value.append(" 使用 ");
+    value.append(join_type_str[tab->type()]);
+    value.append(" 访问");
+    const std::string index = wzg_executor_chosen_index(tab);
+    if (index != "无") {
+      value.append("，索引 ");
+      value.append(index);
+    } else {
+      value.append("，未选择单个索引");
+    }
+    value.append("，预计读取 ");
+    value.append(wzg_executor_double_to_string(tab->position()->rows_fetched));
+    value.append(" 行");
+    ++count;
+  }
+  return count == 0 ? "不需要读取用户表" : value;
+}
+
+std::string wzg_executor_filters(THD *thd, Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->qep_tab == nullptr || join->primary_tables == 0)
+    return "无表级过滤条件";
+
+  std::string value;
+  int count = 0;
+  for (uint i = 0; i < join->primary_tables; ++i) {
+    QEP_TAB *tab = &join->qep_tab[i];
+    Item *condition = tab->condition();
+    if (condition == nullptr) continue;
+    if (count > 0) value.append("；");
+    if (count >= kWzgExecutorMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append("读取 ");
+    value.append(wzg_executor_table_name(tab->table_ref));
+    value.append(" 后判断 ");
+    value.append(wzg_executor_item_text(thd, condition));
+    ++count;
+  }
+  return count == 0 ? "无表级过滤条件" : value;
+}
+
+std::string wzg_executor_join_plan(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->primary_tables <= 1) return "无 JOIN";
+  std::string value("按顺序组合表：");
+  value.append(wzg_executor_read_order(unit));
+  value.append("；后面的表会使用前面已经读到的列做匹配或过滤");
+  return value;
+}
+
+std::string wzg_executor_temporary_plan(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->tmp_tables == 0)
+    return "不需要额外临时表";
+  std::string value("需要 ");
+  value.append(std::to_string(join->tmp_tables));
+  value.append(" 个中间临时表，用于排序、分组、去重、窗口函数或子查询物化等中间处理");
+  return value;
+}
+
+std::string wzg_executor_filesort_plan(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->sort_cost <= 0.0)
+    return "不需要 filesort";
+  std::string value("需要额外排序，优化器估算排序成本 ");
+  value.append(wzg_executor_double_to_string(join->sort_cost));
+  return value;
+}
+
+std::string wzg_executor_subquery_overview(Query_expression *unit) {
+  if (unit == nullptr || unit->item == nullptr) return "无子查询上下文";
+  Query_block *subquery = unit->first_query_block();
+  Query_block *outer = unit->outer_query_block();
+  std::string value("当前执行查询块 ");
+  value.append(subquery == nullptr ? "未知" : std::to_string(subquery->select_number));
+  value.append("，它作为外层查询块 ");
+  value.append(outer == nullptr ? "未知" : std::to_string(outer->select_number));
+  value.append(" 的子查询使用");
+  return value;
+}
+
+void wzg_emit_executor_start(THD *thd, Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  WZG_PROBE_EVENT(thd, "executor.start")
+      .message(unit != nullptr && unit->item != nullptr
+                   ? "开始执行子查询计划，准备生成外层查询可使用的结果"
+                   : "开始执行查询计划，准备真正读取数据")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("query_role",
+             unit != nullptr && unit->item != nullptr ? "子查询" : "外层或普通查询")
+      .field("read_order", wzg_executor_read_order(unit))
+      .field("access_methods", wzg_executor_access_methods(unit))
+      .field("filters", wzg_executor_filters(thd, unit))
+      .field("join_plan", wzg_executor_join_plan(unit))
+      .field("temporary_table", wzg_executor_temporary_plan(unit))
+      .field("filesort", wzg_executor_filesort_plan(unit))
+      .field("estimated_result_rows",
+             join == nullptr ? "未知" : wzg_executor_to_string(join->best_rowcount))
+      .field("subquery_context", wzg_executor_subquery_overview(unit))
+      .field("next_step", "调用执行器迭代器，从计划的第一步开始读取行")
+      .emit();
+}
+
+void wzg_emit_executor_finish(THD *thd, Query_expression *unit,
+                              ha_rows sent_records, bool error) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  const ha_rows examined_rows = join == nullptr ? 0 : join->examined_rows;
+  WZG_PROBE_EVENT(thd, "executor.finish")
+      .message(error ? "查询执行提前结束，执行过程中出现错误或被中断"
+                     : "查询执行完成，结果已返回给客户端或上层查询")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("query_role",
+             unit != nullptr && unit->item != nullptr ? "子查询" : "外层或普通查询")
+      .field("execution_result", error ? "error" : "success")
+      .field("sent_rows_from_this_executor",
+             wzg_executor_to_string(sent_records))
+      .field("examined_rows_from_this_query_block",
+             wzg_executor_to_string(examined_rows))
+      .field("thd_total_sent_rows",
+             wzg_executor_to_string(thd->get_sent_row_count()))
+      .field("thd_total_examined_rows_before_cleanup",
+             wzg_executor_to_string(thd->get_examined_row_count()))
+      .field("result_destination",
+             unit != nullptr && unit->item != nullptr
+                 ? "返回给外层查询继续判断"
+                 : "返回给客户端")
+      .field("note", "这里是真实执行后的统计，不是优化器估算值")
+      .emit();
+}
+
+}  // namespace
 
 bool Query_result_union::prepare(THD *, const mem_root_deque<Item *> &,
                                  Query_expression *u) {
@@ -1713,6 +1983,22 @@ bool Query_expression::ExecuteIteratorQuery(THD *thd) {
   }
 
   set_executed();
+  wzg_emit_executor_start(thd, this);
+  bool wzg_executor_finish_emitted = false;
+  auto wzg_executor_finish = create_scope_guard([&] {
+    if (!wzg_executor_finish_emitted) {
+      ha_rows sent_records = 0;
+      if (is_simple()) {
+        sent_records = first_query_block()->join->send_records;
+      } else if (set_operation() != nullptr && set_operation()->m_is_materialized) {
+        sent_records = query_term()->query_block()->join->send_records;
+      } else {
+        sent_records = send_records;
+      }
+      wzg_emit_executor_finish(thd, this, sent_records,
+                               thd->is_error() || thd->killed);
+    }
+  });
 
   // Hand over the query to the secondary engine if needed.
   if (first_query_block()->join->override_executor_func != nullptr) {
@@ -1817,7 +2103,10 @@ bool Query_expression::ExecuteIteratorQuery(THD *thd) {
 
   thd->current_found_rows = *send_records_ptr;
 
-  return query_result->send_eof(thd);
+  const bool send_eof_error = query_result->send_eof(thd);
+  wzg_emit_executor_finish(thd, this, *send_records_ptr, send_eof_error);
+  wzg_executor_finish_emitted = true;
+  return send_eof_error;
 }
 
 /**
