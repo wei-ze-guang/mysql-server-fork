@@ -78,6 +78,8 @@
 #include "mysys_err.h"  // EE_CAPACITY_EXCEEDED
 #include "nulls.h"
 #include "pfs_thread_provider.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
+#include "sql/wzg_probe/wzg_probe.h"
 #include "prealloced_array.h"
 #include "scope_guard.h"
 #include "sql/auth/auth_acls.h"
@@ -1462,6 +1464,17 @@ bool do_command(THD *thd) {
 
   DEBUG_SYNC(thd, "before_command_dispatch");
 
+  wzg_probe::clear_raw_sql();
+  WZG_PROBE_EVENT(thd, "command.dispatch")
+      .message("开始分发客户端命令")
+      .command(Command_names::str_notranslate(command).c_str())
+      .field("command_name", Command_names::str_notranslate(command))
+      .field("packet_length",
+             static_cast<std::uint64_t>(
+                 thd->get_protocol_classic()->get_packet_length()))
+      .field("note", "客户端命令已读取完成，准备进入 dispatch_command")
+      .emit();
+
   return_value = dispatch_command(thd, &com_data, command);
   thd->get_protocol_classic()->get_output_packet()->shrink(
       thd->variables.net_buffer_length);
@@ -2092,6 +2105,18 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         MYSQL_NOTIFY_STATEMENT_QUERY_ATTRIBUTES(thd->m_statement_psi, false);
         break;  // fatal error is set
       }
+      wzg_probe::set_raw_sql(thd->query().str, thd->query().length);
+
+      WZG_PROBE_EVENT(thd, "sql.query_received")
+          .message("服务端已接收到 SQL 文本")
+          .command(Command_names::str_notranslate(command).c_str())
+          .field("query_length",
+                 static_cast<std::uint64_t>(thd->query().length))
+          .field("query_preview", thd->query().str == nullptr ? ""
+                                                              : thd->query().str)
+          .field("note",
+                 "这里还没有进入完整 SQL 执行，只确认 SQL 文本已经进入 THD")
+          .emit();
 
       const char *packet_end = thd->query().str + thd->query().length;
 
@@ -2907,6 +2932,17 @@ static inline void binlog_gtid_end_transaction(THD *thd) {
 */
 
 int mysql_execute_command(THD *thd, bool first_level) {
+  std::unique_ptr<wzg_probe::Scope> wzg_sql_scope;
+  if (first_level) {
+    wzg_sql_scope = std::make_unique<wzg_probe::Scope>(thd, "sql.parse_execute");
+    wzg_sql_scope->message("SQL 解析和执行主流程结束")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("first_level", first_level)
+        .field("sql_command_name", get_sql_command_string(thd->lex->sql_command))
+        .field("note",
+               "这一条表示 SQL 主执行函数已经返回，后续可以继续细分优化器、锁、MVCC 等阶段");
+  }
+
   int res = false;
   LEX *const lex = thd->lex;
   /* first Query_block (have special meaning for many of non-SELECTcommands) */
@@ -5259,6 +5295,99 @@ void statement_id_to_session(THD *thd) {
     sysvar_tracker->mark_as_changed(thd, cs_statement);
   }
 }
+
+static const char *wzg_statement_type(enum_sql_command command) {
+  switch (command) {
+    case SQLCOM_SELECT:
+      return "查询语句";
+    case SQLCOM_INSERT:
+    case SQLCOM_INSERT_SELECT:
+    case SQLCOM_REPLACE:
+    case SQLCOM_REPLACE_SELECT:
+      return "写入语句";
+    case SQLCOM_UPDATE:
+    case SQLCOM_UPDATE_MULTI:
+      return "更新语句";
+    case SQLCOM_DELETE:
+    case SQLCOM_DELETE_MULTI:
+      return "删除语句";
+    case SQLCOM_CREATE_TABLE:
+    case SQLCOM_ALTER_TABLE:
+    case SQLCOM_DROP_TABLE:
+    case SQLCOM_CREATE_DB:
+    case SQLCOM_ALTER_DB:
+    case SQLCOM_DROP_DB:
+    case SQLCOM_CREATE_INDEX:
+    case SQLCOM_DROP_INDEX:
+      return "结构变更语句";
+    case SQLCOM_BEGIN:
+    case SQLCOM_COMMIT:
+    case SQLCOM_ROLLBACK:
+    case SQLCOM_ROLLBACK_TO_SAVEPOINT:
+    case SQLCOM_SAVEPOINT:
+    case SQLCOM_RELEASE_SAVEPOINT:
+      return "事务控制语句";
+    case SQLCOM_SET_OPTION:
+      return "会话设置语句";
+    default:
+      return "其他语句";
+  }
+}
+
+static const char *wzg_statement_summary(enum_sql_command command) {
+  switch (command) {
+    case SQLCOM_SELECT:
+      return "读取数据，不直接修改表数据";
+    case SQLCOM_INSERT:
+    case SQLCOM_INSERT_SELECT:
+    case SQLCOM_REPLACE:
+    case SQLCOM_REPLACE_SELECT:
+      return "准备向表写入新数据";
+    case SQLCOM_UPDATE:
+    case SQLCOM_UPDATE_MULTI:
+      return "准备修改表中的已有数据";
+    case SQLCOM_DELETE:
+    case SQLCOM_DELETE_MULTI:
+      return "准备删除表中的数据";
+    case SQLCOM_CREATE_TABLE:
+    case SQLCOM_ALTER_TABLE:
+    case SQLCOM_DROP_TABLE:
+    case SQLCOM_CREATE_DB:
+    case SQLCOM_ALTER_DB:
+    case SQLCOM_DROP_DB:
+    case SQLCOM_CREATE_INDEX:
+    case SQLCOM_DROP_INDEX:
+      return "准备修改数据库对象结构";
+    case SQLCOM_BEGIN:
+    case SQLCOM_COMMIT:
+    case SQLCOM_ROLLBACK:
+    case SQLCOM_ROLLBACK_TO_SAVEPOINT:
+    case SQLCOM_SAVEPOINT:
+    case SQLCOM_RELEASE_SAVEPOINT:
+      return "准备控制事务边界或保存点";
+    case SQLCOM_SET_OPTION:
+      return "准备修改当前会话或系统设置";
+    default:
+      return "解析器已识别语句类型，具体含义交给后续阶段处理";
+  }
+}
+
+static std::uint64_t wzg_query_block_count(const LEX *lex) {
+  std::uint64_t count = 0;
+  if (lex == nullptr) return count;
+  for (Query_block *query_block = lex->all_query_blocks_list;
+       query_block != nullptr; query_block = query_block->next_select_in_list()) {
+    ++count;
+  }
+  return count;
+}
+
+static const char *wzg_query_structure(std::uint64_t query_block_count) {
+  if (query_block_count == 0) return "非查询块语句";
+  if (query_block_count == 1) return "单层查询";
+  return "主查询包含子查询或其他嵌套查询块";
+}
+
 /*
   When you modify dispatch_sql_command(), you may need to modify
   mysql_test_parse_for_slave() in this same file.
@@ -5284,6 +5413,14 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state) {
   thd->reset_rewritten_query();
   lex_start(thd);
 
+  WZG_PROBE_EVENT(thd, "parser.start")
+      .message("开始解析 SQL，服务端准备检查语法并理解语句结构")
+      .field("parse_result", "started")
+      .field("statement_type", "待识别")
+      .field("next_step", "检查 SQL 语法，并生成后续阶段可使用的内部结构")
+      .field("note", "解析器负责读懂 SQL，不负责真正读取表数据或决定最终执行顺序")
+      .emit();
+
   thd->m_parser_state = parser_state;
   invoke_pre_parse_rewrite_plugins(thd);
   thd->m_parser_state = nullptr;
@@ -5306,6 +5443,41 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state) {
     found_semicolon = parser_state->m_lip.found_semicolon;
     qlen = found_semicolon ? (found_semicolon - thd->query().str)
                            : thd->query().length;
+
+    const std::uint64_t query_block_count = wzg_query_block_count(thd->lex);
+    if (!err) {
+      WZG_PROBE_EVENT(thd, "parser.finish")
+          .message(query_block_count > 1
+                       ? "SQL 语法解析完成，发现主查询中包含子查询结构"
+                       : "SQL 语法解析完成，服务端已经理解这条语句要做什么")
+          .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("parse_result", "success")
+          .field("statement_type", wzg_statement_type(thd->lex->sql_command))
+          .field("statement_summary",
+                 wzg_statement_summary(thd->lex->sql_command))
+          .field("has_subquery", query_block_count > 1)
+          .field("query_block_count", query_block_count)
+          .field("query_structure", wzg_query_structure(query_block_count))
+          .field("has_multiple_statements", found_semicolon != nullptr)
+          .field("has_comment", parser_state->has_comment())
+          .field("current_statement_length", static_cast<std::uint64_t>(qlen))
+          .field("parser_output",
+                 query_block_count > 1
+                     ? "已生成主查询和子查询的内部结构，供后续优化器使用"
+                     : "已生成当前语句的内部结构，供后续阶段使用")
+          .field("next_step",
+                 "进入优化器或执行阶段，由后续阶段决定改写方式、表访问顺序和索引选择")
+          .field("note", "解析器识别语句结构，但不最终决定哪一部分先执行")
+          .emit();
+    } else {
+      WZG_PROBE_EVENT(thd, "parser.error")
+          .message("SQL 语法解析失败，服务端无法理解这条语句")
+          .field("parse_result", "error")
+          .field("statement_type", "未知")
+          .field("next_step", "返回语法错误给客户端，不进入正常执行阶段")
+          .field("note", "这一步失败后不会进入优化器和执行器主流程")
+          .emit();
+    }
     /*
       We set thd->query_length correctly to not log several queries, when we
       execute only first. We set it to not see the ';' otherwise it would get

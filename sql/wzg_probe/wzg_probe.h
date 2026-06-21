@@ -2,6 +2,7 @@
 #define SQL_WZG_PROBE_WZG_PROBE_H
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 
 class THD;
@@ -23,6 +24,9 @@ class Event {
   Event &field(const char *key, std::int64_t value);
   Event &field(const char *key, std::uint64_t value);
   Event &field(const char *key, bool value);
+  Event &message(const char *value);
+  Event &command(const char *value);
+  Event &sql_command(const char *value);
 
   void emit();
 
@@ -46,6 +50,9 @@ class Scope {
   Scope &field(const char *key, std::int64_t value);
   Scope &field(const char *key, std::uint64_t value);
   Scope &field(const char *key, bool value);
+  Scope &message(const char *value);
+  Scope &command(const char *value);
+  Scope &sql_command(const char *value);
 
  private:
   Event m_event;
@@ -53,6 +60,8 @@ class Scope {
 
 void on_connection_start(THD *thd);
 void on_connection_end(THD *thd);
+void set_raw_sql(const char *sql, std::size_t length);
+void clear_raw_sql();
 
 }  // namespace wzg_probe
 

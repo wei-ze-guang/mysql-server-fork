@@ -80,6 +80,7 @@ TARGET_LINK_LIBRARIES(mysqld
 
   "command": "COM_QUERY",                  // MySQL 协议命令类型，后续在 dispatch_command 插桩时填充
   "sql_command": "SQLCOM_SELECT",          // SQL 语义命令类型，解析后才可能填充
+  "raw_sql": "select 1",                   // 客户端发来的原始 SQL 快照，供后续与改写/归一化 SQL 对比
   "query": "select 1",                     // 当前 SQL 文本；当前模块限制最多复制 4096 字节
 
   "error": false,                          // 当前事件记录时 THD 是否处于错误状态
@@ -154,10 +155,76 @@ WZG_PROBE_EVENT(thd, "connection.start")
 
 ## 当前输出
 
-当前 `wzg_file_sink.cc` 先输出到 `stderr`。因为模块还没有插到执行路径，所以正常启动不会产生 WZG 日志。后续接入运行路径后，再把 sink 改为项目内文件，例如：
+当前 `wzg_file_sink.cc` 通过环境变量 `WZG_PROBE_LOG` 指定输出文件。推荐启动时设置：
+
+```bash
+WZG_PROBE_LOG="$PWD/_runtime/mysql-local/logs/wzg-probe.jsonl" \
+_build/mysql-local/runtime_output_directory/mysqld --daemonize ...
+```
+
+如果没有设置 `WZG_PROBE_LOG`，WZG Probe 会回退到 `stderr`。
+
+当前已接入的第一批事件：
 
 ```text
-_runtime/mysql-local/logs/wzg-probe.jsonl
+connection.start
+command.dispatch
+sql.query_received
+parser.start
+parser.finish
+parser.error
+sql.parse_execute
+connection.end
+```
+
+Parser 事件使用解释型日志，不暴露过多内部变量名。重点回答：
+
+```text
+SQL 是否通过语法解析
+解析器识别出它是哪类语句
+是否发现子查询/嵌套查询块
+解析结果会交给哪个后续阶段
+解析器不负责最终执行顺序、索引选择和真实读写数据
+```
+
+`raw_sql` 应尽量贯穿 parser、optimizer、executor 等后续阶段，表示客户端发来的原始 SQL。后续如果加入 `rewritten_sql`、`normalized_sql` 或执行计划摘要，可以和 `raw_sql` 对比。
+
+成功示例：
+
+```jsonc
+{
+  "event_name": "parser.finish",
+  "message": "SQL 语法解析完成，发现主查询中包含子查询结构",
+  "sql_command": "select",
+  "fields": {
+    "parse_result": "success",
+    "statement_type": "查询语句",
+    "statement_summary": "读取数据，不直接修改表数据",
+    "has_subquery": "true",
+    "query_block_count": "3",
+    "query_structure": "主查询包含子查询或其他嵌套查询块",
+    "parser_output": "已生成主查询和子查询的内部结构，供后续优化器使用",
+    "next_step": "进入优化器或执行阶段，由后续阶段决定改写方式、表访问顺序和索引选择",
+    "note": "解析器识别语句结构，但不最终决定哪一部分先执行"
+  }
+}
+```
+
+失败示例：
+
+```jsonc
+{
+  "event_name": "parser.error",
+  "message": "SQL 语法解析失败，服务端无法理解这条语句",
+  "error": true,
+  "error_code": 1064,
+  "fields": {
+    "parse_result": "error",
+    "statement_type": "未知",
+    "next_step": "返回语法错误给客户端，不进入正常执行阶段",
+    "note": "这一步失败后不会进入优化器和执行器主流程"
+  }
+}
 ```
 
 ## 增量编译建议

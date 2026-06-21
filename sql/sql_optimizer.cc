@@ -44,6 +44,7 @@
 #include <deque>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -64,6 +65,7 @@
 #include "mysqld_error.h"
 #include "scope_guard.h"
 #include "sql/check_stack.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/current_thd.h"
 #include "sql/debug_sync.h"  // DEBUG_SYNC
 #include "sql/derror.h"      // ER_THD
@@ -115,12 +117,1256 @@
 #include "sql/table.h"
 #include "sql/thd_raii.h"
 #include "sql/window.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql_string.h"
 #include "template_utils.h"
 
 using std::ceil;
 using std::max;
 using std::min;
+
+namespace {
+
+constexpr int kWzgOptimizerMaxListItems = 12;
+constexpr size_t kWzgOptimizerMaxExpressionBytes = 512;
+
+std::string wzg_optimizer_clip(std::string value, size_t max_bytes) {
+  if (value.size() <= max_bytes) return value;
+  value.resize(max_bytes);
+  value.append("...");
+  return value;
+}
+
+std::string wzg_optimizer_table_name(const Table_ref *table_ref) {
+  if (table_ref == nullptr) return "";
+  std::string value;
+  if (table_ref->db != nullptr && table_ref->db_length > 0) {
+    value.append(table_ref->db, table_ref->db_length);
+    value.push_back('.');
+  }
+  if (table_ref->table_name != nullptr && table_ref->table_name_length > 0)
+    value.append(table_ref->table_name, table_ref->table_name_length);
+  else if (table_ref->alias != nullptr)
+    value.append(table_ref->alias);
+  else
+    value.append("<anonymous>");
+  return value;
+}
+
+std::string wzg_optimizer_tables(Query_block *query_block) {
+  std::string value;
+  int count = 0;
+  for (Table_ref *table_ref = query_block == nullptr ? nullptr
+                                                     : query_block->leaf_tables;
+       table_ref != nullptr; table_ref = table_ref->next_leaf) {
+    if (count > 0) value.append(", ");
+    if (count >= kWzgOptimizerMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(wzg_optimizer_table_name(table_ref));
+    ++count;
+  }
+  return count == 0 ? "无表，可能是 SELECT 常量或系统变量" : value;
+}
+
+std::string wzg_optimizer_item_text(THD *thd, const Item *item) {
+  if (item == nullptr) return "无";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  item->print(thd, &text, QT_ORDINARY);
+  return wzg_optimizer_clip(std::string(text.ptr(), text.length()),
+                            kWzgOptimizerMaxExpressionBytes);
+}
+
+std::string wzg_optimizer_return_columns(THD *thd,
+                                         mem_root_deque<Item *> *fields) {
+  std::string value;
+  int count = 0;
+  if (fields == nullptr) return "无返回字段";
+  for (Item *item : VisibleFields(*fields)) {
+    if (count > 0) value.append(", ");
+    if (count >= kWzgOptimizerMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(wzg_optimizer_item_text(thd, item));
+    ++count;
+  }
+  return count == 0 ? "无返回字段" : value;
+}
+
+std::string wzg_optimizer_input_summary(THD *thd, Query_block *query_block,
+                                        mem_root_deque<Item *> *fields) {
+  std::string value("已经确认要读取 ");
+  value.append(wzg_optimizer_tables(query_block));
+  value.append("，返回 ");
+  value.append(wzg_optimizer_return_columns(thd, fields));
+  value.append(" 字段");
+  if (query_block != nullptr && query_block->where_cond() != nullptr) {
+    value.append("，并按 ");
+    value.append(wzg_optimizer_item_text(thd, query_block->where_cond()));
+    value.append(" 过滤");
+  } else {
+    value.append("，没有 WHERE 过滤条件");
+  }
+  return value;
+}
+
+std::string wzg_optimizer_to_string(ha_rows value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
+}
+
+std::string wzg_optimizer_key_parts(const KEY &key) {
+  std::string value;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (part_no > 0) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    if (part.field != nullptr && part.field->field_name != nullptr)
+      value.append(part.field->field_name);
+    else
+      value.append("<expression>");
+  }
+  return value.empty() ? "<unknown>" : value;
+}
+
+std::string wzg_optimizer_index_list(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr || table->s->keys == 0 ||
+      table->key_info == nullptr)
+    return "无索引";
+
+  std::string value;
+  for (uint key_no = 0; key_no < table->s->keys; ++key_no) {
+    if (key_no > 0) value.append(", ");
+    const KEY &key = table->key_info[key_no];
+    value.append(key.name == nullptr ? "<unnamed>" : key.name);
+    value.push_back('(');
+    value.append(wzg_optimizer_key_parts(key));
+    value.push_back(')');
+  }
+  return value;
+}
+
+std::string wzg_optimizer_key_map_list(const TABLE *table,
+                                       const Key_map &keys) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      table->s->keys == 0 || keys.is_clear_all())
+    return "无";
+
+  std::string value;
+  int count = 0;
+  for (uint key_no = 0; key_no < table->s->keys; ++key_no) {
+    if (!keys.is_set(key_no)) continue;
+    if (count > 0) value.append(", ");
+    const KEY &key = table->key_info[key_no];
+    value.append(key.name == nullptr ? "<unnamed>" : key.name);
+    value.push_back('(');
+    value.append(wzg_optimizer_key_parts(key));
+    value.push_back(')');
+    ++count;
+  }
+  return count == 0 ? "无" : value;
+}
+
+const char *wzg_optimizer_condition_shape(Item_func::Functype functype) {
+  switch (functype) {
+    case Item_func::EQ_FUNC:
+    case Item_func::EQUAL_FUNC:
+    case Item_func::MULT_EQUAL_FUNC:
+      return "等值条件";
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+      return "范围条件";
+    case Item_func::BETWEEN:
+      return "区间条件";
+    case Item_func::IN_FUNC:
+      return "多值条件";
+    case Item_func::LIKE_FUNC:
+      return "LIKE 条件";
+    case Item_func::ISNULL_FUNC:
+    case Item_func::ISNOTNULL_FUNC:
+      return "空值判断条件";
+    case Item_func::MEMBER_OF_FUNC:
+    case Item_func::JSON_CONTAINS:
+    case Item_func::JSON_OVERLAPS:
+      return "JSON 或多值索引相关条件";
+    case Item_func::SP_EQUALS_FUNC:
+    case Item_func::SP_WITHIN_FUNC:
+    case Item_func::SP_CONTAINS_FUNC:
+    case Item_func::SP_INTERSECTS_FUNC:
+    case Item_func::SP_DISJOINT_FUNC:
+    case Item_func::SP_COVERS_FUNC:
+    case Item_func::SP_COVEREDBY_FUNC:
+    case Item_func::SP_OVERLAPS_FUNC:
+    case Item_func::SP_TOUCHES_FUNC:
+    case Item_func::SP_CROSSES_FUNC:
+      return "空间关系条件";
+    case Item_func::NE_FUNC:
+      return "不等条件";
+    default:
+      return "其他条件";
+  }
+}
+
+const char *wzg_optimizer_condition_operator(Item_func::Functype functype) {
+  switch (functype) {
+    case Item_func::EQ_FUNC:
+      return "=";
+    case Item_func::EQUAL_FUNC:
+      return "<=>";
+    case Item_func::NE_FUNC:
+      return "<>";
+    case Item_func::GT_FUNC:
+      return ">";
+    case Item_func::GE_FUNC:
+      return ">=";
+    case Item_func::LT_FUNC:
+      return "<";
+    case Item_func::LE_FUNC:
+      return "<=";
+    case Item_func::BETWEEN:
+      return "BETWEEN";
+    case Item_func::IN_FUNC:
+      return "IN";
+    case Item_func::LIKE_FUNC:
+      return "LIKE";
+    case Item_func::ISNULL_FUNC:
+      return "IS NULL";
+    case Item_func::ISNOTNULL_FUNC:
+      return "IS NOT NULL";
+    case Item_func::MEMBER_OF_FUNC:
+      return "MEMBER OF";
+    case Item_func::MULT_EQUAL_FUNC:
+      return "=";
+    case Item_func::JSON_CONTAINS:
+      return "JSON_CONTAINS";
+    case Item_func::JSON_OVERLAPS:
+      return "JSON_OVERLAPS";
+    case Item_func::SP_EQUALS_FUNC:
+      return "SP_EQUALS";
+    case Item_func::SP_WITHIN_FUNC:
+      return "SP_WITHIN";
+    case Item_func::SP_CONTAINS_FUNC:
+      return "SP_CONTAINS";
+    case Item_func::SP_INTERSECTS_FUNC:
+      return "SP_INTERSECTS";
+    case Item_func::SP_DISJOINT_FUNC:
+      return "SP_DISJOINT";
+    case Item_func::SP_COVERS_FUNC:
+      return "SP_COVERS";
+    case Item_func::SP_COVEREDBY_FUNC:
+      return "SP_COVEREDBY";
+    case Item_func::SP_OVERLAPS_FUNC:
+      return "SP_OVERLAPS";
+    case Item_func::SP_TOUCHES_FUNC:
+      return "SP_TOUCHES";
+    case Item_func::SP_CROSSES_FUNC:
+      return "SP_CROSSES";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+const char *wzg_optimizer_condition_explain(Item_func::Functype functype) {
+  switch (functype) {
+    case Item_func::EQ_FUNC:
+    case Item_func::EQUAL_FUNC:
+    case Item_func::MULT_EQUAL_FUNC:
+      return "字段和固定值或另一列做相等比较";
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+      return "字段和固定值或另一列做大小比较";
+    case Item_func::BETWEEN:
+      return "字段落在一个上下界区间内，类似 >= low AND <= high";
+    case Item_func::IN_FUNC:
+      return "字段和多个候选值比较，类似多个等值条件";
+    case Item_func::LIKE_FUNC:
+      return "字段按字符串模式匹配，前缀匹配更容易成为索引候选";
+    case Item_func::ISNULL_FUNC:
+    case Item_func::ISNOTNULL_FUNC:
+      return "字段和 NULL 状态做比较";
+    case Item_func::MEMBER_OF_FUNC:
+    case Item_func::JSON_CONTAINS:
+    case Item_func::JSON_OVERLAPS:
+      return "JSON 或数组成员关系，可能关联多值索引";
+    case Item_func::SP_EQUALS_FUNC:
+    case Item_func::SP_WITHIN_FUNC:
+    case Item_func::SP_CONTAINS_FUNC:
+    case Item_func::SP_INTERSECTS_FUNC:
+    case Item_func::SP_DISJOINT_FUNC:
+    case Item_func::SP_COVERS_FUNC:
+    case Item_func::SP_COVEREDBY_FUNC:
+    case Item_func::SP_OVERLAPS_FUNC:
+    case Item_func::SP_TOUCHES_FUNC:
+    case Item_func::SP_CROSSES_FUNC:
+      return "空间关系判断，可能关联空间索引";
+    case Item_func::NE_FUNC:
+      return "字段和固定值或另一列做不等比较，通常不如等值条件适合索引定位";
+    default:
+      return "优化器正在检查这个条件是否能变成索引候选";
+  }
+}
+
+std::string wzg_optimizer_condition_values(THD *thd, Item **value,
+                                           uint num_values) {
+  if (value == nullptr || num_values == 0) return "无";
+  std::string out;
+  for (uint i = 0; i < num_values; ++i) {
+    if (i > 0) out.append(", ");
+    out.append(wzg_optimizer_item_text(thd, value[i]));
+  }
+  return out;
+}
+
+std::string wzg_optimizer_condition_column(const Item_field *item_field) {
+  if (item_field == nullptr || item_field->field == nullptr ||
+      item_field->field->field_name == nullptr)
+    return "未知字段";
+  return item_field->field->field_name;
+}
+
+std::string wzg_optimizer_condition_message(const Item_field *item_field,
+                                            Item_func::Functype functype,
+                                            bool index_candidate) {
+  std::string message("分析 WHERE 条件，发现 ");
+  message.append(wzg_optimizer_condition_column(item_field));
+  message.push_back(' ');
+  message.append(wzg_optimizer_condition_operator(functype));
+  message.append(index_candidate ? " 可以作为索引候选" : " 不能作为索引候选");
+  return message;
+}
+
+void wzg_emit_optimizer_condition_analysis(
+    THD *thd, Item_func *cond, Item_field *item_field, Item **value,
+    uint num_values, const TABLE *table, const Key_map *matched_keys,
+    bool is_index_column, bool index_candidate, const char *candidate_meaning,
+    const char *reason) {
+  const Item_func::Functype functype = cond->functype();
+  WZG_PROBE_EVENT(thd, "optimizer.condition_analysis")
+      .message(wzg_optimizer_condition_message(item_field, functype,
+                                               index_candidate)
+                   .c_str())
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("where_condition", wzg_optimizer_item_text(thd, cond))
+      .field("condition_shape", wzg_optimizer_condition_shape(functype))
+      .field("condition_explain", wzg_optimizer_condition_explain(functype))
+      .field("condition_column", wzg_optimizer_condition_column(item_field))
+      .field("condition_operator", wzg_optimizer_condition_operator(functype))
+      .field("condition_value",
+             wzg_optimizer_condition_values(thd, value, num_values))
+      .field("is_index_column", is_index_column)
+      .field("matched_indexes",
+             matched_keys == nullptr ? "无"
+                                     : wzg_optimizer_key_map_list(table,
+                                                                  *matched_keys))
+      .field("index_candidate", index_candidate)
+      .field("candidate_meaning", candidate_meaning)
+      .field("reason", reason)
+      .field("next_step", "后续优化器继续比较候选方案和其他访问方式的成本")
+      .field("note", "这里表示条件候选分析，不等于最终一定选择该索引")
+      .emit();
+}
+
+const char *wzg_optimizer_access_type_explain(enum join_type type) {
+  switch (type) {
+    case JT_SYSTEM:
+      return "系统表或只有一行的表，优化器把它当作常量读取";
+    case JT_CONST:
+      return "主键或唯一索引等值查找，预计最多匹配一行";
+    case JT_EQ_REF:
+      return "连接中使用唯一索引等值查找，每个前表组合最多匹配一行";
+    case JT_REF:
+      return "使用普通索引等值查找，可能匹配多行";
+    case JT_ALL:
+      return "全表扫描，需要按表数据逐行检查";
+    case JT_RANGE:
+      return "范围扫描，按索引范围读取一段数据";
+    case JT_INDEX_SCAN:
+      return "全索引扫描，扫描索引叶子而不是直接扫描整张表数据";
+    case JT_FT:
+      return "全文索引访问";
+    case JT_REF_OR_NULL:
+      return "类似普通索引等值查找，但还会额外查找 NULL 值";
+    case JT_INDEX_MERGE:
+      return "索引合并，组合多个索引范围的结果";
+    case JT_UNKNOWN:
+      return "访问方式尚未确定";
+  }
+  return "未知访问方式";
+}
+
+std::string wzg_optimizer_access_table_name(const QEP_TAB *tab) {
+  if (tab == nullptr) return "";
+  if (tab->table_ref != nullptr) return wzg_optimizer_table_name(tab->table_ref);
+  TABLE *table = tab->table();
+  if (table != nullptr && table->s != nullptr) {
+    std::string value;
+    if (table->s->db.str != nullptr && table->s->db.length > 0) {
+      value.append(table->s->db.str, table->s->db.length);
+      value.push_back('.');
+    }
+    if (table->s->table_name.str != nullptr &&
+        table->s->table_name.length > 0)
+      value.append(table->s->table_name.str, table->s->table_name.length);
+    return value.empty() ? "<unknown>" : value;
+  }
+  return "<unknown>";
+}
+
+std::string wzg_optimizer_chosen_index(const QEP_TAB *tab) {
+  if (tab == nullptr || tab->table() == nullptr) return "无";
+  const uint key_no = tab->effective_index();
+  if (key_no == MAX_KEY) return "无";
+  TABLE *table = tab->table();
+  if (table->key_info == nullptr || table->s == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value(key.name == nullptr ? "<unnamed>" : key.name);
+  value.push_back('(');
+  value.append(wzg_optimizer_key_parts(key));
+  value.push_back(')');
+  return value;
+}
+
+std::string wzg_optimizer_double_to_string(double value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
+}
+
+std::string wzg_optimizer_access_reason(const QEP_TAB *tab) {
+  if (tab == nullptr) return "优化器已经生成访问方式";
+  switch (tab->type()) {
+    case JT_CONST:
+    case JT_EQ_REF:
+    case JT_REF:
+    case JT_REF_OR_NULL:
+      return "优化器最终选择使用索引等值查找访问这张表";
+    case JT_RANGE:
+      return "优化器最终选择使用索引范围扫描访问这张表";
+    case JT_INDEX_SCAN:
+      return "优化器最终选择扫描索引叶子来读取这张表";
+    case JT_ALL:
+      return "优化器最终选择全表扫描，当前计划没有使用单个索引定位记录";
+    case JT_INDEX_MERGE:
+      return "优化器最终选择索引合并，组合多个索引范围的结果";
+    case JT_FT:
+      return "优化器最终选择全文索引访问";
+    case JT_SYSTEM:
+      return "优化器把这张表当作只有一行的常量表处理";
+    case JT_UNKNOWN:
+      return "访问方式尚未确定";
+  }
+  return "优化器已经生成访问方式";
+}
+
+void wzg_emit_optimizer_access_paths(THD *thd, JOIN *join) {
+  if (join == nullptr || join->qep_tab == nullptr) return;
+  for (uint i = 0; i < join->primary_tables; ++i) {
+    QEP_TAB *tab = &join->qep_tab[i];
+    if (tab->table() == nullptr) continue;
+    POSITION *position = tab->position();
+    WZG_PROBE_EVENT(thd, "optimizer.access_path")
+        .message("优化器已为一张表选择最终访问方式")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("table", wzg_optimizer_access_table_name(tab))
+        .field("access_type", join_type_str[tab->type()])
+        .field("access_type_explain",
+               wzg_optimizer_access_type_explain(tab->type()))
+        .field("chosen_index", wzg_optimizer_chosen_index(tab))
+        .field("estimated_rows",
+               position == nullptr
+                   ? "未知"
+                   : wzg_optimizer_double_to_string(position->rows_fetched))
+        .field("estimated_filtered_rows",
+               position == nullptr
+                   ? "未知"
+                   : wzg_optimizer_double_to_string(
+                         position->rows_fetched * position->filter_effect))
+        .field("estimated_cost",
+               position == nullptr
+                   ? "未知"
+                   : wzg_optimizer_double_to_string(position->read_cost))
+        .field("why_chosen", wzg_optimizer_access_reason(tab))
+        .field("next_step", "执行器将按照这个访问方式调用存储引擎读取数据")
+        .field("note", "这里是优化器最终选择的访问路径，不是执行器实际读取结果")
+        .emit();
+  }
+}
+
+std::vector<QEP_TAB *> wzg_optimizer_join_tabs(JOIN *join) {
+  std::vector<QEP_TAB *> tabs;
+  if (join == nullptr || join->qep_tab == nullptr) return tabs;
+  for (uint i = 0; i < join->primary_tables; ++i) {
+    QEP_TAB *tab = &join->qep_tab[i];
+    if (tab->table() != nullptr) tabs.push_back(tab);
+  }
+  return tabs;
+}
+
+std::string wzg_optimizer_join_order_text(const std::vector<QEP_TAB *> &tabs) {
+  std::string value;
+  for (size_t i = 0; i < tabs.size(); ++i) {
+    if (i > 0) value.append(" -> ");
+    value.append(wzg_optimizer_access_table_name(tabs[i]));
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_optimizer_join_order_message(
+    const std::vector<QEP_TAB *> &tabs) {
+  if (tabs.size() < 2) return "单表查询，不需要选择多表连接顺序";
+  std::string value("优化器已选择多表连接顺序：先读 ");
+  value.append(wzg_optimizer_access_table_name(tabs[0]));
+  if (tabs.size() == 2) {
+    value.append("，再读 ");
+    value.append(wzg_optimizer_access_table_name(tabs[1]));
+  } else {
+    value.append("，然后按计划继续读取后面的表");
+  }
+  return value;
+}
+
+std::string wzg_optimizer_join_order_details(
+    const std::vector<QEP_TAB *> &tabs) {
+  std::string value;
+  for (size_t i = 0; i < tabs.size(); ++i) {
+    QEP_TAB *tab = tabs[i];
+    POSITION *position = tab == nullptr ? nullptr : tab->position();
+    if (i > 0) value.append("; ");
+    value.append(wzg_optimizer_to_string(static_cast<ha_rows>(i + 1)));
+    value.append(". ");
+    value.append(wzg_optimizer_access_table_name(tab));
+    value.append(": 访问方式 ");
+    value.append(join_type_str[tab->type()]);
+    value.append("，索引 ");
+    value.append(wzg_optimizer_chosen_index(tab));
+    value.append("，预计读取 ");
+    value.append(position == nullptr
+                     ? "未知"
+                     : wzg_optimizer_double_to_string(position->rows_fetched));
+    value.append(" 行，过滤后 ");
+    value.append(position == nullptr
+                     ? "未知"
+                     : wzg_optimizer_double_to_string(
+                           position->rows_fetched * position->filter_effect));
+    value.append(" 行，累计结果 ");
+    value.append(position == nullptr
+                     ? "未知"
+                     : wzg_optimizer_double_to_string(
+                           position->prefix_rowcount));
+    value.append(" 行，累计成本 ");
+    value.append(position == nullptr
+                     ? "未知"
+                     : wzg_optimizer_double_to_string(position->prefix_cost));
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_optimizer_join_order_reason(
+    const std::vector<QEP_TAB *> &tabs) {
+  if (tabs.empty()) return "没有可记录的表访问顺序";
+  POSITION *last_position =
+      tabs.back() == nullptr ? nullptr : tabs.back()->position();
+  std::string value("这是优化器完成连接顺序搜索后留下的最终顺序");
+  if (last_position != nullptr) {
+    value.append("，该顺序预计最终产生 ");
+    value.append(wzg_optimizer_double_to_string(last_position->prefix_rowcount));
+    value.append(" 行中间结果，累计成本 ");
+    value.append(wzg_optimizer_double_to_string(last_position->prefix_cost));
+  }
+  value.append("。执行时会先读前面的表，再用前面得到的行去匹配后面的表");
+  return value;
+}
+
+void wzg_emit_optimizer_join_order(THD *thd, JOIN *join) {
+  std::vector<QEP_TAB *> tabs = wzg_optimizer_join_tabs(join);
+  if (tabs.size() < 2) return;
+
+  WZG_PROBE_EVENT(thd, "optimizer.join_order")
+      .message(wzg_optimizer_join_order_message(tabs).c_str())
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("table_count", static_cast<std::uint64_t>(tabs.size()))
+      .field("join_order", wzg_optimizer_join_order_text(tabs))
+      .field("first_table", wzg_optimizer_access_table_name(tabs.front()))
+      .field("last_table", wzg_optimizer_access_table_name(tabs.back()))
+      .field("order_details", wzg_optimizer_join_order_details(tabs))
+      .field("why_this_order", wzg_optimizer_join_order_reason(tabs))
+      .field("next_step", "执行器将按这个顺序逐表读取和连接数据")
+      .field("note", "这里是优化器估算出来的最终连接顺序，不是执行器实际读取结果")
+      .emit();
+}
+
+const char *wzg_optimizer_ordered_index_usage_text(int usage) {
+  switch (usage) {
+    case JOIN::ORDERED_INDEX_VOID:
+      return "没有使用索引顺序来完成排序或分组";
+    case JOIN::ORDERED_INDEX_GROUP_BY:
+      return "GROUP BY 可以利用索引顺序，减少额外排序";
+    case JOIN::ORDERED_INDEX_ORDER_BY:
+      return "ORDER BY 可以利用索引顺序，减少额外排序";
+  }
+  return "未知";
+}
+
+std::string wzg_optimizer_order_list_text(THD *thd, ORDER *order) {
+  if (order == nullptr) return "无";
+  std::string value;
+  int count = 0;
+  for (ORDER *entry = order; entry != nullptr; entry = entry->next) {
+    if (count > 0) value.append(", ");
+    if (count >= kWzgOptimizerMaxListItems) {
+      value.append("...");
+      break;
+    }
+    if (entry->item != nullptr && *entry->item != nullptr)
+      value.append(wzg_optimizer_item_text(thd, *entry->item));
+    else
+      value.append("未知表达式");
+
+    if (entry->direction == ORDER_ASC)
+      value.append(" ASC");
+    else if (entry->direction == ORDER_DESC)
+      value.append(" DESC");
+
+    ++count;
+  }
+  return count == 0 ? "无" : value;
+}
+
+std::string wzg_optimizer_sort_group_action(JOIN *join) {
+  if (join == nullptr) return "未知";
+  const bool using_tmp = join->explain_flags.any(ESP_USING_TMPTABLE);
+  const bool using_filesort = join->explain_flags.any(ESP_USING_FILESORT);
+
+  if (using_tmp && using_filesort)
+    return "需要临时表，并且需要 filesort 排序";
+  if (using_tmp) return "需要临时表";
+  if (using_filesort) return "需要 filesort 排序";
+  if (join->m_ordered_index_usage == JOIN::ORDERED_INDEX_GROUP_BY ||
+      join->m_ordered_index_usage == JOIN::ORDERED_INDEX_ORDER_BY)
+    return "可以利用索引顺序，避免额外排序";
+  return "不需要额外临时表或 filesort";
+}
+
+std::string wzg_optimizer_temp_table_reason(JOIN *join) {
+  if (join == nullptr) return "未知";
+  if (!join->explain_flags.any(ESP_USING_TMPTABLE)) return "本次计划没有创建中间临时表";
+  if (join->explain_flags.get(ESC_GROUP_BY, ESP_USING_TMPTABLE))
+    return "GROUP BY 不能直接靠当前读取顺序完成，需要先把中间结果写入临时表再分组";
+  if (join->explain_flags.get(ESC_ORDER_BY, ESP_USING_TMPTABLE))
+    return "ORDER BY 需要基于中间结果处理，优化器选择先写入临时表";
+  if (join->explain_flags.get(ESC_DISTINCT, ESP_USING_TMPTABLE))
+    return "DISTINCT 去重需要中间临时表保存已处理结果";
+  if (join->explain_flags.get(ESC_BUFFER_RESULT, ESP_USING_TMPTABLE))
+    return "SQL_BUFFER_RESULT 或内部缓冲需求要求把结果先写入临时表";
+  if (join->explain_flags.get(ESC_WINDOWING, ESP_USING_TMPTABLE))
+    return "窗口函数需要中间临时表保存阶段性结果";
+  return "优化器最终计划标记需要临时表";
+}
+
+std::string wzg_optimizer_filesort_reason(JOIN *join) {
+  if (join == nullptr) return "未知";
+  if (!join->explain_flags.any(ESP_USING_FILESORT))
+    return "本次计划没有使用 filesort";
+  if (join->explain_flags.get(ESC_GROUP_BY, ESP_USING_FILESORT))
+    return "GROUP BY 的顺序不能直接由索引或当前读取顺序提供，需要 filesort";
+  if (join->explain_flags.get(ESC_ORDER_BY, ESP_USING_FILESORT))
+    return "ORDER BY 的顺序不能直接由索引或当前读取顺序提供，需要 filesort";
+  if (join->explain_flags.get(ESC_DISTINCT, ESP_USING_FILESORT))
+    return "DISTINCT 去重过程需要排序";
+  if (join->explain_flags.get(ESC_WINDOWING, ESP_USING_FILESORT))
+    return "窗口函数处理需要排序";
+  return "优化器最终计划标记需要 filesort";
+}
+
+void wzg_emit_optimizer_sort_group(THD *thd, JOIN *join) {
+  if (join == nullptr) return;
+  const bool has_order_by = !join->order.empty();
+  const bool has_group_by = !join->group_list.empty();
+  const bool need_tmp_table = join->explain_flags.any(ESP_USING_TMPTABLE);
+  const bool need_filesort = join->explain_flags.any(ESP_USING_FILESORT);
+
+  WZG_PROBE_EVENT(thd, "optimizer.sort_group")
+      .message("检查排序、分组和去重是否需要临时表或额外排序")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("has_order_by", has_order_by)
+      .field("order_by", wzg_optimizer_order_list_text(thd, join->order.order))
+      .field("has_group_by", has_group_by)
+      .field("group_by",
+             wzg_optimizer_order_list_text(thd, join->group_list.order))
+      .field("has_distinct", join->select_distinct)
+      .field("can_use_index_order",
+             join->m_ordered_index_usage != JOIN::ORDERED_INDEX_VOID)
+      .field("index_order_usage",
+             wzg_optimizer_ordered_index_usage_text(join->m_ordered_index_usage))
+      .field("need_temporary_table", need_tmp_table)
+      .field("temporary_table_reason", wzg_optimizer_temp_table_reason(join))
+      .field("need_filesort", need_filesort)
+      .field("filesort_reason", wzg_optimizer_filesort_reason(join))
+      .field("what_mysql_decided", wzg_optimizer_sort_group_action(join))
+      .field("next_step", "继续生成最终执行计划，执行器后续按计划读取、排序、分组或返回结果")
+      .field("note", "这里和 EXPLAIN 的 Using temporary / Using filesort 标记来自同一类最终计划信息")
+      .emit();
+}
+
+std::string wzg_optimizer_access_summary(const std::vector<QEP_TAB *> &tabs) {
+  std::string value;
+  for (size_t i = 0; i < tabs.size(); ++i) {
+    QEP_TAB *tab = tabs[i];
+    POSITION *position = tab == nullptr ? nullptr : tab->position();
+    if (i > 0) value.append("; ");
+    value.append(wzg_optimizer_access_table_name(tab));
+    value.append(" 使用 ");
+    value.append(join_type_str[tab->type()]);
+    value.append(" 访问");
+    const std::string index = wzg_optimizer_chosen_index(tab);
+    if (index != "无") {
+      value.append("，索引 ");
+      value.append(index);
+    } else {
+      value.append("，未选择单个索引");
+    }
+    if (position != nullptr) {
+      value.append("，预计读取 ");
+      value.append(wzg_optimizer_double_to_string(position->rows_fetched));
+      value.append(" 行，过滤后 ");
+      value.append(wzg_optimizer_double_to_string(position->rows_fetched *
+                                                  position->filter_effect));
+      value.append(" 行");
+    }
+  }
+  return value.empty() ? "无表访问" : value;
+}
+
+std::string wzg_optimizer_final_rows(const std::vector<QEP_TAB *> &tabs,
+                                     JOIN *join) {
+  if (!tabs.empty() && tabs.back() != nullptr && tabs.back()->position() != nullptr)
+    return wzg_optimizer_double_to_string(tabs.back()->position()->prefix_rowcount);
+  if (join == nullptr) return "未知";
+  return wzg_optimizer_to_string(join->best_rowcount);
+}
+
+std::string wzg_optimizer_final_cost(const std::vector<QEP_TAB *> &tabs,
+                                     JOIN *join) {
+  if (!tabs.empty() && tabs.back() != nullptr && tabs.back()->position() != nullptr)
+    return wzg_optimizer_double_to_string(tabs.back()->position()->prefix_cost);
+  if (join == nullptr) return "未知";
+  return wzg_optimizer_double_to_string(join->best_read);
+}
+
+std::string wzg_optimizer_finish_message(const std::vector<QEP_TAB *> &tabs,
+                                         JOIN *join) {
+  std::string value("优化器已生成最终执行计划");
+  if (!tabs.empty()) {
+    value.append("：预计输出 ");
+    value.append(wzg_optimizer_final_rows(tabs, join));
+    value.append(" 行，累计成本 ");
+    value.append(wzg_optimizer_final_cost(tabs, join));
+  }
+  return value;
+}
+
+std::string wzg_optimizer_plan_summary(const std::vector<QEP_TAB *> &tabs,
+                                       JOIN *join) {
+  std::string value;
+  value.append("读表顺序 ");
+  value.append(wzg_optimizer_join_order_text(tabs));
+  value.append("；");
+  value.append(wzg_optimizer_access_summary(tabs));
+  value.append("；");
+  value.append(wzg_optimizer_sort_group_action(join));
+  return value;
+}
+
+void wzg_emit_optimizer_finish(THD *thd, JOIN *join) {
+  if (join == nullptr) return;
+  std::vector<QEP_TAB *> tabs = wzg_optimizer_join_tabs(join);
+
+  WZG_PROBE_EVENT(thd, "optimizer.finish")
+      .message(wzg_optimizer_finish_message(tabs, join).c_str())
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("optimize_result", "success")
+      .field("table_count", static_cast<std::uint64_t>(tabs.size()))
+      .field("join_order", wzg_optimizer_join_order_text(tabs))
+      .field("access_summary", wzg_optimizer_access_summary(tabs))
+      .field("need_temporary_table",
+             join->explain_flags.any(ESP_USING_TMPTABLE))
+      .field("temporary_table_reason", wzg_optimizer_temp_table_reason(join))
+      .field("need_filesort", join->explain_flags.any(ESP_USING_FILESORT))
+      .field("filesort_reason", wzg_optimizer_filesort_reason(join))
+      .field("estimated_result_rows", wzg_optimizer_final_rows(tabs, join))
+      .field("estimated_total_cost", wzg_optimizer_final_cost(tabs, join))
+      .field("plan_summary", wzg_optimizer_plan_summary(tabs, join))
+      .field("next_step", "进入执行器阶段，按这个计划调用存储引擎读取数据")
+      .field("note", "这里是优化器最终计划总结，估算行数和成本不等于执行阶段实际结果")
+      .emit();
+}
+
+std::string wzg_optimizer_tables_for_map(JOIN *join, table_map tables) {
+  if (join == nullptr || join->query_block == nullptr || tables == 0)
+    return "无";
+  std::string value;
+  int count = 0;
+  for (Table_ref *table_ref = join->query_block->leaf_tables;
+       table_ref != nullptr; table_ref = table_ref->next_leaf) {
+    if (!(tables & table_ref->map())) continue;
+    if (count > 0) value.append(", ");
+    if (count >= kWzgOptimizerMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(wzg_optimizer_table_name(table_ref));
+    ++count;
+  }
+  return count == 0 ? "无" : value;
+}
+
+std::string wzg_optimizer_condition_source(const JOIN_TAB *tab) {
+  if (tab == nullptr || tab->condition() == nullptr) return "无";
+  Item *join_cond = tab->join_cond();
+  if (join_cond != nullptr && tab->condition() == join_cond) return "JOIN ON";
+  if (join_cond != nullptr) return "WHERE 或 JOIN ON 拆分后的条件";
+  return "WHERE";
+}
+
+std::string wzg_optimizer_condition_attach_time(const JOIN_TAB *tab) {
+  if (tab == nullptr) return "未知";
+  if (tab->first_inner() != NO_PLAN_IDX)
+    return "外连接匹配状态确定后再判断，避免把应该保留的 NULL 扩展行提前过滤掉";
+  return "读取这张表并拿到它需要的列之后、继续读取下一张表之前";
+}
+
+std::string wzg_optimizer_condition_attach_reason(JOIN *join,
+                                                  const JOIN_TAB *tab) {
+  if (tab == nullptr || tab->condition() == nullptr) return "这张表没有额外过滤条件";
+  const table_map condition_tables = tab->condition()->used_tables();
+  const table_map current_table = tab->table_ref == nullptr ? table_map(0)
+                                                            : tab->table_ref->map();
+  if ((condition_tables & ~current_table) == 0)
+    return "这个条件只依赖当前表字段，读到当前表行后马上判断可以减少后续处理";
+  if ((condition_tables & ~tab->prefix_tables()) == 0) {
+    std::string value("这个条件依赖 ");
+    value.append(wzg_optimizer_tables_for_map(join, condition_tables));
+    value.append("，这些表在当前步骤都已经读到，所以可以在这里判断");
+    return value;
+  }
+  return "优化器把这个条件放在当前可安全判断的位置";
+}
+
+void wzg_emit_optimizer_condition_attach(THD *thd, JOIN *join, JOIN_TAB *tab,
+                                         uint plan_index) {
+  if (join == nullptr || tab == nullptr || tab->table() == nullptr) return;
+  Item *condition = tab->condition();
+
+  WZG_PROBE_EVENT(thd, "optimizer.condition_attach")
+      .message(condition == nullptr ? "这张表没有需要单独挂载的过滤条件"
+                                    : "优化器已决定这个过滤条件在哪张表读取后判断")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("plan_step", static_cast<std::uint64_t>(plan_index + 1))
+      .field("target_table", wzg_optimizer_table_name(tab->table_ref))
+      .field("attached_condition", wzg_optimizer_item_text(thd, condition))
+      .field("condition_source", wzg_optimizer_condition_source(tab))
+      .field("condition_uses_tables",
+             condition == nullptr ? "无"
+                                  : wzg_optimizer_tables_for_map(
+                                        join, condition->used_tables()))
+      .field("available_tables_now",
+             wzg_optimizer_tables_for_map(join, tab->prefix_tables()))
+      .field("when_checked", wzg_optimizer_condition_attach_time(tab))
+      .field("why_here", wzg_optimizer_condition_attach_reason(join, tab))
+      .field("next_step", "执行器读取到这张表的行后，会按这里挂载的条件做过滤")
+      .field("note", "这里表示条件在执行计划中的判断位置，不表示条件文本来自单独一条 SQL 子句")
+      .emit();
+}
+
+const char *wzg_optimizer_range_path_type(const AccessPath *path) {
+  if (path == nullptr) return "无 range 方案";
+  switch (path->type) {
+    case AccessPath::INDEX_RANGE_SCAN:
+      return "索引范围扫描";
+    case AccessPath::INDEX_MERGE:
+      return "索引合并";
+    case AccessPath::ROWID_INTERSECTION:
+      return "多个索引取交集";
+    case AccessPath::ROWID_UNION:
+      return "多个索引取并集";
+    case AccessPath::INDEX_SKIP_SCAN:
+      return "索引 skip scan";
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      return "GROUP BY 索引 skip scan";
+    default:
+      return "其他 range 方案";
+  }
+}
+
+std::string wzg_optimizer_range_used_index(const TABLE *table,
+                                           const AccessPath *path) {
+  if (table == nullptr || path == nullptr) return "无";
+  char key_buffer[256];
+  char length_buffer[128];
+  String key_names(key_buffer, sizeof(key_buffer), system_charset_info);
+  String used_lengths(length_buffer, sizeof(length_buffer), system_charset_info);
+  key_names.length(0);
+  used_lengths.length(0);
+  add_keys_and_lengths(path, &key_names, &used_lengths);
+  if (key_names.length() == 0) return "无";
+  std::string value(key_names.ptr(), key_names.length());
+  if (used_lengths.length() > 0) {
+    value.append("，使用 key 长度 ");
+    value.append(used_lengths.ptr(), used_lengths.length());
+  }
+  return value;
+}
+
+std::string wzg_optimizer_range_extra(const AccessPath *path) {
+  if (path == nullptr) return "无";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  add_info_string(path, &text);
+  return text.length() == 0 ? "无" : std::string(text.ptr(), text.length());
+}
+
+std::string wzg_optimizer_range_result_text(const AccessPath *path,
+                                            bool impossible_range) {
+  if (impossible_range) return "range 分析发现条件不可能匹配记录";
+  if (path == nullptr) return "没有形成比全表扫描更合适的 range 访问方案";
+  std::string value("形成 ");
+  value.append(wzg_optimizer_range_path_type(path));
+  value.append("，后续优化器会继续和其他访问方式比较成本");
+  return value;
+}
+
+void wzg_emit_optimizer_range_analysis(THD *thd, JOIN *join, JOIN_TAB *tab,
+                                       Item *condition, ha_rows records,
+                                       bool impossible_range) {
+  if (join == nullptr || tab == nullptr || tab->table() == nullptr) return;
+  const AccessPath *range_scan = tab->range_scan();
+
+  WZG_PROBE_EVENT(thd, "optimizer.range_analysis")
+      .message("range 优化器分析过滤条件，判断能否变成索引范围读取")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("target_table", wzg_optimizer_table_name(tab->table_ref))
+      .field("checked_condition", wzg_optimizer_item_text(thd, condition))
+      .field("candidate_indexes",
+             wzg_optimizer_key_map_list(tab->table(), tab->const_keys))
+      .field("skip_scan_candidate_indexes",
+             wzg_optimizer_key_map_list(tab->table(), tab->skip_scan_keys))
+      .field("range_result",
+             wzg_optimizer_range_result_text(range_scan, impossible_range))
+      .field("range_access_type", wzg_optimizer_range_path_type(range_scan))
+      .field("range_used_index",
+             wzg_optimizer_range_used_index(tab->table(), range_scan))
+      .field("range_extra", wzg_optimizer_range_extra(range_scan))
+      .field("estimated_range_rows",
+             records == HA_POS_ERROR ? "未知"
+                                     : wzg_optimizer_to_string(records))
+      .field("estimated_range_cost",
+             range_scan == nullptr
+                 ? "无"
+                 : wzg_optimizer_double_to_string(range_scan->cost()))
+      .field("table_scan_rows_before_range",
+             wzg_optimizer_to_string(tab->records()))
+      .field("table_scan_cost_before_range",
+             wzg_optimizer_double_to_string(tab->read_time))
+      .field("next_step", "优化器继续把 range 方案放进整体 join 顺序和访问方式成本比较")
+      .field("note", "这里是 range optimizer 的分析结果，不等于最终一定采用该 range 方案")
+      .emit();
+}
+
+const char *wzg_optimizer_subquery_type_text(
+    Item_subselect::Subquery_type subquery_type) {
+  switch (subquery_type) {
+    case Item_subselect::IN_SUBQUERY:
+      return "IN 子查询";
+    case Item_subselect::ALL_SUBQUERY:
+      return "ALL 子查询";
+    case Item_subselect::ANY_SUBQUERY:
+      return "ANY/SOME 子查询";
+    case Item_subselect::EXISTS_SUBQUERY:
+      return "EXISTS 子查询";
+    case Item_subselect::SCALAR_SUBQUERY:
+      return "标量子查询";
+  }
+  return "未知子查询";
+}
+
+const char *wzg_optimizer_subquery_strategy_text(Subquery_strategy strategy) {
+  switch (strategy) {
+    case Subquery_strategy::UNSPECIFIED:
+      return "未决定";
+    case Subquery_strategy::CANDIDATE_FOR_IN2EXISTS_OR_MAT:
+      return "候选：IN-to-EXISTS 或物化";
+    case Subquery_strategy::CANDIDATE_FOR_SEMIJOIN:
+      return "候选：半连接";
+    case Subquery_strategy::CANDIDATE_FOR_DERIVED_TABLE:
+      return "候选：改写为派生表";
+    case Subquery_strategy::SEMIJOIN:
+      return "半连接";
+    case Subquery_strategy::DERIVED_TABLE:
+      return "改写为派生表";
+    case Subquery_strategy::SUBQ_EXISTS:
+      return "IN-to-EXISTS / EXISTS 执行";
+    case Subquery_strategy::SUBQ_MATERIALIZATION:
+      return "子查询物化";
+    case Subquery_strategy::DELETED:
+      return "子查询已删除";
+  }
+  return "未知策略";
+}
+
+const char *wzg_optimizer_subquery_strategy_meaning(
+    Subquery_strategy strategy) {
+  switch (strategy) {
+    case Subquery_strategy::SUBQ_EXISTS:
+      return "外层每得到一组相关值，子查询按 EXISTS 方式判断是否存在匹配行";
+    case Subquery_strategy::SUBQ_MATERIALIZATION:
+      return "先执行子查询并保存成内部临时结果，外层查询再拿值去匹配这个结果";
+    case Subquery_strategy::SEMIJOIN:
+      return "把子查询改写成半连接，只判断是否有匹配，不按普通 JOIN 返回重复组合";
+    case Subquery_strategy::DERIVED_TABLE:
+      return "把子查询改写成派生表参与外层连接";
+    case Subquery_strategy::CANDIDATE_FOR_IN2EXISTS_OR_MAT:
+      return "优化器会在 IN-to-EXISTS 和物化之间做成本比较";
+    default:
+      return "优化器记录了这个子查询策略状态";
+  }
+}
+
+std::string wzg_optimizer_query_expression_text(THD *thd,
+                                                Query_expression *unit) {
+  if (unit == nullptr) return "未知";
+  char buffer[1024];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  unit->print(thd, &text, QT_ORDINARY);
+  return wzg_optimizer_clip(std::string(text.ptr(), text.length()),
+                            kWzgOptimizerMaxExpressionBytes);
+}
+
+std::uint64_t wzg_optimizer_outer_select_number(Query_expression *unit) {
+  Query_block *outer = unit == nullptr ? nullptr : unit->outer_query_block();
+  return outer == nullptr ? 0 : static_cast<std::uint64_t>(outer->select_number);
+}
+
+std::string wzg_optimizer_join_tab_chosen_index(const JOIN_TAB *tab) {
+  if (tab == nullptr || tab->table() == nullptr) return "无";
+  uint key_no = MAX_KEY;
+  switch (tab->type()) {
+    case JT_CONST:
+    case JT_EQ_REF:
+    case JT_REF:
+    case JT_REF_OR_NULL:
+      key_no = tab->ref().key;
+      break;
+    default:
+      key_no = tab->index();
+      break;
+  }
+  TABLE *table = tab->table();
+  if (key_no == MAX_KEY || table->key_info == nullptr || table->s == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value(key.name == nullptr ? "<unnamed>" : key.name);
+  value.push_back('(');
+  value.append(wzg_optimizer_key_parts(key));
+  value.push_back(')');
+  return value;
+}
+
+void wzg_emit_optimizer_subquery_strategy_start(
+    THD *thd, JOIN *join, Item_in_subselect *in_pred,
+    Subquery_strategy current_strategy) {
+  if (join == nullptr || in_pred == nullptr) return;
+  WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
+      .message("优化器开始为子查询选择执行方式")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("decision_stage", "start")
+      .field("subquery_type",
+             wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
+      .field("subquery_select_number",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("outer_select_number",
+             wzg_optimizer_outer_select_number(join->query_expression()))
+      .field("current_strategy",
+             wzg_optimizer_subquery_strategy_text(current_strategy))
+      .field("subquery_sql",
+             wzg_optimizer_query_expression_text(thd, join->query_expression()))
+      .field("meaning",
+             wzg_optimizer_subquery_strategy_meaning(current_strategy))
+      .field("next_step", "如果存在多个可选策略，继续比较 IN-to-EXISTS 和物化成本")
+      .emit();
+}
+
+void wzg_emit_optimizer_subquery_strategy_cost(
+    THD *thd, JOIN *join, Subquery_strategy allowed_strategy,
+    double subq_executions, double cost_exists, double cost_mat_table,
+    double cost_mat, bool mat_chosen) {
+  if (join == nullptr) return;
+  WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
+      .message("优化器比较 IN-to-EXISTS 和子查询物化的成本")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("decision_stage", "cost_compare")
+      .field("subquery_select_number",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("outer_select_number",
+             wzg_optimizer_outer_select_number(join->query_expression()))
+      .field("allowed_strategy",
+             wzg_optimizer_subquery_strategy_text(allowed_strategy))
+      .field("subquery_evaluations",
+             wzg_optimizer_double_to_string(subq_executions))
+      .field("cost_exists_total", wzg_optimizer_double_to_string(cost_exists))
+      .field("cost_materialize_table",
+             wzg_optimizer_double_to_string(cost_mat_table))
+      .field("cost_materialization_total",
+             wzg_optimizer_double_to_string(cost_mat))
+      .field("chosen_strategy",
+             mat_chosen ? "子查询物化" : "IN-to-EXISTS / EXISTS 执行")
+      .field("why",
+             mat_chosen
+                 ? "物化总成本更低，或者优化器设置要求使用物化"
+                 : "按当前估算，重复按 EXISTS 方式执行更便宜")
+      .field("next_step", "把选中的子查询策略应用到执行计划")
+      .emit();
+}
+
+void wzg_emit_optimizer_subquery_strategy_finish(
+    THD *thd, JOIN *join, Item_in_subselect *in_pred,
+    Subquery_strategy chosen_strategy) {
+  if (join == nullptr || in_pred == nullptr) return;
+  WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
+      .message("优化器已确定子查询执行方式")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("decision_stage", "finish")
+      .field("subquery_type",
+             wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
+      .field("subquery_select_number",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("outer_select_number",
+             wzg_optimizer_outer_select_number(join->query_expression()))
+      .field("chosen_strategy",
+             wzg_optimizer_subquery_strategy_text(chosen_strategy))
+      .field("meaning",
+             wzg_optimizer_subquery_strategy_meaning(chosen_strategy))
+      .field("subquery_sql",
+             wzg_optimizer_query_expression_text(thd, join->query_expression()))
+      .field("next_step", "继续生成包含该子查询策略的最终执行计划")
+      .emit();
+}
+
+void wzg_emit_optimizer_index_subquery_engine(THD *thd, JOIN *join,
+                                             Item_in_subselect *in_pred,
+                                             JOIN_TAB *tab) {
+  if (join == nullptr || in_pred == nullptr || tab == nullptr) return;
+  WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
+      .message("优化器选择使用 index subquery engine 执行这个 IN 子查询")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("decision_stage", "index_subquery_engine")
+      .field("subquery_type",
+             wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
+      .field("subquery_select_number",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("target_table", wzg_optimizer_table_name(tab->table_ref))
+      .field("access_type", join_type_str[tab->type()])
+      .field("chosen_index", wzg_optimizer_join_tab_chosen_index(tab))
+      .field("meaning", "外层给出一个值后，子查询表用索引快速判断是否存在匹配值")
+      .field("next_step", "执行阶段会通过 index subquery engine 做匹配检查")
+      .emit();
+}
+
+bool wzg_optimizer_where_mentions_first_key_part(THD *thd, Item *where_cond,
+                                                 const KEY &key) {
+  if (where_cond == nullptr || key.user_defined_key_parts == 0 ||
+      key.key_part == nullptr || key.key_part[0].field == nullptr ||
+      key.key_part[0].field->field_name == nullptr)
+    return false;
+  const std::string where_text = wzg_optimizer_item_text(thd, where_cond);
+  return where_text.find(key.key_part[0].field->field_name) !=
+         std::string::npos;
+}
+
+std::string wzg_optimizer_indexes_matching_filter_text(THD *thd,
+                                                       const TABLE *table,
+                                                       Item *where_cond) {
+  if (where_cond == nullptr) return "无 WHERE 条件，不按过滤条件匹配索引";
+  if (table == nullptr || table->s == nullptr || table->s->keys == 0 ||
+      table->key_info == nullptr)
+    return "无索引";
+
+  std::string value;
+  int count = 0;
+  for (uint key_no = 0; key_no < table->s->keys; ++key_no) {
+    const KEY &key = table->key_info[key_no];
+    if (!wzg_optimizer_where_mentions_first_key_part(thd, where_cond, key))
+      continue;
+    if (count > 0) value.append(", ");
+    value.append(key.name == nullptr ? "<unnamed>" : key.name);
+    ++count;
+  }
+  return count == 0 ? "当前过滤条件没有直接提到索引首列" : value;
+}
+
+void wzg_emit_optimizer_table_stats(THD *thd, Query_block *query_block) {
+  for (Table_ref *table_ref = query_block == nullptr ? nullptr
+                                                     : query_block->leaf_tables;
+       table_ref != nullptr; table_ref = table_ref->next_leaf) {
+    TABLE *table = table_ref->table;
+    if (table == nullptr) {
+      WZG_PROBE_EVENT(thd, "optimizer.table_stats")
+          .message("查看查询中的内部表对象，准备判断它能怎样参与执行计划")
+          .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("operation", "检查单表统计信息和索引")
+          .field("target_table", wzg_optimizer_table_name(table_ref))
+          .field("current_filter",
+                 wzg_optimizer_item_text(thd, query_block->where_cond()))
+          .field("table_rows_estimate", "未知")
+          .field("found_indexes", "无可直接读取的索引定义")
+          .field("indexes_that_match_filter_text", "未知")
+          .field("what_mysql_checked",
+                 "查看这张表对象是否已经打开、是否有可用于计划选择的统计信息和索引定义")
+          .field("stats_source", "查询块中的内部表对象")
+          .field("next_step", "继续比较可行的查表方式")
+          .field("note", "这里没有真正扫描表的数据行")
+          .emit();
+      continue;
+    }
+
+    const std::string table_name = wzg_optimizer_table_name(table_ref);
+    const std::string filter =
+        wzg_optimizer_item_text(thd, query_block->where_cond());
+    WZG_PROBE_EVENT(thd, "optimizer.table_stats")
+        .message("查看表的数据量和索引，判断有哪些查表方式可以选择")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("operation", "检查单表统计信息和索引")
+        .field("target_table", table_name)
+        .field("current_filter", filter)
+        .field("table_rows_estimate",
+               wzg_optimizer_to_string(table->file->stats.records))
+        .field("found_indexes", wzg_optimizer_index_list(table))
+        .field("indexes_that_match_filter_text",
+               wzg_optimizer_indexes_matching_filter_text(
+                   thd, table, query_block->where_cond()))
+        .field("what_mysql_checked",
+               "查看这张表大概有多少行、有哪些索引、当前过滤条件是否提到索引字段")
+        .field("stats_source", "表定义和存储引擎提供的统计信息")
+        .field("next_step", "比较全表扫描和索引查找等方案的成本")
+        .field("note",
+               "这里没有真正扫描表的数据行，行数是优化器使用的估算值")
+        .emit();
+  }
+}
+
+}  // namespace
 
 const char *antijoin_null_cond = "<ANTIJOIN-NULL>";
 
@@ -377,6 +1623,30 @@ bool JOIN::optimize(bool finalize_access_paths) {
   DEBUG_SYNC(thd, "before_join_optimize");
 
   THD_STAGE_INFO(thd, stage_optimizing);
+
+  WZG_PROBE_EVENT(thd, "optimizer.start")
+      .message("开始优化查询，准备决定这条 SQL 怎样执行更快")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("optimize_result", "started")
+      .field("query_block_number",
+             static_cast<std::uint64_t>(query_block->select_number))
+      .field("table_count",
+             static_cast<std::uint64_t>(query_block->leaf_table_count))
+      .field("tables", wzg_optimizer_tables(query_block))
+      .field("return_columns", wzg_optimizer_return_columns(thd, fields))
+      .field("where_condition",
+             wzg_optimizer_item_text(thd, query_block->where_cond()))
+      .field("has_join", query_block->leaf_table_count > 1)
+      .field("has_subquery", query_block->first_inner_query_expression() != nullptr)
+      .field("has_order_by", !order.empty())
+      .field("has_group_by", !group_list.empty())
+      .field("optimizer_input",
+             wzg_optimizer_input_summary(thd, query_block, fields))
+      .field("next_step",
+             "查看表的数据量、索引和过滤条件，选择更省成本的执行方式")
+      .emit();
+
+  wzg_emit_optimizer_table_stats(thd, query_block);
 
   Opt_trace_context *const trace = &thd->opt_trace;
   const Opt_trace_object trace_wrapper(trace);
@@ -1055,7 +2325,11 @@ bool JOIN::optimize(bool finalize_access_paths) {
   if (make_join_readinfo(this, no_jbuf_after))
     return true; /* purecov: inspected */
 
+  wzg_emit_optimizer_join_order(thd, this);
+  wzg_emit_optimizer_access_paths(thd, this);
+
   if (make_tmp_tables_info()) return true;
+  wzg_emit_optimizer_sort_group(thd, this);
 
   /*
     If we decided to not sort after all, update the cost of the JOIN.
@@ -1097,6 +2371,8 @@ bool JOIN::optimize(bool finalize_access_paths) {
     has finalized the 'plan'.
   */
   if (push_to_engines()) return true;
+
+  wzg_emit_optimizer_finish(thd, this);
 
   // Make plan visible for EXPLAIN
   set_plan_state(PLAN_READY);
@@ -1484,6 +2760,9 @@ int JOIN::replace_index_subquery() {
           down_cast<Item_in_subselect *>(query_expression()->item),
           first_qep_tab->condition(), having_cond);
   query_expression()->item->set_indexsubquery_engine(engine);
+  wzg_emit_optimizer_index_subquery_engine(
+      thd, this, down_cast<Item_in_subselect *>(query_expression()->item),
+      first_join_tab);
   return 1;
 }
 
@@ -6045,23 +7324,29 @@ bool JOIN::estimate_rowcount() {
       condition = where_cond;
     }
     bool always_false_cond = false, range_analysis_done = false;
-    if (!tab->const_keys.is_clear_all() ||
-        !tab->skip_scan_keys.is_clear_all()) {
-      /*
-        This call fills tab->range_scan() with the best range access method
-        possible for this table, and only if it's better than table scan.
-        It also fills tab->needed_reg.
-      */
-      const ha_rows records =
-          get_quick_record_count(thd, tab, row_limit, condition);
+	    if (!tab->const_keys.is_clear_all() ||
+	        !tab->skip_scan_keys.is_clear_all()) {
+	      /*
+	        This call fills tab->range_scan() with the best range access method
+	        possible for this table, and only if it's better than table scan.
+	        It also fills tab->needed_reg.
+	      */
+	      const ha_rows rows_before_range = tab->records();
+	      const double cost_before_range = tab->read_time;
+	      const ha_rows records =
+	          get_quick_record_count(thd, tab, row_limit, condition);
 
-      if (records == 0 && thd->is_error()) return true;
-      if (records == 0 && tab->table()->reginfo.impossible_range)
-        always_false_cond = true;
-      if (records != HA_POS_ERROR) {
-        tab->found_records = records;
-        tab->read_time =
-            tab->range_scan() != nullptr ? tab->range_scan()->cost() : 0.0;
+	      if (records == 0 && thd->is_error()) return true;
+	      if (records == 0 && tab->table()->reginfo.impossible_range)
+	        always_false_cond = true;
+	      tab->set_records(rows_before_range);
+	      tab->read_time = cost_before_range;
+	      wzg_emit_optimizer_range_analysis(thd, this, tab, condition, records,
+	                                        always_false_cond);
+	      if (records != HA_POS_ERROR) {
+	        tab->found_records = records;
+	        tab->read_time =
+	            tab->range_scan() != nullptr ? tab->range_scan()->cost() : 0.0;
       }
       range_analysis_done = true;
     } else if (tab->join_cond() != nullptr && tab->join_cond()->const_item() &&
@@ -7250,8 +8535,13 @@ static bool add_key_field(THD *thd, Key_field **key_fields, uint and_level,
   if (!field->is_flag_set(PART_KEY_FLAG)) {
     // Don't remove column IS NULL on a LEFT JOIN table
     if (!eq_func || (*value)->type() != Item::NULL_ITEM ||
-        !tl->table->is_nullable() || field->is_nullable())
+        !tl->table->is_nullable() || field->is_nullable()) {
+      wzg_emit_optimizer_condition_analysis(
+          thd, cond, item_field, value, num_values, tl->table, nullptr,
+          false, false, "不能作为索引候选",
+          "这个字段不是索引字段，MySQL 在 add_key_field() 中跳过这个条件");
       return false;  // Not a key. Skip it
+    }
     exists_optimize = KEY_OPTIMIZE_EXISTS;
     assert(num_values == 1);
   } else {
@@ -7262,11 +8552,26 @@ static bool add_key_field(THD *thd, Key_field **key_fields, uint and_level,
       if (!((value[i])->used_tables() & (tl->map() | RAND_TABLE_BIT)))
         optimizable = true;
     }
-    if (!optimizable) return false;
+    if (!optimizable) {
+      Key_map possible_keys = field->key_start;
+      possible_keys.intersect(tl->table->keys_in_use_for_query);
+      wzg_emit_optimizer_condition_analysis(
+          thd, cond, item_field, value, num_values, tl->table, &possible_keys,
+          true, false, "暂时不能作为索引候选",
+          "比较值依赖当前表或随机值，MySQL 不能把它当作稳定的索引查找值");
+      return false;
+    }
     if (!(usable_tables & tl->map())) {
       if (!eq_func || (*value)->type() != Item::NULL_ITEM ||
-          !tl->table->is_nullable() || field->is_nullable())
+          !tl->table->is_nullable() || field->is_nullable()) {
+        Key_map possible_keys = field->key_start;
+        possible_keys.intersect(tl->table->keys_in_use_for_query);
+        wzg_emit_optimizer_condition_analysis(
+            thd, cond, item_field, value, num_values, tl->table,
+            &possible_keys, true, false, "暂时不能作为索引候选",
+            "这个表当前不在可用于索引优化的表集合中，MySQL 跳过普通索引候选");
         return false;  // Can't use left join optimize
+      }
       exists_optimize = KEY_OPTIMIZE_EXISTS;
     } else {
       JOIN_TAB *stat = tl->table->reginfo.join_tab;
@@ -7317,7 +8622,14 @@ static bool add_key_field(THD *thd, Key_field **key_fields, uint and_level,
         number. cmp_type() is checked to allow compare of dates to numbers.
         eq_func is NEVER true when num_values > 1
        */
-      if (!eq_func) return false;
+      if (!eq_func) {
+        wzg_emit_optimizer_condition_analysis(
+            thd, cond, item_field, value, num_values, tl->table,
+            &possible_keys, true, true,
+            "可以作为范围或多值索引候选，后续优化器会继续交给范围分析和成本估算",
+            "字段是索引字段，并且 MySQL 已把相关索引加入当前表的候选 key 集合");
+        return false;
+      }
 
       /*
         Check if the field and value are comparable in the index.
@@ -7327,9 +8639,18 @@ static bool add_key_field(THD *thd, Key_field **key_fields, uint and_level,
           (field->cmp_type() == STRING_RESULT &&
            field->match_collation_to_optimize_range() &&
            field->charset() != cond->compare_collation())) {
+        wzg_emit_optimizer_condition_analysis(
+            thd, cond, item_field, value, num_values, tl->table,
+            &possible_keys, true, false, "不能作为等值索引查找候选",
+            "字段和值不能按该索引安全比较，MySQL 的 comparable_in_index() 或排序规则检查未通过");
         warn_index_not_applicable(stat->join()->thd, field, possible_keys);
         return false;
       }
+      wzg_emit_optimizer_condition_analysis(
+          thd, cond, item_field, value, num_values, tl->table, &possible_keys,
+          true, true,
+          "可以作为等值索引查找候选，后续优化器会比较它和其他访问方式的成本",
+          "字段是索引字段，相关索引已加入候选 key 集合，并且 MySQL 的索引比较检查已通过");
     }
   }
   /*
@@ -10138,6 +11459,7 @@ static bool make_join_query_block(JOIN *join, Item *cond) {
       Item *const tab_cond = tab->condition();
       Opt_trace_object trace_one_table(trace);
       trace_one_table.add_utf8_table(tab->table_ref).add("attached", tab_cond);
+      wzg_emit_optimizer_condition_attach(thd, join, tab, i);
       if (tab_cond && tab_cond->has_subquery())  // traverse only if needed
       {
         /*
@@ -11201,6 +12523,8 @@ bool JOIN::decide_subquery_strategy() {
       static_cast<Item_in_subselect *>(query_expression()->item);
 
   Subquery_strategy chosen_method = in_pred->strategy;
+  wzg_emit_optimizer_subquery_strategy_start(thd, this, in_pred,
+                                             chosen_method);
   // Materialization does not allow UNION so this can't happen:
   assert(chosen_method != Subquery_strategy::SUBQ_MATERIALIZATION);
 
@@ -11210,6 +12534,8 @@ bool JOIN::decide_subquery_strategy() {
 
   switch (chosen_method) {
     case Subquery_strategy::SUBQ_EXISTS:
+      wzg_emit_optimizer_subquery_strategy_finish(thd, this, in_pred,
+                                                  chosen_method);
       if (query_block->m_windows.elements > 0)  // grep for WL#10431
       {
         my_error(ER_NOT_SUPPORTED_YET, MYF(0),
@@ -11219,6 +12545,8 @@ bool JOIN::decide_subquery_strategy() {
       }
       return in_pred->finalize_exists_transform(thd, query_block);
     case Subquery_strategy::SUBQ_MATERIALIZATION:
+      wzg_emit_optimizer_subquery_strategy_finish(thd, this, in_pred,
+                                                  chosen_method);
       return in_pred->finalize_materialization_transform(thd, this);
     default:
       assert(false);
@@ -11341,6 +12669,9 @@ bool JOIN::compare_costs_of_subquery_strategies(Subquery_strategy *method) {
       .add("cost_of_materialization", cost_mat)
       .add("cost_of_EXISTS", cost_exists)
       .add("chosen", mat_chosen);
+  wzg_emit_optimizer_subquery_strategy_cost(
+      thd, this, allowed_strategies, subq_executions, cost_exists,
+      cost_mat_table, cost_mat, mat_chosen);
   if (mat_chosen) {
     *method = Subquery_strategy::SUBQ_MATERIALIZATION;
   } else {

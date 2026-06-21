@@ -44,6 +44,8 @@
 #include <deque>
 #include <functional>
 #include <initializer_list>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -67,6 +69,7 @@
 #include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"  // check_single_table_access
 #include "sql/check_stack.h"       // check_stack_overrun
+#include "sql/command_mapping.h"   // get_sql_command_string
 #include "sql/current_thd.h"       // current_thd
 #include "sql/derror.h"            // ER_THD
 #include "sql/enum_query_type.h"
@@ -111,6 +114,7 @@
 #include "sql/thr_malloc.h"
 #include "sql/visible_fields.h"
 #include "sql/window.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "template_utils.h"
 #include "thr_lock.h"  // TL_READ
 
@@ -126,6 +130,207 @@ static bool simplify_const_condition(THD *thd, Item **cond,
 static Item *create_rollup_switcher(THD *thd, Query_block *query_block,
                                     Item_sum *item, int send_group_parts);
 static bool fulltext_uses_rollup_column(const Query_block *query_block);
+
+namespace {
+
+constexpr int kWzgMaxListItems = 12;
+constexpr size_t kWzgMaxPrintedExpressionBytes = 512;
+
+const char *wzg_field_type_name(enum_field_types type) {
+  switch (type) {
+    case MYSQL_TYPE_DECIMAL:
+      return "DECIMAL";
+    case MYSQL_TYPE_TINY:
+      return "TINYINT";
+    case MYSQL_TYPE_SHORT:
+      return "SMALLINT";
+    case MYSQL_TYPE_LONG:
+      return "INT";
+    case MYSQL_TYPE_FLOAT:
+      return "FLOAT";
+    case MYSQL_TYPE_DOUBLE:
+      return "DOUBLE";
+    case MYSQL_TYPE_NULL:
+      return "NULL";
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIMESTAMP2:
+      return "TIMESTAMP";
+    case MYSQL_TYPE_LONGLONG:
+      return "BIGINT";
+    case MYSQL_TYPE_INT24:
+      return "MEDIUMINT";
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+      return "DATE";
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_TIME2:
+      return "TIME";
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+      return "DATETIME";
+    case MYSQL_TYPE_YEAR:
+      return "YEAR";
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+      return "VARCHAR";
+    case MYSQL_TYPE_BIT:
+      return "BIT";
+    case MYSQL_TYPE_JSON:
+      return "JSON";
+    case MYSQL_TYPE_NEWDECIMAL:
+      return "DECIMAL";
+    case MYSQL_TYPE_ENUM:
+      return "ENUM";
+    case MYSQL_TYPE_SET:
+      return "SET";
+    case MYSQL_TYPE_TINY_BLOB:
+      return "TINYBLOB";
+    case MYSQL_TYPE_MEDIUM_BLOB:
+      return "MEDIUMBLOB";
+    case MYSQL_TYPE_LONG_BLOB:
+      return "LONGBLOB";
+    case MYSQL_TYPE_BLOB:
+      return "BLOB";
+    case MYSQL_TYPE_STRING:
+      return "CHAR";
+    case MYSQL_TYPE_GEOMETRY:
+      return "GEOMETRY";
+    case MYSQL_TYPE_TYPED_ARRAY:
+      return "TYPED_ARRAY";
+    case MYSQL_TYPE_BOOL:
+      return "BOOL";
+    case MYSQL_TYPE_INVALID:
+      return "INVALID";
+  }
+  return "UNKNOWN";
+}
+
+const char *wzg_item_result_name(Item_result result) {
+  switch (result) {
+    case STRING_RESULT:
+      return "字符串结果";
+    case REAL_RESULT:
+      return "浮点数结果";
+    case INT_RESULT:
+      return "整数结果";
+    case ROW_RESULT:
+      return "行值结果";
+    case DECIMAL_RESULT:
+      return "精确小数结果";
+    case INVALID_RESULT:
+      return "未知结果";
+  }
+  return "未知结果";
+}
+
+std::string wzg_clip(std::string value, size_t max_bytes) {
+  if (value.size() <= max_bytes) return value;
+  value.resize(max_bytes);
+  value.append("...");
+  return value;
+}
+
+std::string wzg_table_kind(const Table_ref *table_ref) {
+  if (table_ref == nullptr) return "未知表对象";
+  if (table_ref->is_view()) return "视图";
+  if (table_ref->is_derived()) return "派生表";
+  if (table_ref->is_table_function()) return "表函数";
+  if (table_ref->is_recursive_reference()) return "递归 CTE 引用";
+  if (table_ref->is_base_table()) return "基础表";
+  return "内部表对象";
+}
+
+std::string wzg_table_name(const Table_ref *table_ref) {
+  if (table_ref == nullptr) return "";
+  std::ostringstream out;
+  if (table_ref->db != nullptr && table_ref->db_length > 0)
+    out << std::string(table_ref->db, table_ref->db_length) << ".";
+  if (table_ref->table_name != nullptr && table_ref->table_name_length > 0)
+    out << std::string(table_ref->table_name, table_ref->table_name_length);
+  else if (table_ref->alias != nullptr)
+    out << table_ref->alias;
+  else
+    out << "<anonymous>";
+  if (table_ref->alias != nullptr &&
+      (table_ref->table_name == nullptr ||
+       strcmp(table_ref->alias, table_ref->table_name) != 0))
+    out << " AS " << table_ref->alias;
+  return out.str();
+}
+
+std::string wzg_leaf_tables(Query_block *query_block) {
+  std::ostringstream out;
+  int count = 0;
+  for (Table_ref *table_ref = query_block == nullptr ? nullptr
+                                                     : query_block->leaf_tables;
+       table_ref != nullptr; table_ref = table_ref->next_leaf) {
+    if (count > 0) out << ", ";
+    if (count >= kWzgMaxListItems) {
+      out << "...";
+      break;
+    }
+    out << wzg_table_name(table_ref) << "(" << wzg_table_kind(table_ref) << ")";
+    ++count;
+  }
+  return count == 0 ? "无表，可能是 SELECT 常量或非查询块" : out.str();
+}
+
+std::string wzg_item_text(THD *thd, Item *item) {
+  if (item == nullptr) return "";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  item->print(thd, &text, QT_ORDINARY);
+  return wzg_clip(std::string(text.ptr(), text.length()),
+                  kWzgMaxPrintedExpressionBytes);
+}
+
+std::string wzg_visible_select_items(THD *thd, Query_block *query_block) {
+  std::ostringstream out;
+  int count = 0;
+  if (query_block == nullptr) return "";
+  for (Item *item : VisibleFields(query_block->fields)) {
+    if (count > 0) out << ", ";
+    if (count >= kWzgMaxListItems) {
+      out << "...";
+      break;
+    }
+    out << wzg_item_text(thd, item) << ":" << wzg_field_type_name(item->data_type());
+    ++count;
+  }
+  return count == 0 ? "无可见 SELECT 字段" : out.str();
+}
+
+std::string wzg_condition_summary(THD *thd, Item *condition) {
+  if (condition == nullptr) return "无";
+  std::ostringstream out;
+  out << wzg_item_text(thd, condition) << "，结果类型="
+      << wzg_item_result_name(condition->result_type()) << "，字段类型="
+      << wzg_field_type_name(condition->data_type());
+  return out.str();
+}
+
+void wzg_emit_resolver_error(THD *thd, Query_block *query_block,
+                             const char *stage,
+                             const char *message,
+                             const char *note) {
+  WZG_PROBE_EVENT(thd, "resolver.error")
+      .message(message)
+      .field("resolve_result", "error")
+      .field("failed_stage", stage)
+      .field("query_block_number",
+             static_cast<std::uint64_t>(query_block->select_number))
+      .field("mysql_error_code",
+             static_cast<std::uint64_t>(
+                 thd->get_stmt_da()->is_error()
+                     ? thd->get_stmt_da()->mysql_errno()
+                     : 0))
+      .field("next_step", "返回错误给客户端，不进入正常优化器阶段")
+      .field("note", note)
+      .emit();
+}
+
+}  // namespace
 
 /**
   Prepare query block for optimization.
@@ -189,6 +394,22 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   if (is_table_value_constructor) return prepare_values(thd);
 
   Query_expression *const unit = master_query_expression();
+  const bool wzg_had_select_star = with_wild != 0;
+
+  WZG_PROBE_EVENT(thd, "resolver.start")
+      .message("开始解析 SQL 名字和表达式，准备把文本里的表名、字段名绑定到内部对象")
+      .sql_command(get_sql_command_string(parent_lex->sql_command))
+      .field("query_block_number", static_cast<std::uint64_t>(select_number))
+      .field("has_from", get_table_list() != nullptr)
+      .field("has_where", m_where_cond != nullptr)
+      .field("has_group_by", group_list.elements != 0)
+      .field("has_order_by", order_list.elements != 0)
+      .field("has_limit", select_limit != nullptr)
+      .field("has_select_star", wzg_had_select_star)
+      .field("resolver_goal",
+             "检查表和字段是否存在，检查 SELECT 权限，绑定名字，推导表达式类型，并准备交给优化器")
+      .field("note", "这一阶段不真正读取数据行，也不决定最终表访问顺序")
+      .emit();
 
   if (!m_table_nest.empty()) propagate_nullability(&m_table_nest, false);
 
@@ -242,16 +463,42 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
 
   /* Check that all tables, fields, conds and order are ok */
 
-  if (setup_tables(thd, get_table_list(), false)) return true;
+  if (setup_tables(thd, get_table_list(), false)) {
+    wzg_emit_resolver_error(thd, this, "setup_tables",
+                            "解析表名失败，某个表或派生表结构无法绑定",
+                            "通常表示表不存在、表结构无法打开、派生表解析失败或表数量超限");
+    return true;
+  }
+
+  WZG_PROBE_EVENT(thd, "resolver.tables_resolved")
+      .message("表名解析完成，SQL 中的表名已经绑定到 MySQL 内部表对象")
+      .sql_command(get_sql_command_string(parent_lex->sql_command))
+      .field("resolve_result", "success")
+      .field("query_block_number", static_cast<std::uint64_t>(select_number))
+      .field("table_lookup_result", "所有当前查询块需要的表都已找到或解析为内部表对象")
+      .field("leaf_table_count", static_cast<std::uint64_t>(leaf_table_count))
+      .field("tables", wzg_leaf_tables(this))
+      .field("privilege_check", "已进入 SELECT 权限检查路径，列权限会在字段绑定时继续检查")
+      .field("next_step", "解析 SELECT 字段列表，并展开 SELECT *")
+      .field("note", "这里的 leaf table 是后续优化器看到的输入表列表，视图和派生表可能已经展开或保留为内部对象")
+      .emit();
 
   if ((derived_table_count || table_func_count) &&
-      resolve_placeholder_tables(thd, true))
+      resolve_placeholder_tables(thd, true)) {
+    wzg_emit_resolver_error(thd, this, "resolve_placeholder_tables",
+                            "解析派生表、视图或表函数失败",
+                            "派生表或表函数没有形成可继续绑定字段的内部结构");
     return true;
+  }
 
   // Wait with privilege checking until all derived tables are resolved.
   if (derived_table_count && !thd->derived_tables_processing &&
-      check_view_privileges(thd, SELECT_ACL, SELECT_ACL))
+      check_view_privileges(thd, SELECT_ACL, SELECT_ACL)) {
+    wzg_emit_resolver_error(thd, this, "check_view_privileges",
+                            "检查视图或派生表权限失败",
+                            "当前用户没有继续读取相关视图或底层字段所需的权限");
     return true;
+  }
 
   is_item_list_lookup = true;
 
@@ -274,13 +521,39 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
 
   resolve_place = RESOLVE_SELECT_LIST;
 
-  if (with_wild && setup_wild(thd)) return true;
+  if (with_wild && setup_wild(thd)) {
+    wzg_emit_resolver_error(thd, this, "setup_wild",
+                            "展开 SELECT * 失败，无法把星号转换成真实字段列表",
+                            "可能是表字段解析失败或星号引用的表名不明确");
+    return true;
+  }
   if (setup_base_ref_items(thd)) return true; /* purecov: inspected */
 
   if (setup_fields(thd, thd->want_privilege, /*allow_sum_func=*/true,
                    /*split_sum_funcs=*/true, /*column_update=*/false,
-                   insert_field_list, &fields, base_ref_items))
+                   insert_field_list, &fields, base_ref_items)) {
+    wzg_emit_resolver_error(thd, this, "setup_fields",
+                            "解析 SELECT 字段失败，某个字段、函数或表达式无法绑定",
+                            "通常表示字段不存在、字段名不明确、函数参数不合法或列权限不足");
     return true;
+  }
+
+  WZG_PROBE_EVENT(thd, "resolver.fields_resolved")
+      .message(wzg_had_select_star
+                   ? "字段解析完成，SELECT * 已展开成真实字段列表"
+                   : "字段解析完成，SELECT 列表已经绑定到字段或表达式对象")
+      .sql_command(get_sql_command_string(parent_lex->sql_command))
+      .field("resolve_result", "success")
+      .field("query_block_number", static_cast<std::uint64_t>(select_number))
+      .field("select_star_expanded", wzg_had_select_star)
+      .field("visible_field_count",
+             static_cast<std::uint64_t>(CountVisibleFields(fields)))
+      .field("select_items", wzg_visible_select_items(thd, this))
+      .field("name_binding", "SELECT 列表中的字段名、函数和表达式已经绑定到内部 Item 对象")
+      .field("type_inference", "SELECT 列表表达式已经具备 MySQL 内部字段类型")
+      .field("privilege_check", "字段解析过程中已检查当前用户读取相关列所需的 SELECT 权限")
+      .field("next_step", "解析 WHERE、JOIN ON、GROUP BY、HAVING、ORDER BY 等表达式")
+      .emit();
 
   resolve_place = RESOLVE_NONE;
 
@@ -294,11 +567,34 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   thd->want_privilege = SELECT_ACL;
 
   // Set up join conditions and WHERE clause
-  if (setup_conds(thd)) return true;
+  if (setup_conds(thd)) {
+    wzg_emit_resolver_error(thd, this, "setup_conds",
+                            "解析 WHERE 或 JOIN 条件失败，条件里的字段或表达式无法绑定",
+                            "通常表示条件字段不存在、字段名不明确、表达式类型不合法或列权限不足");
+    return true;
+  }
+
+  WZG_PROBE_EVENT(thd, "resolver.conditions_resolved")
+      .message("条件解析完成，WHERE 和 JOIN 条件已经绑定并完成基本类型检查")
+      .sql_command(get_sql_command_string(parent_lex->sql_command))
+      .field("resolve_result", "success")
+      .field("query_block_number", static_cast<std::uint64_t>(select_number))
+      .field("has_where", m_where_cond != nullptr)
+      .field("where_condition", wzg_condition_summary(thd, m_where_cond))
+      .field("join_condition_count", static_cast<std::uint64_t>(cond_count))
+      .field("condition_binding", "条件中的字段名已经绑定到内部字段对象，常量和函数已经绑定到表达式对象")
+      .field("type_check", "条件表达式已经能产生布尔判断需要的结果，必要的类型处理由 MySQL 表达式系统记录")
+      .field("next_step", "继续解析 GROUP BY、HAVING、ORDER BY、LIMIT，并做局部查询改写")
+      .emit();
 
   // Set up the GROUP BY clause
   int all_fields_count = fields.size();
-  if (group_list.elements && setup_group(thd)) return true;
+  if (group_list.elements && setup_group(thd)) {
+    wzg_emit_resolver_error(thd, this, "setup_group",
+                            "解析 GROUP BY 失败，分组表达式无法绑定",
+                            "GROUP BY 中的字段、别名或表达式没有通过名字绑定和类型检查");
+    return true;
+  }
   hidden_group_field_count = fields.size() - all_fields_count;
 
   // Allow local set functions in HAVING and ORDER BY
@@ -313,7 +609,12 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
       item->update_used_tables();
     }
     if (populate_grouping_sets(thd)) {
-      return true;
+      {
+        wzg_emit_resolver_error(thd, this, "setup_having",
+                                "解析 HAVING 条件失败，HAVING 表达式无法绑定",
+                                "HAVING 中的字段、聚合函数或表达式没有通过名字绑定和类型检查");
+        return true;
+      }
     }
   }
 
@@ -405,8 +706,12 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   all_fields_count = fields.size();
   if (order_list.elements) {
     if (setup_order(thd, base_ref_items, get_table_list(), &fields,
-                    order_list.first))
+                    order_list.first)) {
+      wzg_emit_resolver_error(thd, this, "setup_order",
+                              "解析 ORDER BY 失败，排序表达式无法绑定",
+                              "ORDER BY 中的字段、别名或表达式没有通过名字绑定和类型检查");
       return true;
+    }
   }
   hidden_order_field_count = fields.size() - all_fields_count;
 
@@ -416,7 +721,12 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   }
 
   // Resolve OFFSET and LIMIT clauses
-  if (resolve_limits(thd)) return true;
+  if (resolve_limits(thd)) {
+    wzg_emit_resolver_error(thd, this, "resolve_limits",
+                            "解析 LIMIT 或 OFFSET 失败，分页表达式无法绑定",
+                            "LIMIT/OFFSET 必须能解析成 MySQL 可接受的数值表达式");
+    return true;
+  }
 
   /*
     Query block is completely resolved, except for windows (see below) which
@@ -585,9 +895,19 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     if (setup_ftfuncs(thd, this)) return true;
   }
 
-  if (query_result() && query_result()->prepare(thd, fields, unit)) return true;
+  if (query_result() && query_result()->prepare(thd, fields, unit)) {
+    wzg_emit_resolver_error(thd, this, "query_result_prepare",
+                            "准备查询结果输出失败",
+                            "结果列已经解析，但输出目标没有完成准备");
+    return true;
+  }
 
-  if (has_sj_candidates() && flatten_subqueries(thd)) return true;
+  if (has_sj_candidates() && flatten_subqueries(thd)) {
+    wzg_emit_resolver_error(thd, this, "flatten_subqueries",
+                            "子查询改写失败，无法把可改写的子查询准备成后续优化结构",
+                            "这一步属于 resolver 的局部改写，不表示解析器决定了最终执行顺序");
+    return true;
+  }
 
   set_sj_candidates(nullptr);
 
@@ -631,7 +951,12 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
       apply_local_transforms() is initiated only by the top query, and then
       recurses into subqueries.
      */
-    if (apply_local_transforms(thd, true)) return true;
+    if (apply_local_transforms(thd, true)) {
+      wzg_emit_resolver_error(thd, this, "apply_local_transforms",
+                              "查询块局部改写失败",
+                              "resolver 没有形成优化器可继续分析的最终查询块结构");
+      return true;
+    }
   }
 
   // Eliminate unused window definitions, redundant sorts etc.
@@ -661,6 +986,23 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   }
 
   assert(!thd->is_error());
+  WZG_PROBE_EVENT(thd, "resolver.finish")
+      .message("名字解析和表达式准备完成，查询块已经形成优化器可以继续分析的结构")
+      .sql_command(get_sql_command_string(parent_lex->sql_command))
+      .field("resolve_result", "success")
+      .field("query_block_number", static_cast<std::uint64_t>(select_number))
+      .field("leaf_table_count", static_cast<std::uint64_t>(leaf_table_count))
+      .field("visible_field_count",
+             static_cast<std::uint64_t>(CountVisibleFields(fields)))
+      .field("has_where", m_where_cond != nullptr)
+      .field("has_group_by", group_list.elements != 0)
+      .field("has_having", m_having_cond != nullptr)
+      .field("has_order_by", order_list.elements != 0)
+      .field("has_limit", select_limit != nullptr)
+      .field("optimizer_input",
+             "表对象、字段对象、条件表达式和结果列结构已经准备好，优化器接下来选择访问路径、连接顺序和索引")
+      .field("note", "resolver 会做必要的名字绑定、权限检查、类型推导和局部改写，但不真正读取数据行")
+      .emit();
   return false;
 }
 

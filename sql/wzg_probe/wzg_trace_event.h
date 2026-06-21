@@ -21,6 +21,7 @@ struct TraceEvent {
   std::string event_name;
   std::string event_phase;
   std::string event_level{"info"};
+  std::string message;
 
   std::uint64_t thread_id{0};
   std::uint64_t connection_id{0};
@@ -32,6 +33,7 @@ struct TraceEvent {
   std::string db;
   std::string command;
   std::string sql_command;
+  std::string raw_sql;
   std::string query;
 
   bool error{false};

@@ -86,6 +86,7 @@ std::string to_json_line(const TraceEvent &event) {
   append_string_field(out, "event_name", event.event_name, first);
   append_string_field(out, "event_phase", event.event_phase, first);
   append_string_field(out, "event_level", event.event_level, first);
+  append_string_field(out, "message", event.message, first);
   append_uint_field(out, "thread_id", event.thread_id, first);
   append_uint_field(out, "connection_id", event.connection_id, first);
   append_string_field(out, "connection_uuid", event.connection_uuid, first);
@@ -95,6 +96,7 @@ std::string to_json_line(const TraceEvent &event) {
   append_string_field(out, "db", event.db, first);
   append_string_field(out, "command", event.command, first);
   append_string_field(out, "sql_command", event.sql_command, first);
+  append_string_field(out, "raw_sql", event.raw_sql, first);
   append_string_field(out, "query", event.query, first);
   append_bool_field(out, "error", event.error, first);
   append_uint_field(out, "error_code", event.error_code, first);

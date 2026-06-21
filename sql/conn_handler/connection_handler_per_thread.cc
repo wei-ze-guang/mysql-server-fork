@@ -61,6 +61,7 @@
 #include "sql/sql_error.h"
 #include "sql/sql_parse.h"             // do_command
 #include "sql/sql_thd_internal_api.h"  // thd_set_thread_stack
+#include "sql/wzg_probe/wzg_probe.h"
 #include "thr_mutex.h"
 
 // Initialize static members
@@ -296,6 +297,7 @@ static void *handle_connection(void *arg) {
         thd->get_protocol_classic()->get_vio()->mysql_socket;
     mysql_socket_set_thread_owner(socket);
     thd_manager->add_thd(thd);
+    wzg_probe::on_connection_start(thd);
 
     if (thd_prepare_connection(thd))
       handler_manager->inc_aborted_connects();
@@ -305,6 +307,7 @@ static void *handle_connection(void *arg) {
       }
       end_connection(thd);
     }
+    wzg_probe::on_connection_end(thd);
     close_connection(thd, 0, false, false);
 
     thd->get_stmt_da()->reset_diagnostics_area();

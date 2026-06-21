@@ -12,6 +12,7 @@ namespace {
 thread_local TraceContext tls_context;
 std::atomic<std::uint64_t> global_event_id{1};
 std::atomic<std::uint64_t> global_connection_seq{1};
+constexpr std::size_t kMaxRawSqlBytes = 4096;
 
 }  // namespace
 
@@ -26,7 +27,21 @@ void TraceContext::ensure_connection(THD *thd) {
   m_connection_uuid = out.str();
 }
 
-void TraceContext::clear_connection() { m_connection_uuid.clear(); }
+void TraceContext::clear_connection() {
+  m_connection_uuid.clear();
+  clear_raw_sql();
+}
+
+void TraceContext::set_raw_sql(const char *sql, std::size_t length) {
+  if (sql == nullptr || length == 0) {
+    m_raw_sql.clear();
+    return;
+  }
+  if (length > kMaxRawSqlBytes) length = kMaxRawSqlBytes;
+  m_raw_sql.assign(sql, length);
+}
+
+void TraceContext::clear_raw_sql() { m_raw_sql.clear(); }
 
 TraceContext &current_context() { return tls_context; }
 
@@ -39,5 +54,11 @@ std::uint64_t now_ns() {
           clock::now().time_since_epoch())
           .count());
 }
+
+void set_raw_sql(const char *sql, std::size_t length) {
+  current_context().set_raw_sql(sql, length);
+}
+
+void clear_raw_sql() { current_context().clear_raw_sql(); }
 
 }  // namespace wzg_probe
