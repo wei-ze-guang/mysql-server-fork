@@ -82,6 +82,7 @@
 #include "sql/auth/sql_security_ctx.h"
 #include "sql/binlog.h"  // mysql_bin_log
 #include "sql/check_stack.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/dd/dd_schema.h"
 #include "sql/dd/dd_table.h"       // dd::table_exists
@@ -153,6 +154,7 @@
 #include "sql/transaction.h"  // trans_rollback_stmt
 #include "sql/transaction_info.h"
 #include "sql/trigger_chain.h"  // Trigger_chain
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql/xa.h"
 #include "sql_string.h"
 #include "strmake.h"
@@ -181,6 +183,169 @@ using std::unordered_map;
 static constexpr const size_t MAX_DBKEY_LENGTH{NAME_LEN * 2 + 1 + 1 + 4 + 4};
 
 static constexpr long STACK_MIN_SIZE_FOR_OPEN{1024 * 80};
+
+const char *wzg_mdl_type_name(enum_mdl_type type) {
+  switch (type) {
+    case MDL_INTENTION_EXCLUSIVE:
+      return "MDL_INTENTION_EXCLUSIVE";
+    case MDL_SHARED:
+      return "MDL_SHARED";
+    case MDL_SHARED_HIGH_PRIO:
+      return "MDL_SHARED_HIGH_PRIO";
+    case MDL_SHARED_READ:
+      return "MDL_SHARED_READ";
+    case MDL_SHARED_WRITE:
+      return "MDL_SHARED_WRITE";
+    case MDL_SHARED_WRITE_LOW_PRIO:
+      return "MDL_SHARED_WRITE_LOW_PRIO";
+    case MDL_SHARED_UPGRADABLE:
+      return "MDL_SHARED_UPGRADABLE";
+    case MDL_SHARED_READ_ONLY:
+      return "MDL_SHARED_READ_ONLY";
+    case MDL_SHARED_NO_WRITE:
+      return "MDL_SHARED_NO_WRITE";
+    case MDL_SHARED_NO_READ_WRITE:
+      return "MDL_SHARED_NO_READ_WRITE";
+    case MDL_EXCLUSIVE:
+      return "MDL_EXCLUSIVE";
+    default:
+      return "UNKNOWN_MDL_TYPE";
+  }
+}
+
+const char *wzg_mdl_type_meaning(enum_mdl_type type) {
+  switch (type) {
+    case MDL_SHARED_READ:
+      return "读取表数据需要的共享元数据锁，允许并发读写数据，但阻止并发 DROP/ALTER 修改表结构";
+    case MDL_SHARED_WRITE:
+      return "修改表数据或 SELECT FOR UPDATE 需要的共享写元数据锁，保护表结构不被并发 DDL 改掉";
+    case MDL_SHARED_WRITE_LOW_PRIO:
+      return "低优先级共享写元数据锁，用于 LOW_PRIORITY 更新类场景";
+    case MDL_SHARED:
+      return "只访问对象元数据，不准备读取或修改表数据";
+    case MDL_SHARED_HIGH_PRIO:
+      return "高优先级共享元数据锁，常用于 information_schema 等只看元数据的场景";
+    case MDL_SHARED_UPGRADABLE:
+      return "可升级共享元数据锁，常用于 ALTER TABLE 第一阶段，后续可能升级为更强锁";
+    case MDL_SHARED_READ_ONLY:
+      return "LOCK TABLES READ 使用的共享只读元数据锁，阻止并发修改表数据和结构";
+    case MDL_SHARED_NO_WRITE:
+      return "阻止其他会修改表数据的操作，允许读表数据，常用于 DDL 的部分阶段";
+    case MDL_SHARED_NO_READ_WRITE:
+      return "LOCK TABLES WRITE 使用的强元数据锁，阻止其他连接读写该表数据";
+    case MDL_EXCLUSIVE:
+      return "排他元数据锁，用于 CREATE/DROP/RENAME/部分 ALTER，阻止其他元数据锁并发授予";
+    case MDL_INTENTION_EXCLUSIVE:
+      return "作用在全局或 schema 等范围上的意向排他元数据锁，用于保护后续对象级锁获取";
+    default:
+      return "未知元数据锁类型";
+  }
+}
+
+const char *wzg_mdl_duration_name(enum_mdl_duration duration) {
+  switch (duration) {
+    case MDL_STATEMENT:
+      return "MDL_STATEMENT，语句结束时自动释放";
+    case MDL_TRANSACTION:
+      return "MDL_TRANSACTION，事务结束时自动释放";
+    case MDL_EXPLICIT:
+      return "MDL_EXPLICIT，需要显式释放";
+    default:
+      return "UNKNOWN_MDL_DURATION";
+  }
+}
+
+std::string wzg_mdl_object_name(const MDL_request *request) {
+  if (request == nullptr) return "未知";
+  const char *db = request->key.db_name();
+  const char *name = request->key.name();
+  std::string value;
+  if (db != nullptr && db[0] != '\0') value.append(db);
+  if (name != nullptr && name[0] != '\0') {
+    if (!value.empty()) value.append(".");
+    value.append(name);
+  }
+  return value.empty() ? "全局或匿名对象" : value;
+}
+
+const char *wzg_mdl_namespace_name(MDL_key::enum_mdl_namespace ns) {
+  switch (ns) {
+    case MDL_key::GLOBAL:
+      return "GLOBAL";
+    case MDL_key::BACKUP_LOCK:
+      return "BACKUP_LOCK";
+    case MDL_key::TABLESPACE:
+      return "TABLESPACE";
+    case MDL_key::SCHEMA:
+      return "SCHEMA";
+    case MDL_key::TABLE:
+      return "TABLE";
+    case MDL_key::FUNCTION:
+      return "FUNCTION";
+    case MDL_key::PROCEDURE:
+      return "PROCEDURE";
+    case MDL_key::TRIGGER:
+      return "TRIGGER";
+    case MDL_key::EVENT:
+      return "EVENT";
+    case MDL_key::COMMIT:
+      return "COMMIT";
+    case MDL_key::USER_LEVEL_LOCK:
+      return "USER_LEVEL_LOCK";
+    case MDL_key::LOCKING_SERVICE:
+      return "LOCKING_SERVICE";
+    case MDL_key::SRID:
+      return "SRID";
+    case MDL_key::ACL_CACHE:
+      return "ACL_CACHE";
+    case MDL_key::COLUMN_STATISTICS:
+      return "COLUMN_STATISTICS";
+    case MDL_key::RESOURCE_GROUPS:
+      return "RESOURCE_GROUPS";
+    case MDL_key::FOREIGN_KEY:
+      return "FOREIGN_KEY";
+    case MDL_key::CHECK_CONSTRAINT:
+      return "CHECK_CONSTRAINT";
+    default:
+      return "UNKNOWN_NAMESPACE";
+  }
+}
+
+void wzg_emit_mdl_lock(THD *thd, const MDL_request *request,
+                       bool no_wait_mode, bool error, bool granted) {
+  if (thd == nullptr || request == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+  const char *db_name = request->key.db_name();
+  if (db_name != nullptr &&
+      (!strcmp(db_name, "mysql") || !strcmp(db_name, "performance_schema") ||
+       !strcmp(db_name, "sys") || !strcmp(db_name, "information_schema")))
+    return;
+
+  WZG_PROBE_EVENT(thd, "server.mdl_lock")
+      .message(granted
+                   ? "Server 层已获取元数据锁，执行期间保护表结构不被冲突操作修改"
+                   : "Server 层尝试获取元数据锁失败或遇到冲突")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("lock_result", granted ? "granted" : "not_granted")
+      .field("lock_object", wzg_mdl_object_name(request))
+      .field("lock_namespace",
+             wzg_mdl_namespace_name(request->key.mdl_namespace()))
+      .field("lock_type", wzg_mdl_type_name(request->type))
+      .field("lock_type_meaning", wzg_mdl_type_meaning(request->type))
+      .field("lock_duration", wzg_mdl_duration_name(request->duration))
+      .field("wait_mode",
+             no_wait_mode ? "遇到冲突不等待，通常用于 information_schema 等跳过式打开表"
+                          : "普通等待模式；如果有冲突会等待到 lock_wait_timeout 或死锁处理")
+      .field("server_lock_role",
+             "这是 Server 层 MDL 元数据锁，保护库表对象定义；不是 InnoDB record/gap/next-key 行锁")
+      .field("error", error)
+      .field("next_step",
+             granted
+                 ? "继续打开表对象，后续优化器和执行器可以安全使用当前表结构"
+                 : "当前打开表流程会返回错误或跳过该表，具体取决于调用场景")
+      .emit();
+}
 
 /**
   This internal handler is used to trap ER_NO_SUCH_TABLE and
@@ -2725,7 +2890,10 @@ static bool open_table_get_mdl_lock(THD *thd, Open_table_context *ot_ctx,
     mdl_request = &new_mdl_request;
   }
 
-  if (flags & MYSQL_OPEN_FAIL_ON_MDL_CONFLICT) {
+  const bool no_wait_mode = flags & MYSQL_OPEN_FAIL_ON_MDL_CONFLICT;
+  bool mdl_error = false;
+
+  if (no_wait_mode) {
     /*
       When table is being open in order to get data for I_S table,
       we might have some tables not only open but also locked (e.g. when
@@ -2737,10 +2905,15 @@ static bool open_table_get_mdl_lock(THD *thd, Open_table_context *ot_ctx,
       To avoid such situation we skip the trouble-making table if
       there is a conflicting lock.
     */
-    if (thd->mdl_context.try_acquire_lock(mdl_request)) return true;
+    if (thd->mdl_context.try_acquire_lock(mdl_request)) {
+      wzg_emit_mdl_lock(thd, mdl_request, no_wait_mode, true,
+                        mdl_request->ticket != nullptr);
+      return true;
+    }
     if (mdl_request->ticket == nullptr) {
       my_error(ER_WARN_I_S_SKIPPED_TABLE, MYF(0), mdl_request->key.db_name(),
                mdl_request->key.name());
+      wzg_emit_mdl_lock(thd, mdl_request, no_wait_mode, true, false);
       return true;
     }
   } else {
@@ -2791,9 +2964,16 @@ static bool open_table_get_mdl_lock(THD *thd, Open_table_context *ot_ctx,
     thd->mdl_context.set_force_dml_deadlock_weight(false);
     thd->pop_internal_handler();
 
-    if (result && !ot_ctx->can_recover_from_failed_open()) return true;
+    mdl_error = result;
+    if (result && !ot_ctx->can_recover_from_failed_open()) {
+      wzg_emit_mdl_lock(thd, mdl_request, no_wait_mode, true,
+                        mdl_request->ticket != nullptr);
+      return true;
+    }
   }
   *mdl_ticket = mdl_request->ticket;
+  wzg_emit_mdl_lock(thd, mdl_request, no_wait_mode, mdl_error,
+                    *mdl_ticket != nullptr);
   return false;
 }
 

@@ -83,6 +83,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sql_show.h>
 #include <sql_tablespace.h>
 #include <sql_thd_internal_api.h>
+#include "sql/wzg_probe/wzg_probe.h"
 #include "api0api.h"
 #include "api0misc.h"
 #include "arch0arch.h"
@@ -215,6 +216,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef HAVE_UNISTD_H
@@ -306,6 +308,460 @@ static bool innodb_inited = false;
 }
 
 static struct handlerton *innodb_hton_ptr;
+
+namespace {
+
+bool wzg_innodb_should_log(const TABLE *table, THD *thd) {
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr || table->s == nullptr)
+    return false;
+  if (table->s->db.str == nullptr) return true;
+
+  std::string_view db(table->s->db.str, table->s->db.length);
+  return db != "mysql" && db != "performance_schema" &&
+         db != "information_schema" && db != "sys";
+}
+
+bool wzg_innodb_should_log_thd(THD *thd) {
+  return thd != nullptr && thd->query().str != nullptr &&
+         thd->query().length > 0;
+}
+
+std::string wzg_innodb_table_name(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr) return "无";
+  std::string value;
+  if (table->s->db.str != nullptr && table->s->db.length > 0) {
+    value.append(table->s->db.str, table->s->db.length);
+    value.push_back('.');
+  }
+  if (table->s->table_name.str != nullptr && table->s->table_name.length > 0)
+    value.append(table->s->table_name.str, table->s->table_name.length);
+  return value.empty() ? "<unknown>" : value;
+}
+
+const char *wzg_innodb_find_flag_name(enum ha_rkey_function flag) {
+  switch (flag) {
+    case HA_READ_KEY_EXACT:
+      return "HA_READ_KEY_EXACT";
+    case HA_READ_KEY_OR_NEXT:
+      return "HA_READ_KEY_OR_NEXT";
+    case HA_READ_KEY_OR_PREV:
+      return "HA_READ_KEY_OR_PREV";
+    case HA_READ_AFTER_KEY:
+      return "HA_READ_AFTER_KEY";
+    case HA_READ_BEFORE_KEY:
+      return "HA_READ_BEFORE_KEY";
+    case HA_READ_PREFIX:
+      return "HA_READ_PREFIX";
+    case HA_READ_PREFIX_LAST:
+      return "HA_READ_PREFIX_LAST";
+    case HA_READ_PREFIX_LAST_OR_PREV:
+      return "HA_READ_PREFIX_LAST_OR_PREV";
+    case HA_READ_MBR_CONTAIN:
+      return "HA_READ_MBR_CONTAIN";
+    case HA_READ_MBR_INTERSECT:
+      return "HA_READ_MBR_INTERSECT";
+    case HA_READ_MBR_WITHIN:
+      return "HA_READ_MBR_WITHIN";
+    case HA_READ_MBR_DISJOINT:
+      return "HA_READ_MBR_DISJOINT";
+    case HA_READ_MBR_EQUAL:
+      return "HA_READ_MBR_EQUAL";
+    case HA_READ_NEAREST_NEIGHBOR:
+      return "HA_READ_NEAREST_NEIGHBOR";
+    case HA_READ_INVALID:
+      return "HA_READ_INVALID";
+  }
+  return "UNKNOWN_HA_READ_FLAG";
+}
+
+const char *wzg_innodb_page_mode_name(page_cur_mode_t mode) {
+  switch (mode) {
+    case PAGE_CUR_UNSUPP:
+      return "PAGE_CUR_UNSUPP";
+    case PAGE_CUR_G:
+      return "PAGE_CUR_G";
+    case PAGE_CUR_GE:
+      return "PAGE_CUR_GE";
+    case PAGE_CUR_L:
+      return "PAGE_CUR_L";
+    case PAGE_CUR_LE:
+      return "PAGE_CUR_LE";
+    case PAGE_CUR_CONTAIN:
+      return "PAGE_CUR_CONTAIN";
+    case PAGE_CUR_INTERSECT:
+      return "PAGE_CUR_INTERSECT";
+    case PAGE_CUR_WITHIN:
+      return "PAGE_CUR_WITHIN";
+    case PAGE_CUR_DISJOINT:
+      return "PAGE_CUR_DISJOINT";
+    case PAGE_CUR_MBR_EQUAL:
+      return "PAGE_CUR_MBR_EQUAL";
+    case PAGE_CUR_RTREE_INSERT:
+      return "PAGE_CUR_RTREE_INSERT";
+    case PAGE_CUR_RTREE_LOCATE:
+      return "PAGE_CUR_RTREE_LOCATE";
+    case PAGE_CUR_RTREE_GET_FATHER:
+      return "PAGE_CUR_RTREE_GET_FATHER";
+    case PAGE_CUR_NN:
+      return "PAGE_CUR_NN";
+  }
+  return "UNKNOWN_PAGE_CUR_MODE";
+}
+
+const char *wzg_innodb_page_mode_meaning(page_cur_mode_t mode) {
+  switch (mode) {
+    case PAGE_CUR_GE:
+      return "在 InnoDB B+Tree 中定位到大于等于 key 的第一条记录";
+    case PAGE_CUR_G:
+      return "在 InnoDB B+Tree 中定位到严格大于 key 的第一条记录";
+    case PAGE_CUR_LE:
+      return "在 InnoDB B+Tree 中定位到小于等于 key 的最后一条记录";
+    case PAGE_CUR_L:
+      return "在 InnoDB B+Tree 中定位到严格小于 key 的最后一条记录";
+    case PAGE_CUR_CONTAIN:
+    case PAGE_CUR_INTERSECT:
+    case PAGE_CUR_WITHIN:
+    case PAGE_CUR_DISJOINT:
+    case PAGE_CUR_MBR_EQUAL:
+      return "空间索引 R-Tree 查找模式";
+    case PAGE_CUR_NN:
+      return "近邻索引查找模式";
+    case PAGE_CUR_UNSUPP:
+      return "这个 handler 查找模式不能转换成 InnoDB 支持的游标定位方式";
+    default:
+      return "InnoDB 内部游标定位模式";
+  }
+}
+
+const char *wzg_innodb_match_mode_name(ulint match_mode) {
+  switch (match_mode) {
+    case 0:
+      return "0";
+    case ROW_SEL_EXACT:
+      return "ROW_SEL_EXACT";
+    case ROW_SEL_EXACT_PREFIX:
+      return "ROW_SEL_EXACT_PREFIX";
+    default:
+      return "UNKNOWN_ROW_SEL_MATCH_MODE";
+  }
+}
+
+const char *wzg_innodb_match_mode_meaning(ulint match_mode) {
+  switch (match_mode) {
+    case 0:
+      return "不要求完整 key 精确匹配，按游标定位模式读取";
+    case ROW_SEL_EXACT:
+      return "要求完整 key 值精确匹配，常见于等值索引查找";
+    case ROW_SEL_EXACT_PREFIX:
+      return "要求 key 前缀精确匹配，常见于前缀查找";
+    default:
+      return "未知匹配模式";
+  }
+}
+
+const char *wzg_innodb_direction_name(uint direction) {
+  switch (direction) {
+    case 0:
+      return "0";
+    case ROW_SEL_NEXT:
+      return "ROW_SEL_NEXT";
+    case ROW_SEL_PREV:
+      return "ROW_SEL_PREV";
+    default:
+      return "UNKNOWN_ROW_SEL_DIRECTION";
+  }
+}
+
+const char *wzg_innodb_direction_meaning(uint direction) {
+  switch (direction) {
+    case 0:
+      return "打开或重新定位游标，不是继续取下一行";
+    case ROW_SEL_NEXT:
+      return "沿索引正向继续读取下一条记录";
+    case ROW_SEL_PREV:
+      return "沿索引反向继续读取上一条记录";
+    default:
+      return "未知读取方向";
+  }
+}
+
+std::string wzg_innodb_index_name(const dict_index_t *index) {
+  if (index == nullptr) return "无";
+  return index->name() == nullptr ? "<unnamed>" : index->name();
+}
+
+std::string wzg_innodb_item_to_string(THD *thd, Item *item) {
+  if (item == nullptr) return "无";
+  StringBuffer<STRING_BUFFER_USUAL_SIZE> str(system_charset_info);
+  item->print(thd, &str, QT_ORDINARY);
+  return std::string(str.ptr(), str.length());
+}
+
+const char *wzg_innodb_index_kind(const dict_index_t *index) {
+  if (index == nullptr) return "未知索引";
+  if (index->is_clustered()) return "聚簇索引，叶子记录包含整行数据";
+  return "二级索引，必要时后续可能再读取聚簇索引记录";
+}
+
+std::string wzg_innodb_key_len_text(uint key_len) {
+  return std::to_string(key_len);
+}
+
+std::string wzg_innodb_db_status_text(dberr_t status) {
+  switch (status) {
+    case DB_SUCCESS:
+      return "DB_SUCCESS";
+    case DB_RECORD_NOT_FOUND:
+      return "DB_RECORD_NOT_FOUND";
+    case DB_END_OF_INDEX:
+      return "DB_END_OF_INDEX";
+    case DB_TABLESPACE_DELETED:
+      return "DB_TABLESPACE_DELETED";
+    case DB_TABLESPACE_NOT_FOUND:
+      return "DB_TABLESPACE_NOT_FOUND";
+    case DB_UNSUPPORTED:
+      return "DB_UNSUPPORTED";
+    case DB_FORCED_ABORT:
+      return "DB_FORCED_ABORT";
+    default:
+      return std::to_string(static_cast<int>(status));
+  }
+}
+
+const char *wzg_innodb_db_status_meaning(dberr_t status) {
+  switch (status) {
+    case DB_SUCCESS:
+      return "InnoDB 找到一条可返回记录，并已按 MySQL 行格式写入 buf";
+    case DB_RECORD_NOT_FOUND:
+      return "InnoDB 没有找到匹配记录";
+    case DB_END_OF_INDEX:
+      return "InnoDB 游标已经到达索引末尾或范围外";
+    case DB_TABLESPACE_DELETED:
+      return "表空间已被丢弃";
+    case DB_TABLESPACE_NOT_FOUND:
+      return "表空间文件缺失";
+    case DB_UNSUPPORTED:
+      return "当前查找模式 InnoDB 不支持";
+    case DB_FORCED_ABORT:
+      return "事务被强制中止";
+    default:
+      return "InnoDB 返回了其他内部状态，随后会转换为 MySQL handler 状态码";
+  }
+}
+
+std::string wzg_innodb_mysql_status_text(int error) {
+  switch (error) {
+    case 0:
+      return "0";
+    case HA_ERR_KEY_NOT_FOUND:
+      return "HA_ERR_KEY_NOT_FOUND";
+    case HA_ERR_END_OF_FILE:
+      return "HA_ERR_END_OF_FILE";
+    case HA_ERR_NO_SUCH_TABLE:
+      return "HA_ERR_NO_SUCH_TABLE";
+    case HA_ERR_TABLESPACE_MISSING:
+      return "HA_ERR_TABLESPACE_MISSING";
+    case HA_ERR_INDEX_CORRUPT:
+      return "HA_ERR_INDEX_CORRUPT";
+    case HA_ERR_TABLE_DEF_CHANGED:
+      return "HA_ERR_TABLE_DEF_CHANGED";
+    default:
+      return std::to_string(error);
+  }
+}
+
+const char *wzg_innodb_mysql_status_meaning(int error) {
+  switch (error) {
+    case 0:
+      return "返回给 handler 的状态是成功，SQL 层可以读取 buf 中的行";
+    case HA_ERR_KEY_NOT_FOUND:
+      return "返回给 handler 的状态是没有匹配 key";
+    case HA_ERR_END_OF_FILE:
+      return "返回给 handler 的状态是游标没有更多行";
+    case HA_ERR_NO_SUCH_TABLE:
+      return "返回给 handler 的状态是表不可用或表空间已丢弃";
+    case HA_ERR_TABLESPACE_MISSING:
+      return "返回给 handler 的状态是表空间缺失";
+    case HA_ERR_INDEX_CORRUPT:
+      return "返回给 handler 的状态是索引损坏";
+    case HA_ERR_TABLE_DEF_CHANGED:
+      return "返回给 handler 的状态是表定义已变化";
+    default:
+      return "返回给 handler 的状态是其他错误或特殊状态";
+  }
+}
+
+const char *wzg_innodb_icp_result_name(ICP_RESULT result) {
+  switch (result) {
+    case ICP_MATCH:
+      return "ICP_MATCH";
+    case ICP_NO_MATCH:
+      return "ICP_NO_MATCH";
+    case ICP_OUT_OF_RANGE:
+      return "ICP_OUT_OF_RANGE";
+  }
+  return "UNKNOWN_ICP_RESULT";
+}
+
+const char *wzg_innodb_icp_result_meaning(ICP_RESULT result) {
+  switch (result) {
+    case ICP_MATCH:
+      return "这条索引记录满足下推条件，可以继续返回给上层或继续后续读取";
+    case ICP_NO_MATCH:
+      return "这条索引记录不满足下推条件，InnoDB 可以跳过它，减少回表或上层过滤";
+    case ICP_OUT_OF_RANGE:
+      return "索引游标已经超过范围边界，调用方应结束当前范围读取";
+  }
+  return "未知 ICP 判断结果";
+}
+
+void wzg_emit_innodb_icp_received(THD *thd, const TABLE *table,
+                                  const dict_index_t *index, uint keyno,
+                                  Item *idx_cond) {
+  if (!wzg_innodb_should_log(table, thd)) return;
+  WZG_PROBE_EVENT(thd, "innodb.index_condition_received")
+      .message("InnoDB 接收到 Server 下推的索引条件，后续读取索引记录时会提前判断")
+      .field("table", wzg_innodb_table_name(table))
+      .field("mysql_key_number", std::to_string(keyno))
+      .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_index_kind", wzg_innodb_index_kind(index))
+      .field("pushed_condition", wzg_innodb_item_to_string(thd, idx_cond))
+      .field("condition_owner", "Server 仍持有表达式对象，InnoDB 在读取索引记录时回调表达式求值")
+      .field("when_checked", "读取索引记录后、决定是否继续返回给 SQL 层或回表之前")
+      .field("what_icp_does",
+             "ICP 不改变索引访问方式；它只把能用索引字段判断的条件提前到存储引擎层")
+      .field("next_step",
+             "row_search 读取索引记录时会调用 innobase_index_cond，产生 innodb.index_condition_check")
+      .emit();
+}
+
+void wzg_emit_innodb_icp_check(THD *thd, uint keyno, Item *idx_cond,
+                               ICP_RESULT result) {
+  if (!wzg_innodb_should_log_thd(thd) || idx_cond == nullptr) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.index_condition_check")
+      .message("InnoDB 在索引记录上提前判断下推条件")
+      .field("mysql_key_number", std::to_string(keyno))
+      .field("pushed_condition", wzg_innodb_item_to_string(thd, idx_cond))
+      .field("check_position",
+             "已读到一条索引记录，但还没有把它作为普通行交给 SQL 层处理")
+      .field("result", wzg_innodb_icp_result_name(result))
+      .field("result_meaning", wzg_innodb_icp_result_meaning(result))
+      .field("if_match", "继续处理这条记录，必要时读取完整行并返回给上层")
+      .field("if_no_match", "跳过这条索引记录，继续找下一条候选记录")
+      .field("if_out_of_range", "当前范围扫描结束")
+      .field("note",
+             "这里记录的是存储引擎层的提前判断结果；最终 SQL 是否返回该行，还可能受其他过滤条件影响")
+      .emit();
+}
+
+void wzg_emit_innodb_index_read_start(THD *thd, const TABLE *table,
+                                      const dict_index_t *index,
+                                      const uchar *key_ptr, uint key_len,
+                                      enum ha_rkey_function find_flag,
+                                      page_cur_mode_t mode,
+                                      ulint match_mode) {
+  if (!wzg_innodb_should_log(table, thd)) return;
+  WZG_PROBE_EVENT(thd, "innodb.index_read_start")
+      .message("InnoDB 收到索引读取请求，准备在索引结构中定位记录")
+      .field("table", wzg_innodb_table_name(table))
+      .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_index_kind", wzg_innodb_index_kind(index))
+      .field("key_buffer",
+             key_ptr == nullptr
+                 ? "空 key 指针；表示定位到索引开头或结尾"
+                 : "MySQL handler 传入的二进制 key，InnoDB 会先转换成内部 search_tuple")
+      .field("key_length_bytes", wzg_innodb_key_len_text(key_len))
+      .field("handler_find_flag", wzg_innodb_find_flag_name(find_flag))
+      .field("innodb_cursor_mode", wzg_innodb_page_mode_name(mode))
+      .field("innodb_cursor_mode_meaning",
+             wzg_innodb_page_mode_meaning(mode))
+      .field("match_mode", wzg_innodb_match_mode_name(match_mode))
+      .field("match_mode_meaning", wzg_innodb_match_mode_meaning(match_mode))
+      .field("search_tuple",
+             key_ptr == nullptr
+                 ? "不会构造具体 key 值，只按游标模式定位索引边界"
+                 : "会把二进制 key 转成 InnoDB 内部 tuple，供 row_search 使用")
+      .field("next_step",
+             "调用 row_search_mvcc 或 row_search_no_mvcc，在 InnoDB 索引中定位记录")
+      .emit();
+}
+
+void wzg_emit_innodb_index_read_finish(THD *thd, const TABLE *table,
+                                       const dict_index_t *index,
+                                       dberr_t db_status, int mysql_status) {
+  if (!wzg_innodb_should_log(table, thd)) return;
+  WZG_PROBE_EVENT(thd, "innodb.index_read_finish")
+      .message(mysql_status == 0
+                   ? "InnoDB 索引读取已返回，并找到一条可交给 SQL 层的记录"
+                   : "InnoDB 索引读取已返回，但没有产生可用行或返回了错误")
+      .field("table", wzg_innodb_table_name(table))
+      .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_status", wzg_innodb_db_status_text(db_status))
+      .field("innodb_status_meaning",
+             wzg_innodb_db_status_meaning(db_status))
+      .field("handler_return_code", wzg_innodb_mysql_status_text(mysql_status))
+      .field("handler_return_meaning",
+             wzg_innodb_mysql_status_meaning(mysql_status))
+      .field("return_type", "int handler 状态码")
+      .field("record_buffer",
+             mysql_status == 0 ? "buf 已填充 MySQL 行格式记录"
+                               : "buf 没有新的有效记录")
+      .field("next_step", mysql_status == 0
+                              ? "handler 把成功状态返回给 SQL 执行器"
+                              : "handler 把未找到、末尾或错误状态返回给 SQL 执行器")
+      .emit();
+}
+
+void wzg_emit_innodb_cursor_fetch_start(THD *thd, const TABLE *table,
+                                        const dict_index_t *index,
+                                        uint direction, uint match_mode) {
+  if (!wzg_innodb_should_log(table, thd)) return;
+  WZG_PROBE_EVENT(thd, "innodb.cursor_fetch_start")
+      .message("InnoDB 收到游标继续读取请求，准备沿当前索引游标取下一条记录")
+      .field("table", wzg_innodb_table_name(table))
+      .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_index_kind", wzg_innodb_index_kind(index))
+      .field("direction", wzg_innodb_direction_name(direction))
+      .field("direction_meaning", wzg_innodb_direction_meaning(direction))
+      .field("match_mode", wzg_innodb_match_mode_name(match_mode))
+      .field("match_mode_meaning", wzg_innodb_match_mode_meaning(match_mode))
+      .field("record_buffer",
+             "buf 参数；成功时 InnoDB 会把取到的记录转换成 MySQL 行格式写入这里")
+      .field("next_step",
+             "调用 row_search_mvcc 或 row_search_no_mvcc，使用已保存的索引游标继续读取")
+      .emit();
+}
+
+void wzg_emit_innodb_cursor_fetch_finish(THD *thd, const TABLE *table,
+                                         const dict_index_t *index,
+                                         dberr_t db_status,
+                                         int mysql_status) {
+  if (!wzg_innodb_should_log(table, thd)) return;
+  WZG_PROBE_EVENT(thd, "innodb.cursor_fetch_finish")
+      .message(mysql_status == 0
+                   ? "InnoDB 游标继续读取已返回，并取到一条记录"
+                   : "InnoDB 游标继续读取已返回，但没有更多行或返回了错误")
+      .field("table", wzg_innodb_table_name(table))
+      .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_status", wzg_innodb_db_status_text(db_status))
+      .field("innodb_status_meaning",
+             wzg_innodb_db_status_meaning(db_status))
+      .field("handler_return_code", wzg_innodb_mysql_status_text(mysql_status))
+      .field("handler_return_meaning",
+             wzg_innodb_mysql_status_meaning(mysql_status))
+      .field("return_type", "int handler 状态码")
+      .field("record_buffer",
+             mysql_status == 0 ? "buf 已填充 MySQL 行格式记录"
+                               : "buf 没有新的有效记录")
+      .field("next_step", mysql_status == 0
+                              ? "handler 继续把这一行交给 SQL 执行器处理"
+                              : "handler 通知 SQL 执行器当前游标没有更多可用行")
+      .emit();
+}
+
+}  // namespace
 
 static const long AUTOINC_OLD_STYLE_LOCKING = 0;
 static const long AUTOINC_NEW_STYLE_LOCKING = 1;
@@ -10522,20 +10978,33 @@ int ha_innobase::index_read(
   m_last_match_mode = (uint)match_mode;
 
   dberr_t ret;
+  bool emitted_finish = false;
+
+  wzg_emit_innodb_index_read_start(m_user_thd, table, index, key_ptr, key_len,
+                                   find_flag, mode, match_mode);
 
   if (mode != PAGE_CUR_UNSUPP) {
     ret = innobase_srv_conc_enter_innodb(m_prebuilt);
 
     if (ret != DB_SUCCESS) {
-      return convert_error_code_to_mysql(ret, m_prebuilt->table->flags,
-                                         m_user_thd);
+      const int error =
+          convert_error_code_to_mysql(ret, m_prebuilt->table->flags,
+                                      m_user_thd);
+      wzg_emit_innodb_index_read_finish(m_user_thd, table, index, ret, error);
+      emitted_finish = true;
+      return error;
     }
 
     if (!m_prebuilt->table->is_intrinsic()) {
       if (TrxInInnoDB::is_aborted(m_prebuilt->trx)) {
         innobase_rollback(ht, m_user_thd, false);
 
-        return convert_error_code_to_mysql(DB_FORCED_ABORT, 0, m_user_thd);
+        const int error =
+            convert_error_code_to_mysql(DB_FORCED_ABORT, 0, m_user_thd);
+        wzg_emit_innodb_index_read_finish(m_user_thd, table, index,
+                                          DB_FORCED_ABORT, error);
+        emitted_finish = true;
+        return error;
       }
 
       m_prebuilt->ins_sel_stmt = thd_is_ins_sel_stmt(m_user_thd);
@@ -10597,6 +11066,10 @@ int ha_innobase::index_read(
                                           m_user_thd);
 
       break;
+  }
+
+  if (!emitted_finish) {
+    wzg_emit_innodb_index_read_finish(m_user_thd, table, index, ret, error);
   }
 
   return error;
@@ -10779,16 +11252,27 @@ int ha_innobase::general_fetch(
 
   bool intrinsic = m_prebuilt->table->is_intrinsic();
 
+  wzg_emit_innodb_cursor_fetch_start(m_user_thd, table, m_prebuilt->index,
+                                     direction, match_mode);
+
   if (!intrinsic && TrxInInnoDB::is_aborted(trx)) {
     innobase_rollback(ht, m_user_thd, false);
 
-    return convert_error_code_to_mysql(DB_FORCED_ABORT, 0, m_user_thd);
+    const int error =
+        convert_error_code_to_mysql(DB_FORCED_ABORT, 0, m_user_thd);
+    wzg_emit_innodb_cursor_fetch_finish(m_user_thd, table, m_prebuilt->index,
+                                        DB_FORCED_ABORT, error);
+    return error;
   }
 
   auto ret = innobase_srv_conc_enter_innodb(m_prebuilt);
 
   if (ret != DB_SUCCESS) {
-    return convert_error_code_to_mysql(DB_FORCED_ABORT, 0, m_user_thd);
+    const int error = convert_error_code_to_mysql(DB_FORCED_ABORT, 0,
+                                                  m_user_thd);
+    wzg_emit_innodb_cursor_fetch_finish(m_user_thd, table, m_prebuilt->index,
+                                        ret, error);
+    return error;
   }
 
   if (!intrinsic) {
@@ -10840,6 +11324,9 @@ int ha_innobase::general_fetch(
 
       break;
   }
+
+  wzg_emit_innodb_cursor_fetch_finish(m_user_thd, table, m_prebuilt->index, ret,
+                                      error);
 
   return error;
 }
@@ -23747,10 +24234,15 @@ innobase_index_cond(ha_innobase *h) /*!< in/out: pointer to ha_innobase */
 
   if (h->end_range && h->compare_key_icp(h->end_range) > 0) {
     /* caller should return HA_ERR_END_OF_FILE already */
+    wzg_emit_innodb_icp_check(current_thd, h->pushed_idx_cond_keyno,
+                              h->pushed_idx_cond, ICP_OUT_OF_RANGE);
     return ICP_OUT_OF_RANGE;
   }
 
-  return h->pushed_idx_cond->val_int() ? ICP_MATCH : ICP_NO_MATCH;
+  ICP_RESULT result = h->pushed_idx_cond->val_int() ? ICP_MATCH : ICP_NO_MATCH;
+  wzg_emit_innodb_icp_check(current_thd, h->pushed_idx_cond_keyno,
+                            h->pushed_idx_cond, result);
+  return result;
 }
 
 /** Get the computed value by supplying the base column values.
@@ -24022,6 +24514,8 @@ class Item *ha_innobase::idx_cond_push(uint keyno, class Item *idx_cond) {
   pushed_idx_cond = idx_cond;
   pushed_idx_cond_keyno = keyno;
   in_range_check_pushed_down = true;
+  wzg_emit_innodb_icp_received(m_user_thd, table, innobase_get_index(keyno),
+                               keyno, idx_cond);
   /* We will evaluate the condition entirely */
   return nullptr;
 }

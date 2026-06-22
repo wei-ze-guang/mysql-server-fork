@@ -49,6 +49,7 @@
 #include "mysqld_error.h"
 #include "prealloced_array.h"
 #include "scope_guard.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/debug_sync.h"
 #include "sql/error_handler.h"
 #include "sql/field.h"
@@ -83,10 +84,68 @@
 #include "sql/table_function.h"  // Table_function
 #include "sql/temp_table_param.h"
 #include "sql/window.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "template_utils.h"
 
 using pack_rows::TableCollection;
 using std::any_of;
+
+namespace {
+
+std::string wzg_temp_table_name(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr) return "内部临时表";
+  std::string value;
+  if (table->s->db.str != nullptr && table->s->db.length > 0) {
+    value.append(table->s->db.str, table->s->db.length);
+    value.push_back('.');
+  }
+  if (table->s->table_name.str != nullptr && table->s->table_name.length > 0)
+    value.append(table->s->table_name.str, table->s->table_name.length);
+  return value.empty() ? "内部临时表" : value;
+}
+
+std::string wzg_temp_table_engine(const TABLE *table) {
+  if (table == nullptr || table->file == nullptr) return "未知";
+  const char *name = table->file->table_type();
+  return name == nullptr ? "未知" : name;
+}
+
+std::string wzg_ha_rows_text(ha_rows rows) {
+  if (rows == HA_POS_ERROR) return "未知";
+  return std::to_string(rows);
+}
+
+void wzg_emit_temp_table_result(THD *thd, const TABLE *table,
+                                const char *materialize_kind,
+                                const char *materialize_action,
+                                ha_rows input_rows, ha_rows stored_rows,
+                                ha_rows updated_rows, bool reused_existing,
+                                bool spilled_to_disk, bool error,
+                                const char *next_step) {
+  if (thd == nullptr || thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  WZG_PROBE_EVENT(thd, "executor.temp_table_result")
+      .message(error ? "内部临时结果处理提前结束，执行过程中出现错误"
+                     : "内部临时结果已经生成，可以被后续执行节点读取")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("materialize_kind", materialize_kind)
+      .field("materialize_action", materialize_action)
+      .field("temporary_table", wzg_temp_table_name(table))
+      .field("temporary_table_engine", wzg_temp_table_engine(table))
+      .field("input_rows_read", wzg_ha_rows_text(input_rows))
+      .field("rows_written_or_groups_created", wzg_ha_rows_text(stored_rows))
+      .field("groups_updated", wzg_ha_rows_text(updated_rows))
+      .field("reused_existing_result", reused_existing)
+      .field("spilled_to_disk", spilled_to_disk)
+      .field("execution_result", error ? "error" : "success")
+      .field("what_this_means",
+             "这里是真实执行后的临时结果统计，不是优化器估算；普通物化统计写入行数，临时表聚合统计生成的分组数")
+      .field("next_step", next_step)
+      .emit();
+}
+
+}  // namespace
 
 int FilterIterator::Read() {
   for (;;) {
@@ -1558,6 +1617,11 @@ bool MaterializeIterator<Profiler>::Init() {
       // Just a rescan of the same table.
       const bool err = m_table_iterator->Init();
       m_table_iter_profiler.StopInit(start_time);
+      wzg_emit_temp_table_result(
+          thd(), table(), "普通物化结果", "复用已经生成的内部临时结果",
+          HA_POS_ERROR, HA_POS_ERROR, 0, true, false, err,
+          err ? "复用临时结果失败，执行会返回错误"
+              : "直接重新扫描已经生成的临时结果");
       return err;
     }
   }
@@ -1679,6 +1743,11 @@ bool MaterializeIterator<Profiler>::Init() {
     the time spent on individual read operations.
   */
   m_profiler.IncrementNumRows(stored_rows);
+  wzg_emit_temp_table_result(
+      thd(), table(), "普通物化结果", "读取输入查询块并写入内部临时结果",
+      HA_POS_ERROR, stored_rows, 0, false, false, err,
+      err ? "临时结果扫描初始化失败，执行会返回错误"
+          : "后续执行节点会扫描这个临时结果继续处理");
   return err;
 }
 
@@ -3855,6 +3924,10 @@ bool TemptableAggregateIterator<Profiler>::Init() {
   auto end_unique_index =
       create_scope_guard([&] { table()->file->ha_index_end(); });
 
+  ha_rows input_rows = 0;
+  ha_rows groups_created = 0;
+  ha_rows groups_updated = 0;
+  bool spilled_to_disk = false;
   PFSBatchMode pfs_batch_mode(m_subquery_iterator.get());
   for (;;) {
     int read_error = m_subquery_iterator->Read();
@@ -3867,6 +3940,7 @@ bool TemptableAggregateIterator<Profiler>::Init() {
       thd()->send_kill_message();
       return true;
     }
+    ++input_rows;
 
     // Materialize items for this row.
     if (copy_funcs(m_temp_table_param, thd(), CFT_FIELDS))
@@ -3925,6 +3999,7 @@ bool TemptableAggregateIterator<Profiler>::Init() {
           end_unique_index.release();
           return true;
         }
+        spilled_to_disk = true;
         /*
           The key of the temporary table can be a hash of the group-by columns
           or the group-by columns themselves. Find the row to be updated in the
@@ -3959,6 +4034,7 @@ bool TemptableAggregateIterator<Profiler>::Init() {
           return true;
         }
       }
+      ++groups_updated;
       continue;
     }
 
@@ -4026,9 +4102,12 @@ bool TemptableAggregateIterator<Profiler>::Init() {
         end_unique_index.release();
         return true;
       }
+      spilled_to_disk = true;
+      ++groups_created;
     } else {
       // Count the number of rows materialized.
       m_profiler.IncrementNumRows(1);
+      ++groups_created;
     }
   }
 
@@ -4040,6 +4119,12 @@ bool TemptableAggregateIterator<Profiler>::Init() {
   m_profiler.StopInit(start_time);
   const bool err = m_table_iterator->Init();
   m_table_iter_profiler.StopInit(start_time);
+  wzg_emit_temp_table_result(
+      thd(), table(), "临时表聚合结果",
+      "读取输入行，按 GROUP BY key 写入或更新聚合临时表", input_rows,
+      groups_created, groups_updated, false, spilled_to_disk, err,
+      err ? "聚合临时表扫描初始化失败，执行会返回错误"
+          : "后续执行节点会扫描聚合临时表，输出每个分组的聚合结果");
   return err;
 }
 

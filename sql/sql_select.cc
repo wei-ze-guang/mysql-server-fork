@@ -67,6 +67,7 @@
 #include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"  // *_ACL
 #include "sql/auth/sql_security_ctx.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/current_thd.h"
 #include "sql/debug_sync.h"  // DEBUG_SYNC
 #include "sql/enum_query_type.h"
@@ -116,6 +117,7 @@
 #include "sql/sql_parse.h"      // bind_fields
 #include "sql/sql_planner.h"    // calculate_condition_filter
 #include "sql/sql_plugin.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql/sql_resolver.h"
 #include "sql/sql_test.h"       // misc. debug printing utilities
 #include "sql/sql_timer.h"      // thd_timer_set
@@ -2803,6 +2805,116 @@ bool and_conditions(Item **e1, Item *e2) {
   return false;
 }
 
+static std::string wzg_item_to_string(THD *thd, Item *item) {
+  if (item == nullptr) return "无";
+  StringBuffer<STRING_BUFFER_USUAL_SIZE> str(system_charset_info);
+  item->print(thd, &str, QT_ORDINARY);
+  return std::string(str.ptr(), str.length());
+}
+
+static std::string wzg_table_name(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr) return "无";
+  std::string value;
+  if (table->s->db.str != nullptr && table->s->db.length > 0) {
+    value.append(table->s->db.str, table->s->db.length);
+    value.push_back('.');
+  }
+  if (table->s->table_name.str != nullptr && table->s->table_name.length > 0)
+    value.append(table->s->table_name.str, table->s->table_name.length);
+  return value.empty() ? "<unknown>" : value;
+}
+
+static std::string wzg_key_name(const TABLE *table, uint keyno) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      keyno == MAX_KEY || keyno >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[keyno];
+  std::string value(key.name == nullptr ? "<unnamed>" : key.name);
+  value.push_back('(');
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (part_no > 0) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    if (part.field != nullptr && part.field->field_name != nullptr)
+      value.append(part.field->field_name);
+    else
+      value.append("<expression>");
+  }
+  value.push_back(')');
+  return value;
+}
+
+static void wzg_emit_index_condition_pushdown_attempt(
+    THD *thd, TABLE *table, uint keyno, Item *current_table_condition,
+    Item *idx_cond, bool bka_blocked) {
+  if (thd == nullptr || table == nullptr || table->s == nullptr ||
+      idx_cond == nullptr)
+    return;
+
+  WZG_PROBE_EVENT(thd, "optimizer.index_condition_pushdown_attempt")
+      .message(bka_blocked
+                   ? "优化器发现可用于索引条件下推的条件，但 BKA 场景下先不交给存储引擎"
+                   : "优化器发现可用于索引条件下推的条件，准备交给存储引擎提前判断")
+      .field("table", wzg_table_name(table))
+      .field("index", wzg_key_name(table, keyno))
+      .field("current_table_condition",
+             wzg_item_to_string(thd, current_table_condition))
+      .field("candidate_pushed_condition", wzg_item_to_string(thd, idx_cond))
+      .field("push_target", bka_blocked ? "不调用存储引擎，条件留在 SQL 层"
+                                        : "调用 handler::idx_cond_push")
+      .field("why_this_condition",
+             "这个条件只依赖当前索引能提供的字段，所以有机会在读取索引记录时提前判断")
+      .field("what_icp_does",
+             "ICP 不决定使用哪个索引；它是在已经选择索引读取后，把只依赖索引字段的条件提前到存储引擎判断")
+      .field("next_step",
+             bka_blocked
+                 ? "执行器后续通过普通过滤节点判断这个条件"
+                 : "存储引擎接收条件后，后续读取索引记录时尝试提前判断")
+      .emit();
+}
+
+static void wzg_emit_index_condition_pushdown_finish(
+    THD *thd, TABLE *table, uint keyno, Item *current_table_condition,
+    Item *idx_cond, Item *idx_remainder_cond, Item *row_cond,
+    bool bka_blocked) {
+  if (thd == nullptr || table == nullptr || table->s == nullptr ||
+      idx_cond == nullptr)
+    return;
+
+  const bool pushed = !bka_blocked && idx_remainder_cond != idx_cond;
+  WZG_PROBE_EVENT(thd, "optimizer.index_condition_pushdown_finish")
+      .message(pushed ? "索引条件下推已完成，存储引擎会提前判断这部分条件"
+                      : "索引条件下推已分析完成，但这部分条件仍留在 SQL 层判断")
+      .field("table", wzg_table_name(table))
+      .field("index", wzg_key_name(table, keyno))
+      .field("current_table_condition",
+             wzg_item_to_string(thd, current_table_condition))
+      .field("pushed_condition", wzg_item_to_string(thd, idx_cond))
+      .field("remaining_condition_after_push",
+             wzg_item_to_string(thd, idx_remainder_cond))
+      .field("row_condition",
+             row_cond == nullptr
+                 ? "无；除了下推条件外，没有额外需要 SQL 层保留的行过滤条件"
+                 : wzg_item_to_string(thd, row_cond))
+      .field("push_result", pushed ? "pushed" : "not_pushed")
+      .field("push_result_meaning",
+             pushed
+                 ? "存储引擎会在读取索引记录时先判断 pushed_condition，满足后才继续返回给上层"
+                 : "这个条件没有实际交给存储引擎，仍由 SQL 层过滤")
+      .field("blocked_reason",
+             bka_blocked
+                 ? "BKA join cache 场景下，判断该条件需要额外操作，因此没有下推"
+                 : (pushed ? "无" : "存储引擎没有接收该条件，或只接收了部分条件"))
+      .field("what_icp_does",
+             "ICP 不决定使用哪个索引；它是在已经选择索引读取后，把只依赖索引字段的条件提前到存储引擎判断")
+      .field("benefit",
+             "对二级索引尤其有用：不满足条件的索引记录可以少做回表或少返回给 SQL 层")
+      .field("next_step",
+             pushed
+                 ? "InnoDB 后续通过 innodb.index_condition_check 逐条记录判断这个条件"
+                 : "执行器后续通过普通过滤节点判断这些条件")
+      .emit();
+}
+
 /*
   Get a part of the condition that can be checked using only index fields
 
@@ -3061,20 +3173,20 @@ void QEP_TAB::push_index_cond(const JOIN_TAB *join_tab, uint keyno,
 
       Item *idx_remainder_cond = nullptr;
 
+      const bool bka_blocked =
+          join_tab->use_join_cache() && other_tbls_ok &&
+          (idx_cond->used_tables() &
+           ~(table_ref->map() | join_->const_table_map));
+
+      wzg_emit_index_condition_pushdown_attempt(join_->thd, tbl, keyno,
+                                                condition(), idx_cond,
+                                                bka_blocked);
+
       /*
         For BKA cache, we don't store the condition, because evaluation of the
         condition would require additional operations before the evaluation.
       */
-      if (join_tab->use_join_cache() &&
-          /*
-            if cache is used then the value is true only
-            for BKA cache (see setup_join_buffering() func).
-            In this case other_tbls_ok is an equivalent of
-            cache->is_key_access().
-          */
-          other_tbls_ok &&
-          (idx_cond->used_tables() &
-           ~(table_ref->map() | join_->const_table_map))) {
+      if (bka_blocked) {
         idx_remainder_cond = idx_cond;
         trace_obj->add("not_pushed_due_to_BKA", true);
       } else {
@@ -3099,6 +3211,10 @@ void QEP_TAB::push_index_cond(const JOIN_TAB *join_tab, uint keyno,
       Item *row_cond = make_cond_remainder(condition(), true);
       DBUG_EXECUTE("where", print_where(join_->thd, row_cond, "remainder cond",
                                         QT_ORDINARY););
+
+      wzg_emit_index_condition_pushdown_finish(
+          join_->thd, tbl, keyno, condition(), idx_cond, idx_remainder_cond,
+          row_cond, bka_blocked);
 
       if (row_cond) {
         and_conditions(&row_cond, idx_remainder_cond);
@@ -4278,6 +4394,21 @@ bool JOIN::add_having_as_tmp_table_cond(uint curr_tmp_table) {
       if (curr_table->condition()->fix_fields(thd, nullptr)) return true;
     }
     curr_table->condition()->apply_is_true();
+    WZG_PROBE_EVENT(thd, "executor.having")
+        .message("执行器把 HAVING 条件下推到内部临时表读取条件中")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("query_block_number",
+               static_cast<std::uint64_t>(query_block->select_number))
+        .field("having_condition", ItemToString(sort_table_cond))
+        .field("attached_to", "内部临时表的读取条件")
+        .field("when_checked",
+               "聚合结果写入临时表后，从临时表读取分组结果时检查")
+        .field("input_row_meaning",
+               "这里判断的是临时表里的聚合/分组结果行，不是原始表行")
+        .field("pass_behavior", "条件为 TRUE 的分组结果继续进入排序、投影或返回")
+        .field("reject_behavior", "条件为 FALSE 或 NULL 的分组结果会被过滤掉")
+        .field("next_step", "通过 HAVING 的临时表行继续交给后续执行节点")
+        .emit();
     DBUG_EXECUTE("where", print_where(thd, curr_table->condition(),
                                       "select and having", QT_ORDINARY););
 

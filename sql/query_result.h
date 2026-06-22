@@ -195,16 +195,23 @@ class Query_result_send : public Query_result {
     set with an eof or error packet
   */
   bool is_result_set_started;
+  bool result_send_start_logged;
 
  public:
-  Query_result_send() : Query_result(), is_result_set_started(false) {}
+  Query_result_send()
+      : Query_result(),
+        is_result_set_started(false),
+        result_send_start_logged(false) {}
   bool send_result_set_metadata(THD *thd, const mem_root_deque<Item *> &list,
                                 uint flags) override;
   bool send_data(THD *thd, const mem_root_deque<Item *> &items) override;
   bool send_eof(THD *thd) override;
   bool check_supports_cursor() const override { return false; }
   void abort_result_set(THD *thd) override;
-  void cleanup() override { is_result_set_started = false; }
+  void cleanup() override {
+    is_result_set_started = false;
+    result_send_start_logged = false;
+  }
   /**
     An alternative implementation may provide an optimized protocol adapter
     for this object.

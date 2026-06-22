@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -64,6 +65,7 @@
 #include "mysqld_error.h"
 #include "prealloced_array.h"
 #include "sql-common/json_dom.h"  // Json_wrapper
+#include "sql/command_mapping.h"
 #include "sql/current_thd.h"
 #include "sql/field.h"
 #include "sql/filesort.h"  // Filesort
@@ -110,6 +112,7 @@
 #include "sql/temp_table_param.h"
 #include "sql/visible_fields.h"
 #include "sql/window.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "template_utils.h"
 #include "thr_lock.h"
 
@@ -211,6 +214,208 @@ string RefToString(const Index_lookup &ref, const KEY &key,
   return ret;
 }
 
+const char *WzgTempTableMemEngineName(ulong engine) {
+  switch (engine) {
+    case 0:
+      return "MEMORY";
+    case 1:
+      return "TempTable";
+    default:
+      return "未知";
+  }
+}
+
+std::string WzgTempTableName(const TABLE *table) {
+  if (table == nullptr || table->s == nullptr ||
+      table->s->table_name.str == nullptr)
+    return "内部临时表";
+  return std::string(table->s->table_name.str, table->s->table_name.length);
+}
+
+std::string WzgTempTableRowsLimitText(ha_rows rows_limit) {
+  if (rows_limit == HA_POS_ERROR) return "无限制，需要保留完整中间结果";
+  return std::to_string(rows_limit);
+}
+
+std::string WzgTempTableFieldText(const mem_root_deque<Item *> &fields) {
+  constexpr uint kMaxPrintedFields = 12;
+  std::ostringstream out;
+  uint printed = 0;
+  for (Item *item : fields) {
+    if (printed >= kMaxPrintedFields) break;
+    if (printed > 0) out << "；";
+    out << (printed + 1) << ". ";
+    out << "name=" << (item == nullptr ? "未知" : item->full_name());
+    out << "，expression=" << ItemToString(item);
+    out << "，visible="
+        << (item != nullptr && item->hidden ? "false" : "true");
+    ++printed;
+  }
+  if (fields.size() > printed)
+    out << "；还有 " << (fields.size() - printed) << " 个字段未展开";
+  return printed == 0 ? "无字段" : out.str();
+}
+
+std::string WzgTempTableGroupText(ORDER *group) {
+  if (group == nullptr) return "无";
+  constexpr uint kMaxPrintedFields = 8;
+  std::ostringstream out;
+  uint printed = 0;
+  for (ORDER *item = group; item != nullptr && printed < kMaxPrintedFields;
+       item = item->next) {
+    if (printed > 0) out << "；";
+    out << (printed + 1) << ". ";
+    out << (item->item == nullptr || *item->item == nullptr
+                ? "未知表达式"
+                : ItemToString(*item->item));
+    out << (item->direction == ORDER_DESC ? " DESC" : " ASC");
+    ++printed;
+  }
+  if (group != nullptr && printed == kMaxPrintedFields) out << "；还有更多分组字段未展开";
+  return printed == 0 ? "无" : out.str();
+}
+
+std::string WzgTempTableReasonText(const JOIN *join, const TABLE *table,
+                                   const Temp_table_param *param,
+                                   ORDER *group, bool distinct,
+                                   bool save_sum_fields) {
+  std::string reason;
+  auto append = [&reason](const char *text) {
+    if (!reason.empty()) reason.append("；");
+    reason.append(text);
+  };
+  if (param != nullptr && param->m_window != nullptr)
+    append("窗口函数需要把输入行和窗口计算结果放入中间行结构");
+  if (group != nullptr || (table != nullptr && table->group != nullptr))
+    append("GROUP BY 或聚合需要按分组 key 保存中间结果");
+  if (distinct || (table != nullptr && table->s != nullptr &&
+                   table->s->is_distinct))
+    append("DISTINCT 需要用临时表辅助去重");
+  if (save_sum_fields) append("聚合函数结果需要保存到临时表字段");
+  if (join != nullptr &&
+      (join->query_block->active_options() & OPTION_BUFFER_RESULT))
+    append("SQL_BUFFER_RESULT 要求先缓冲结果");
+  return reason.empty() ? "执行计划需要保存中间结果，供后续排序、过滤或返回使用"
+                        : reason;
+}
+
+std::string WzgTempTableNextStepText(const Temp_table_param *param,
+                                     const TABLE *table) {
+  if (param != nullptr && param->m_window != nullptr)
+    return "后续窗口函数读取这个临时行结构，计算窗口函数后继续向上输出";
+  if (table != nullptr && table->group != nullptr)
+    return "后续执行器按分组 key 写入或更新临时表中的聚合结果";
+  if (table != nullptr && table->s != nullptr && table->s->is_distinct)
+    return "后续执行器写入临时表时利用唯一约束跳过重复行";
+  return "后续执行器把中间行写入临时表，再由上层节点读取或继续处理";
+}
+
+void WzgEmitTempTableCreate(THD *thd, const JOIN *join, const QEP_TAB *tab,
+                            const TABLE *table,
+                            const mem_root_deque<Item *> &fields,
+                            ORDER *group, bool distinct,
+                            bool save_sum_fields, ha_rows rows_limit) {
+  if (thd == nullptr || table == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+
+  const Temp_table_param *param =
+      tab == nullptr ? nullptr : tab->tmp_table_param;
+  WZG_PROBE_EVENT(thd, "executor.temp_table_create")
+      .message("执行器创建内部临时表，用来保存 SQL 执行过程中的中间结果")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             join == nullptr || join->query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("plan_table_index",
+             tab == nullptr ? std::uint64_t{0}
+                            : static_cast<std::uint64_t>(tab->idx()))
+      .field("temporary_table", WzgTempTableName(table))
+      .field("temporary_table_kind", "内部临时表，不是用户显式 CREATE TEMPORARY TABLE")
+      .field("expected_memory_engine",
+             WzgTempTableMemEngineName(thd->variables.internal_tmp_mem_storage_engine))
+      .field("memory_limit_hint",
+             std::string("tmp_table_size=") +
+                 std::to_string(thd->variables.tmp_table_size) +
+                 "，max_heap_table_size=" +
+                 std::to_string(thd->variables.max_heap_table_size))
+      .field("rows_limit", WzgTempTableRowsLimitText(rows_limit))
+      .field("field_count", static_cast<std::uint64_t>(fields.size()))
+      .field("visible_field_count",
+             static_cast<std::uint64_t>(CountVisibleFields(fields)))
+      .field("hidden_field_count",
+             param == nullptr ? std::uint64_t{0}
+                              : static_cast<std::uint64_t>(
+                                    param->hidden_field_count))
+      .field("columns", WzgTempTableFieldText(fields))
+      .field("group_by", WzgTempTableGroupText(group))
+      .field("distinct", distinct || (table->s != nullptr && table->s->is_distinct))
+      .field("save_sum_fields", save_sum_fields)
+      .field("for_window",
+             param != nullptr && param->m_window != nullptr
+                 ? "是；这个临时表是窗口函数步骤的输出表"
+                 : "否")
+      .field("reason",
+             WzgTempTableReasonText(join, table, param, group, distinct,
+                                    save_sum_fields))
+      .field("note",
+             "这里记录临时表结构创建；是否实际写满、是否落盘，要看后续 executor.temp_table_result")
+      .field("next_step", WzgTempTableNextStepText(param, table))
+      .emit();
+}
+
+void WzgEmitHavingPlan(THD *thd, const JOIN *join, const Item *having,
+                       const char *where_attached) {
+  if (thd == nullptr || having == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+
+  WZG_PROBE_EVENT(thd, "executor.having")
+      .message("执行器准备检查 HAVING 条件，过滤聚合或分组之后的结果")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             join == nullptr || join->query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("having_condition", ItemToString(having))
+      .field("attached_to", where_attached == nullptr ? "未知" : where_attached)
+      .field("when_checked",
+             "GROUP BY、聚合或临时表中间结果形成之后，在分组结果继续向上输出之前检查")
+      .field("input_row_meaning",
+             "这里判断的是聚合/分组后的结果行，不是存储引擎刚读出的原始表行")
+      .field("pass_behavior", "HAVING 条件为 TRUE 的分组或结果行继续进入排序、投影或返回客户端")
+      .field("reject_behavior", "HAVING 条件为 FALSE 或 NULL 的分组或结果行不会继续返回")
+      .field("next_step", "通过 HAVING 的结果继续交给后续执行节点")
+      .emit();
+}
+
+void WzgEmitDistinctTempTable(THD *thd, const JOIN *join, const TABLE *table,
+                              const mem_root_deque<Item *> &fields,
+                              bool distinct_arg) {
+  if (thd == nullptr || table == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+  if (!distinct_arg && (table->s == nullptr || !table->s->is_distinct)) return;
+
+  WZG_PROBE_EVENT(thd, "executor.distinct")
+      .message("执行器准备用内部临时表去重，只保留 SELECT 结果列组合不重复的行")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             join == nullptr || join->query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("dedup_method", "临时表唯一约束去重")
+      .field("temporary_table", WzgTempTableName(table))
+      .field("distinct_columns", WzgTempTableFieldText(fields))
+      .field("input_meaning",
+             "去重比较的是 SELECT 列表形成的结果行，不是只看原始表的物理记录")
+      .field("duplicate_behavior",
+             "写入临时表时，如果唯一约束发现相同结果行，重复行会被跳过")
+      .field("next_step", "唯一行保存在临时表中，后续再被读取、排序或返回客户端")
+      .emit();
+}
+
 bool JOIN::create_intermediate_table(
     QEP_TAB *const tab, const mem_root_deque<Item *> &tmp_table_fields,
     ORDER_with_src &tmp_table_group, bool save_sum_fields) {
@@ -250,6 +455,10 @@ bool JOIN::create_intermediate_table(
 
   assert(tab->idx() > 0);
   tab->set_table(table);
+  WzgEmitTempTableCreate(thd, this, tab, table, tmp_table_fields,
+                         tmp_table_group.order, distinct_arg, save_sum_fields,
+                         tmp_rows_limit);
+  WzgEmitDistinctTempTable(thd, this, table, tmp_table_fields, distinct_arg);
 
   /**
     If this is a window's OUT table, any final DISTINCT, ORDER BY will lead to
@@ -3182,6 +3391,8 @@ AccessPath *JOIN::create_root_access_path_for_join() {
     // and then remove the code that moves HAVING onto qep_tab->condition().
     if (qep_tab->having != nullptr &&
         qep_tab->op_type != QEP_TAB::OT_AGGREGATE_INTO_TMP_TABLE) {
+      WzgEmitHavingPlan(thd, this, qep_tab->having,
+                        "临时表读取之后的 FilterIterator");
       path = NewFilterAccessPath(thd, path, qep_tab->having);
     }
 
@@ -3311,6 +3522,8 @@ AccessPath *JOIN::create_root_access_path_for_join() {
           thd, path, qep_tab->tmp_table_param, qep_tab->table(), table_path,
           qep_tab->ref_item_slice);
       if (qep_tab->having != nullptr) {
+        WzgEmitHavingPlan(thd, this, qep_tab->having,
+                          "临时表聚合结果之后的 FilterIterator");
         path = NewFilterAccessPath(thd, path, qep_tab->having);
       }
     } else {
@@ -3420,6 +3633,8 @@ AccessPath *JOIN::attach_access_paths_for_having_and_limit(
   // We don't currently bother with materializing subqueries
   // in HAVING, as they should be rare.
   if (having_cond != nullptr) {
+    WzgEmitHavingPlan(thd, this, having_cond,
+                      "查询块最终输出之前的 FilterIterator");
     path = add_filter_access_path(thd, path, having_cond, query_block);
   }
 

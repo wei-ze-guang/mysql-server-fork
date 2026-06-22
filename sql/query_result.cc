@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <sstream>
+#include <string>
 
 #include "lex_string.h"
 #include "my_dbug.h"
@@ -46,6 +48,7 @@
 #include "sql/derror.h"  // ER_THD
 #include "sql/item.h"
 #include "sql/item_func.h"
+#include "sql/command_mapping.h"
 #include "sql/mysqld.h"            // key_select_to_file
 #include "sql/parse_tree_nodes.h"  // PT_select_var
 #include "sql/protocol.h"
@@ -55,7 +58,9 @@
 #include "sql/sql_error.h"
 #include "sql/sql_exchange.h"
 #include "sql/system_variables.h"
+#include "sql/table.h"
 #include "sql/visible_fields.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql_string.h"
 #include "strmake.h"
 #include "strxnmov.h"
@@ -67,11 +72,197 @@ uint Query_result::field_count(const mem_root_deque<Item *> &fields) const {
   return CountVisibleFields(fields);
 }
 
+namespace {
+
+const char *WzgProjectionItemTypeText(Item *item) {
+  if (item == nullptr) return "未知";
+  if (item->type() == Item::FIELD_ITEM) {
+    Item *real_item = item->real_item();
+    if (real_item != nullptr && real_item->type() == Item::FIELD_ITEM) {
+      Item_field *field_item = down_cast<Item_field *>(real_item);
+      if (field_item->field != nullptr && field_item->field->table != nullptr &&
+          field_item->field->table->s != nullptr &&
+          field_item->field->table->s->tmp_table != NO_TMP_TABLE)
+        return "中间结果字段";
+    }
+    return "表字段";
+  }
+  switch (item->type()) {
+    case Item::REF_ITEM:
+      return "引用字段或别名";
+    case Item::FUNC_ITEM:
+      return "表达式或函数";
+    case Item::SUM_FUNC_ITEM:
+      return "聚合函数或窗口函数";
+    case Item::SUBQUERY_ITEM:
+      return "子查询表达式";
+    case Item::CACHE_ITEM:
+      return "内部缓存表达式";
+    default:
+      return "其他表达式";
+  }
+}
+
+const char *WzgProjectionResultTypeText(Item_result type) {
+  switch (type) {
+    case INT_RESULT:
+      return "整数/布尔";
+    case REAL_RESULT:
+      return "浮点数";
+    case DECIMAL_RESULT:
+      return "高精度数字";
+    case STRING_RESULT:
+      return "字符串/日期时间/JSON/二进制";
+    case ROW_RESULT:
+      return "行值";
+    default:
+      return "未知类型";
+  }
+}
+
+std::string WzgProjectionExpressionText(THD *thd, Item *item) {
+  if (item == nullptr) return "未知表达式";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  item->print(thd, &text, QT_ORDINARY);
+  return text.length() == 0 ? "未知表达式"
+                            : std::string(text.ptr(), text.length());
+}
+
+std::string WzgProjectionColumnsText(THD *thd,
+                                     const mem_root_deque<Item *> &list) {
+  constexpr uint kMaxPrintedColumns = 12;
+  std::ostringstream out;
+  uint printed = 0;
+  const uint visible_count = CountVisibleFields(list);
+  for (Item *item : VisibleFields(list)) {
+    if (printed >= kMaxPrintedColumns) break;
+    if (printed > 0) out << "；";
+    out << (printed + 1) << ". ";
+    out << "column_name=" << (item == nullptr ? "未知" : item->full_name());
+    out << "，expression=" << WzgProjectionExpressionText(thd, item);
+    out << "，source_type="
+        << WzgProjectionItemTypeText(item);
+    out << "，result_type="
+        << (item == nullptr ? "未知"
+                            : WzgProjectionResultTypeText(item->result_type()));
+    out << "，nullable="
+        << (item != nullptr && item->is_nullable() ? "true" : "false");
+    ++printed;
+  }
+  if (visible_count > printed) out << "；还有 " << (visible_count - printed)
+                                   << " 个结果列未展开";
+  return printed == 0 ? "无可见结果列" : out.str();
+}
+
+std::string WzgProjectionSummaryText(const mem_root_deque<Item *> &list) {
+  uint direct_fields = 0;
+  uint intermediate_fields = 0;
+  uint refs = 0;
+  uint expressions = 0;
+  uint aggregates_or_windows = 0;
+  uint subqueries = 0;
+  for (Item *item : VisibleFields(list)) {
+    if (item == nullptr) continue;
+    switch (item->type()) {
+      case Item::FIELD_ITEM: {
+        Item *real_item = item->real_item();
+        Item_field *field_item =
+            real_item != nullptr && real_item->type() == Item::FIELD_ITEM
+                ? down_cast<Item_field *>(real_item)
+                : nullptr;
+        if (field_item != nullptr && field_item->field != nullptr &&
+            field_item->field->table != nullptr &&
+            field_item->field->table->s != nullptr &&
+            field_item->field->table->s->tmp_table != NO_TMP_TABLE)
+          ++intermediate_fields;
+        else
+          ++direct_fields;
+        break;
+      }
+      case Item::REF_ITEM:
+        ++refs;
+        break;
+      case Item::FUNC_ITEM:
+        ++expressions;
+        break;
+      case Item::SUM_FUNC_ITEM:
+        ++aggregates_or_windows;
+        break;
+      case Item::SUBQUERY_ITEM:
+        ++subqueries;
+        break;
+      default:
+        ++expressions;
+        break;
+    }
+  }
+  std::ostringstream out;
+  out << "直接表字段 " << direct_fields << " 个，中间结果字段 "
+      << intermediate_fields << " 个，引用/别名 " << refs << " 个，普通表达式 "
+      << expressions << " 个，聚合或窗口函数 " << aggregates_or_windows
+      << " 个，子查询表达式 " << subqueries << " 个";
+  return out.str();
+}
+
+void WzgEmitProjection(THD *thd, const mem_root_deque<Item *> &list,
+                       uint flags) {
+  if (thd == nullptr || thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  WZG_PROBE_EVENT(thd, "executor.projection")
+      .message("执行器准备组装最终结果列，把 SELECT 列表中的字段和表达式发送给客户端")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("visible_column_count",
+             static_cast<std::uint64_t>(CountVisibleFields(list)))
+      .field("projection_columns", WzgProjectionColumnsText(thd, list))
+      .field("projection_summary", WzgProjectionSummaryText(list))
+      .field("metadata_flags", static_cast<std::uint64_t>(flags))
+      .field("when_it_happens",
+             "结果集 metadata 发送成功后记录；真正每一行发送时会逐列调用 Item::send 取当前行的值")
+      .field("how_it_works",
+             "直接字段从当前记录取值；中间结果字段从排序、物化、聚合或窗口函数步骤产生的临时行结构取值；普通表达式会按当前行计算")
+      .field("next_step",
+             "Query_result_send::send_data 对每一行调用 THD::send_result_set_row，把这些列写入客户端协议")
+      .emit();
+}
+
+void WzgEmitResultSendStart(THD *thd, const mem_root_deque<Item *> &items) {
+  if (thd == nullptr || thd->query().str == nullptr || thd->query().length == 0)
+    return;
+
+  WZG_PROBE_EVENT(thd, "executor.result_send_start")
+      .message("Server 层开始把最终结果行逐行写给客户端")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("send_mode", "逐行发送最终结果")
+      .field("visible_column_count",
+             static_cast<std::uint64_t>(CountVisibleFields(items)))
+      .field("send_call",
+             "Query_result_send::send_data -> THD::send_result_set_row -> Protocol::end_row")
+      .field("protocol", "MySQL 客户端协议")
+      .field("send_stage_work",
+             "取当前结果行的 SELECT 列值，按 MySQL 客户端协议编码，并写入客户端连接")
+      .field("before_send_may_have_done",
+             "如果执行计划需要，排序、分组、去重、窗口函数或物化已经由前面的执行节点完成")
+      .field("not_done_here",
+             "这里不重新执行 ORDER BY、GROUP BY、DISTINCT、UNION 或窗口函数")
+      .field("row_logging",
+             "只记录第一次开始发送，不逐行记录具体数据，避免日志过大和泄露业务数据")
+      .field("next_step", "客户端从 socket 读取结果行")
+      .emit();
+}
+
+}  // namespace
+
 bool Query_result_send::send_result_set_metadata(
     THD *thd, const mem_root_deque<Item *> &list, uint flags) {
   bool res;
-  if (!(res = thd->send_result_metadata(list, flags)))
+  if (!(res = thd->send_result_metadata(list, flags))) {
     is_result_set_started = true;
+    result_send_start_logged = false;
+    WzgEmitProjection(thd, list, flags);
+  }
   return res;
 }
 
@@ -99,6 +290,11 @@ bool Query_result_send::send_data(THD *thd,
   Protocol *protocol = thd->get_protocol();
   DBUG_TRACE;
 
+  if (!result_send_start_logged) {
+    WzgEmitResultSendStart(thd, items);
+    result_send_start_logged = true;
+  }
+
   protocol->start_row();
   if (thd->send_result_set_row(items)) {
     protocol->abort_row();
@@ -117,6 +313,7 @@ bool Query_result_send::send_eof(THD *thd) {
   if (thd->is_error()) return true;
   ::my_eof(thd);
   is_result_set_started = false;
+  result_send_start_logged = false;
   return false;
 }
 

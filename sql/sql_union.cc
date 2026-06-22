@@ -244,6 +244,98 @@ std::string wzg_executor_access_methods(Query_expression *unit) {
   return count == 0 ? "不需要读取用户表" : value;
 }
 
+const char *wzg_locked_row_action_text(thr_locked_row_action action) {
+  switch (action) {
+    case THR_NOWAIT:
+      return "NOWAIT，遇到已被锁住的行不等待，直接返回锁等待错误";
+    case THR_SKIP:
+      return "SKIP LOCKED，遇到已被锁住的行会跳过";
+    case THR_WAIT:
+      return "WAIT，按锁等待规则等待";
+    case THR_DEFAULT:
+    default:
+      return "默认等待策略，通常按 innodb_lock_wait_timeout 等规则等待";
+  }
+}
+
+std::string wzg_locking_clause_text(const Lock_descriptor &descriptor) {
+  if (descriptor.type == TL_WRITE) return "FOR UPDATE";
+  if (descriptor.type == TL_READ_WITH_SHARED_LOCKS)
+    return "FOR SHARE / LOCK IN SHARE MODE";
+  return "无";
+}
+
+std::string wzg_locking_intent_text(const Lock_descriptor &descriptor) {
+  if (descriptor.type == TL_WRITE)
+    return "对读取到的记录准备加排他锁，通常用于随后更新或防止别人修改这些行";
+  if (descriptor.type == TL_READ_WITH_SHARED_LOCKS)
+    return "对读取到的记录准备加共享锁，允许别人读，但阻止别人修改这些行";
+  return "不是加锁读";
+}
+
+std::string wzg_executor_locking_tables(Query_expression *unit) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  if (join == nullptr || join->qep_tab == nullptr || join->primary_tables == 0)
+    return "无";
+
+  std::string value;
+  int count = 0;
+  for (uint i = 0; i < join->primary_tables; ++i) {
+    QEP_TAB *tab = &join->qep_tab[i];
+    if (tab->table_ref == nullptr) continue;
+    const Lock_descriptor &descriptor = tab->table_ref->lock_descriptor();
+    if (descriptor.type != TL_WRITE &&
+        descriptor.type != TL_READ_WITH_SHARED_LOCKS)
+      continue;
+    if (count > 0) value.append("；");
+    if (count >= kWzgExecutorMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(wzg_executor_table_name(tab->table_ref));
+    value.append("，");
+    value.append(wzg_locking_clause_text(descriptor));
+    value.append("，");
+    value.append(wzg_locking_intent_text(descriptor));
+    value.append("，");
+    value.append(wzg_locked_row_action_text(descriptor.action));
+    ++count;
+  }
+  return count == 0 ? "无" : value;
+}
+
+void wzg_emit_locking_read(THD *thd, Query_expression *unit) {
+  if (thd == nullptr || thd->query().str == nullptr || thd->query().length == 0)
+    return;
+  const std::string locking_tables = wzg_executor_locking_tables(unit);
+  if (locking_tables == "无") return;
+
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  JOIN *join = query_block == nullptr ? nullptr : query_block->join;
+  WZG_PROBE_EVENT(thd, "executor.locking_read")
+      .message("执行器识别到这是加锁读，读取记录时会要求存储引擎返回当前版本并处理行锁")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("locking_tables", locking_tables)
+      .field("read_type", "当前读；不是普通 MVCC 快照读")
+      .field("access_methods", wzg_executor_access_methods(unit))
+      .field("estimated_result_rows",
+             join == nullptr ? "未知" : wzg_executor_to_string(join->best_rowcount))
+      .field("server_decision",
+             "Server/执行器已经把相关表标记为加锁读，但还没有在这里真正持有 InnoDB 行锁")
+      .field("server_mdl_relation",
+             "server.mdl_lock 保护表结构；executor.locking_read 说明读取记录时需要行级加锁语义")
+      .field("intention_lock_note",
+             "Server MDL 里有 MDL_INTENTION_EXCLUSIVE；面试常说的 InnoDB IS/IX 表意向锁属于存储引擎层，后续由 InnoDB 决定")
+      .field("next_step",
+             "handler/InnoDB 读取记录时会进入当前读和行锁判断，后续 InnoDB 决定 record/gap/next-key/IS/IX 等具体锁")
+      .emit();
+}
+
 std::string wzg_executor_filters(THD *thd, Query_expression *unit) {
   Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
   JOIN *join = query_block == nullptr ? nullptr : query_block->join;
@@ -316,7 +408,7 @@ std::string wzg_executor_subquery_overview(Query_expression *unit) {
 void wzg_emit_executor_start(THD *thd, Query_expression *unit) {
   Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
   JOIN *join = query_block == nullptr ? nullptr : query_block->join;
-  WZG_PROBE_EVENT(thd, "executor.start")
+  WZG_PROBE_EVENT(thd, "executor.run_start")
       .message(unit != nullptr && unit->item != nullptr
                    ? "开始执行子查询计划，准备生成外层查询可使用的结果"
                    : "开始执行查询计划，准备真正读取数据")
@@ -338,6 +430,7 @@ void wzg_emit_executor_start(THD *thd, Query_expression *unit) {
       .field("subquery_context", wzg_executor_subquery_overview(unit))
       .field("next_step", "调用执行器迭代器，从计划的第一步开始读取行")
       .emit();
+  wzg_emit_locking_read(thd, unit);
 }
 
 void wzg_emit_executor_finish(THD *thd, Query_expression *unit,

@@ -127,6 +127,7 @@ class SortingIterator final : public RowIterator {
 
   const ha_rows m_num_rows_estimate;
   const table_map m_tables_to_get_rowid_for;
+  ha_rows m_last_input_rows_found{HA_POS_ERROR};
   ha_rows *m_examined_rows;
 
   // Holds one out of all RowIterator implementations we need so that it is

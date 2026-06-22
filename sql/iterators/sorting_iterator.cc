@@ -41,6 +41,7 @@
 #include "my_sys.h"
 #include "my_thread_local.h"
 #include "mysql/service_mysql_alloc.h"
+#include "sql/command_mapping.h"  // get_sql_command_string
 #include "sql/field.h"
 #include "sql/filesort.h"  // Filesort
 #include "sql/handler.h"
@@ -60,10 +61,111 @@
 #include "sql/sql_sort.h"
 #include "sql/system_variables.h"
 #include "sql/table.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "thr_lock.h"
 
 using std::string;
 using std::vector;
+
+namespace {
+
+std::string wzg_sort_rows_text(ha_rows rows) {
+  if (rows == HA_POS_ERROR) return "未知";
+  return std::to_string(rows);
+}
+
+std::string wzg_sort_limit_text(ha_rows limit) {
+  if (limit == HA_POS_ERROR) return "无限制";
+  return std::to_string(limit);
+}
+
+std::string wzg_sort_item_text(THD *thd, const st_sort_field &sort_field) {
+  if (sort_field.item == nullptr) return "未知表达式";
+  char buffer[512];
+  String text(buffer, sizeof(buffer), system_charset_info);
+  text.length(0);
+  sort_field.item->print(thd, &text, QT_ORDINARY);
+  std::string value =
+      text.length() == 0 ? "未知表达式" : std::string(text.ptr(), text.length());
+  value.append(sort_field.reverse ? " DESC" : " ASC");
+  return value;
+}
+
+std::string wzg_sort_by_text(THD *thd, const Filesort *filesort) {
+  if (filesort == nullptr || filesort->sortorder == nullptr ||
+      filesort->sort_order_length() == 0)
+    return "无排序表达式";
+
+  constexpr uint kMaxPrintedSortFields = 8;
+  std::string value;
+  const uint count =
+      std::min(filesort->sort_order_length(), kMaxPrintedSortFields);
+  for (uint i = 0; i < count; ++i) {
+    if (!value.empty()) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". ");
+    value.append(wzg_sort_item_text(thd, filesort->sortorder[i]));
+  }
+  if (filesort->sort_order_length() > count) {
+    value.append("；还有 ");
+    value.append(std::to_string(filesort->sort_order_length() - count));
+    value.append(" 个排序字段未展开");
+  }
+  return value;
+}
+
+const char *wzg_sort_result_location(const Sort_result &sort_result) {
+  if (sort_result.io_cache != nullptr && my_b_inited(sort_result.io_cache))
+    return "临时文件，排序结果需要从 filesort 临时文件读取";
+  if (sort_result.sorted_result_in_fsbuf)
+    return "内存 sort buffer，排序结果仍在 filesort buffer 中";
+  if (sort_result.sorted_result != nullptr)
+    return "内存独立结果缓冲区，排序 key 已整理成可读取结果";
+  return "未知";
+}
+
+const char *wzg_sort_payload_text(const Filesort_info &fs_info) {
+  if (fs_info.using_addon_fields())
+    return "排序记录带有需要返回的附加字段，排序后通常可直接继续处理";
+  return "排序记录保存 rowid，排序后需要按 rowid 回到原表取行";
+}
+
+void wzg_emit_sort_result(THD *thd, const Filesort *filesort,
+                          const Filesort_info &fs_info,
+                          const Sort_result &sort_result,
+                          ha_rows input_rows_found, ha_rows num_rows_estimate,
+                          bool result_iterator_error) {
+  if (thd == nullptr || filesort == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0)
+    return;
+
+  WZG_PROBE_EVENT(thd, "executor.sort_result")
+      .message(result_iterator_error
+                   ? "filesort 已执行，但排序结果读取器初始化失败"
+                   : "filesort 已执行完成，排序结果可以被后续节点读取")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("sort_by", wzg_sort_by_text(thd, filesort))
+      .field("estimated_input_rows", wzg_sort_rows_text(num_rows_estimate))
+      .field("input_rows_found", wzg_sort_rows_text(input_rows_found))
+      .field("sorted_rows", wzg_sort_rows_text(sort_result.found_records))
+      .field("limit", wzg_sort_limit_text(filesort->limit))
+      .field("remove_duplicates", filesort->m_remove_duplicates)
+      .field("priority_queue_used", filesort->using_pq)
+      .field("sort_payload", wzg_sort_payload_text(fs_info))
+      .field("result_location", wzg_sort_result_location(sort_result))
+      .field("used_temporary_file",
+             sort_result.io_cache != nullptr && my_b_inited(sort_result.io_cache))
+      .field("execution_result", result_iterator_error ? "error" : "success")
+      .field("note",
+             "这里是真实 filesort 执行后的统计，不是优化器估算；sorted_rows 是排序结果中可继续读取的行数")
+      .field("next_step",
+             result_iterator_error
+                 ? "排序结果读取器初始化失败，执行会返回错误"
+                 : "后续 SortBufferIterator 或 SortFileIterator 会按排序顺序返回行")
+      .emit();
+}
+
+}  // namespace
 
 // If the table is scanned with a FullTextSearchIterator, tell the
 // corresponding full-text function that it is no longer using an
@@ -497,7 +599,10 @@ bool SortingIterator::Init() {
     }
   }
 
-  return m_result_iterator->Init();
+  const bool err = m_result_iterator->Init();
+  wzg_emit_sort_result(thd(), m_filesort, m_fs_info, m_sort_result,
+                       m_last_input_rows_found, m_num_rows_estimate, err);
+  return err;
 }
 
 void SortingIterator::SetNullRowFlag(bool is_null_row) {
@@ -531,6 +636,7 @@ int SortingIterator::DoSort() {
   bool error = ::filesort(thd(), m_filesort, m_source_iterator.get(),
                           m_tables_to_get_rowid_for, m_num_rows_estimate,
                           &m_fs_info, &m_sort_result, &found_rows);
+  m_last_input_rows_found = found_rows;
   for (TABLE *table : m_filesort->tables) {
     table->set_keyread(false);  // Restore if we used indexes
   }
