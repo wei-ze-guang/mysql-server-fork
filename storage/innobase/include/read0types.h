@@ -228,6 +228,25 @@ class ReadView {
   trx_id_t low_limit_id() const { return (m_low_limit_id); }
 
   /**
+  @return the up limit id */
+  trx_id_t up_limit_id() const { return (m_up_limit_id); }
+
+  /**
+  @return the transaction id that created this read view */
+  trx_id_t creator_trx_id() const { return (m_creator_trx_id); }
+
+  /**
+  @return the number of active read-write transactions captured by this view */
+  ulint active_trx_count() const { return (m_ids.size()); }
+
+  /**
+  @return active transaction id at position */
+  trx_id_t active_trx_id_at(ulint pos) const {
+    ut_ad(pos < m_ids.size());
+    return (m_ids.data()[pos]);
+  }
+
+  /**
   @return true if there are no transaction ids in the snapshot */
   bool empty() const { return (m_ids.empty()); }
 

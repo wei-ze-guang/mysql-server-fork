@@ -58,12 +58,103 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0mem.h"
 
 #include "my_dbug.h"
+#include "current_thd.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+#include <algorithm>
+#include <sstream>
+#include <string>
+#include <string_view>
 
 namespace dd {
 class Spatial_reference_system;
 }
 
 /*=========== UNDO LOG RECORD CREATION AND DECODING ====================*/
+
+namespace {
+
+bool wzg_undo_should_log(THD *thd, const dict_table_t *table) {
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_undo_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_undo_index_name(const dict_index_t *index) {
+  if (index == nullptr) return "无";
+  return index->name() == nullptr ? "<unnamed>" : index->name();
+}
+
+const char *wzg_undo_op_name(ulint op_type) {
+  switch (op_type) {
+    case TRX_UNDO_INSERT_OP:
+      return "TRX_UNDO_INSERT_OP";
+    case TRX_UNDO_MODIFY_OP:
+      return "TRX_UNDO_MODIFY_OP";
+    default:
+      return "UNKNOWN_UNDO_OP";
+  }
+}
+
+const char *wzg_undo_op_meaning(ulint op_type) {
+  switch (op_type) {
+    case TRX_UNDO_INSERT_OP:
+      return "插入产生的 undo；回滚时可以删除这条新插入记录";
+    case TRX_UNDO_MODIFY_OP:
+      return "更新或删除标记产生的 undo；保存修改前信息，用于回滚和 MVCC 旧版本读取";
+    default:
+      return "未知 undo 操作类型";
+  }
+}
+
+std::string wzg_undo_trx_id(const trx_t *trx) {
+  if (trx == nullptr) return "无";
+  return std::to_string(static_cast<unsigned long long>(trx_get_id_for_print(trx)));
+}
+
+void wzg_emit_undo_log_create(trx_t *trx, const dict_index_t *index,
+                              ulint op_type, roll_ptr_t roll_ptr,
+                              space_id_t undo_space_id, page_no_t undo_page_no,
+                              ulint undo_offset) {
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  if (index == nullptr || !wzg_undo_should_log(thd, index->table)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.undo_log_create")
+      .message("修改聚簇索引记录前写入 undo log，保存旧版本信息")
+      .field("table", wzg_undo_table_name(index->table))
+      .field("index", wzg_undo_index_name(index))
+      .field("operation", wzg_undo_op_name(op_type))
+      .field("operation_meaning", wzg_undo_op_meaning(op_type))
+      .field("transaction_id", wzg_undo_trx_id(trx))
+      .field("undo_space_id", static_cast<std::uint64_t>(undo_space_id))
+      .field("undo_page_no", static_cast<std::uint64_t>(undo_page_no))
+      .field("undo_offset", static_cast<std::uint64_t>(undo_offset))
+      .field("roll_ptr", static_cast<std::uint64_t>(roll_ptr))
+      .field("roll_ptr_meaning",
+             "这就是后续写入聚簇索引记录 DB_ROLL_PTR 的值；它定位到本次生成的 undo 记录")
+      .field("why_undo",
+             "如果事务回滚，InnoDB 用 undo 撤销本次修改；如果普通 SELECT 的 ReadView 看不到新版本，也可以沿 DB_ROLL_PTR 找到旧版本")
+      .field("next_step",
+             "继续修改聚簇索引记录，并把 DB_TRX_ID 设置为当前事务 id、DB_ROLL_PTR 指向这个 undo 记录")
+      .emit();
+}
+
+}  // namespace
 
 /** Writes the mtr log entry of the inserted undo log record on the undo log
  page. */
@@ -2321,6 +2412,8 @@ dberr_t trx_undo_report_row_operation(
       *roll_ptr =
           trx_undo_build_roll_ptr(op_type == TRX_UNDO_INSERT_OP,
                                   undo_ptr->rseg->space_id, page_no, offset);
+      wzg_emit_undo_log_create(trx, index, op_type, *roll_ptr,
+                               undo_ptr->rseg->space_id, page_no, offset);
       return (DB_SUCCESS);
     }
 

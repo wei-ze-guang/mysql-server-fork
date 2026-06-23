@@ -32,6 +32,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
  *******************************************************/
 
 #include <stddef.h>
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "fsp0fsp.h"
@@ -51,6 +55,158 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0rseg.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
+#include "current_thd.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+namespace {
+
+bool wzg_row_undo_has_user_sql(const trx_t &trx) {
+  const THD *thd = trx.mysql_thd != nullptr ? trx.mysql_thd : current_thd;
+  return thd != nullptr && thd->query().str != nullptr &&
+         thd->query().length > 0 && thd->thread_id() != 0;
+}
+
+bool wzg_row_undo_user_table(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return false;
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_row_undo_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "未知";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_row_undo_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "未知";
+  return index->name();
+}
+
+const char *wzg_row_undo_type_text(ulint type) {
+  switch (type) {
+    case TRX_UNDO_INSERT_REC:
+      return "TRX_UNDO_INSERT_REC";
+    case TRX_UNDO_UPD_EXIST_REC:
+      return "TRX_UNDO_UPD_EXIST_REC";
+    case TRX_UNDO_UPD_DEL_REC:
+      return "TRX_UNDO_UPD_DEL_REC";
+    case TRX_UNDO_DEL_MARK_REC:
+      return "TRX_UNDO_DEL_MARK_REC";
+    default:
+      return "UNKNOWN_UNDO_RECORD";
+  }
+}
+
+const char *wzg_row_undo_lookup_reason(ulint type) {
+  switch (type) {
+    case TRX_UNDO_DEL_MARK_REC:
+      return "rollback DELETE：撤销删除标记";
+    case TRX_UNDO_INSERT_REC:
+      return "rollback INSERT：删除本事务插入的新记录";
+    case TRX_UNDO_UPD_EXIST_REC:
+      return "rollback UPDATE：恢复更新前字段";
+    case TRX_UNDO_UPD_DEL_REC:
+      return "rollback UPDATE of delete-marked record";
+    default:
+      return "rollback：处理未知 undo 类型";
+  }
+}
+
+void wzg_emit_undo_lookup_step(undo_node_t *node, bool is_insert_roll_ptr) {
+  if (node == nullptr || node->undo_rec == nullptr ||
+      !wzg_row_undo_has_user_sql(node->trx)) {
+    return;
+  }
+
+  const ulint type = trx_undo_rec_get_type(node->undo_rec);
+  if (type != TRX_UNDO_DEL_MARK_REC) return;
+
+  bool roll_ptr_is_insert = false;
+  ulint rseg_id = 0;
+  page_no_t page_no = 0;
+  ulint offset = 0;
+  trx_undo_decode_roll_ptr(node->roll_ptr, &roll_ptr_is_insert, &rseg_id,
+                           &page_no, &offset);
+
+  THD *thd = node->trx.mysql_thd != nullptr ? node->trx.mysql_thd : current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.undo_lookup_step")
+      .message("回滚开始从当前事务 undo 链取出一条 undo 记录，并判断它要撤销什么")
+      .field("lookup_reason", wzg_row_undo_lookup_reason(type))
+      .field("transaction_id",
+             std::to_string(static_cast<unsigned long long>(
+                 trx_get_id_for_print(&node->trx))))
+      .field("roll_ptr", static_cast<std::uint64_t>(node->roll_ptr))
+      .field("undo_rseg_id", static_cast<std::uint64_t>(rseg_id))
+      .field("undo_page_no", static_cast<std::uint64_t>(page_no))
+      .field("undo_offset", static_cast<std::uint64_t>(offset))
+      .field("undo_no", static_cast<std::uint64_t>(node->undo_no))
+      .field("undo_record_type", wzg_row_undo_type_text(type))
+      .field("roll_ptr_kind",
+             is_insert_roll_ptr ? "insert undo 链" : "update/delete undo 链")
+      .field("lookup_order",
+             "从事务最后生成的 undo 开始向前处理，回滚顺序和原修改顺序相反")
+      .field("match_standard",
+             "这里只是找到一条 undo；后面还必须用 undo 里的 row reference 定位聚簇索引记录，并检查记录 DB_ROLL_PTR 是否等于这个 roll_ptr")
+      .field("next_step",
+             "解析 undo 里的表 id、主键引用和旧系统字段，然后去聚簇索引 B+Tree 找原记录")
+      .emit();
+}
+
+void wzg_emit_undo_lookup_stop(trx_t &trx) {
+  if (!wzg_row_undo_has_user_sql(trx)) return;
+  THD *thd = trx.mysql_thd != nullptr ? trx.mysql_thd : current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.undo_lookup_stop")
+      .message("当前事务 undo 链已经没有更多记录，回滚查找结束")
+      .field("transaction_id",
+             std::to_string(
+                 static_cast<unsigned long long>(trx_get_id_for_print(&trx))))
+      .field("stop_reason", "trx_roll_pop_top_rec_of_trx 返回空")
+      .field("stop_standard",
+             "事务的 undo 链已经走完；如果是部分回滚，则到达 roll_limit/savepoint 边界也会停止")
+      .field("result",
+             "所有需要撤销的行操作已经处理完成，后续事务结束会释放锁")
+      .emit();
+}
+
+void wzg_emit_undo_lookup_match(undo_node_t *node, const dict_index_t *index,
+                                const rec_t *rec, bool found,
+                                roll_ptr_t record_roll_ptr) {
+  if (node == nullptr || node->rec_type != TRX_UNDO_DEL_MARK_REC ||
+      !wzg_row_undo_has_user_sql(node->trx) ||
+      !wzg_row_undo_user_table(node->table)) {
+    return;
+  }
+
+  THD *thd = node->trx.mysql_thd != nullptr ? node->trx.mysql_thd : current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.undo_lookup_match")
+      .message(found ? "undo 里的 row reference 已定位到目标聚簇索引记录，roll_ptr 匹配成功"
+                     : "undo 里的 row reference 没有匹配到可撤销的目标聚簇索引记录")
+      .field("lookup_reason", "rollback DELETE：确认要撤销哪条 delete-marked 记录")
+      .field("transaction_id",
+             std::to_string(static_cast<unsigned long long>(
+                 trx_get_id_for_print(&node->trx))))
+      .field("table", wzg_row_undo_table_name(node->table))
+      .field("index", wzg_row_undo_index_name(index))
+      .field("roll_ptr_from_undo", static_cast<std::uint64_t>(node->roll_ptr))
+      .field("roll_ptr_on_record", static_cast<std::uint64_t>(record_roll_ptr))
+      .field("record_heap_no",
+             rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(rec)))
+      .field("match_result", found ? "matched" : "not_matched")
+      .field("match_standard",
+             "row reference 能找到聚簇索引记录，并且该记录当前 DB_ROLL_PTR 等于 undo 的 roll_ptr，说明它正是这条 undo 要撤销的版本")
+      .field("on_match_next_step",
+             "撤销 deleted flag，恢复记录系统字段，让 DELETE 前的记录重新可见")
+      .field("on_not_found_next_step",
+             "跳过或按错误路径处理；可能是记录已不存在、表已被丢弃或这条记录后来又发生了变化")
+      .emit();
+}
+
+}  // namespace
 
 /* How to undo row operations?
 (1) For an insert, we have stored a prefix of the clustered index record
@@ -178,6 +334,7 @@ bool row_undo_search_clust_to_pcur(
   row_ext_t **ext;
   const rec_t *rec;
   mem_heap_t *heap = nullptr;
+  roll_ptr_t record_roll_ptr = 0;
   ulint offsets_[REC_OFFS_NORMAL_SIZE];
   ulint *offsets = offsets_;
   rec_offs_init(offsets_);
@@ -201,7 +358,9 @@ bool row_undo_search_clust_to_pcur(
   offsets = rec_get_offsets(rec, clust_index, offsets, ULINT_UNDEFINED,
                             UT_LOCATION_HERE, &heap);
 
-  found = row_get_rec_roll_ptr(rec, clust_index, offsets) == node->roll_ptr;
+  record_roll_ptr = row_get_rec_roll_ptr(rec, clust_index, offsets);
+  found = record_roll_ptr == node->roll_ptr;
+  wzg_emit_undo_lookup_match(node, clust_index, rec, found, record_roll_ptr);
 
   if (found) {
     ut_ad(row_get_rec_trx_id(rec, clust_index, offsets) == node->trx.id);
@@ -326,6 +485,8 @@ static void long_running_diag(undo_node_t &node) {
                                                  &roll_ptr, node->heap);
 
     if (!node->undo_rec) {
+      wzg_emit_undo_lookup_stop(trx);
+
       /* Rollback completed for this query thread */
 
       thr->run_node = que_node_get_parent(node);
@@ -344,7 +505,10 @@ static void long_running_diag(undo_node_t &node) {
     node->roll_ptr = roll_ptr;
     node->undo_no = trx_undo_rec_get_undo_no(node->undo_rec);
 
-    if (trx_undo_roll_ptr_is_insert(roll_ptr)) {
+    const bool is_insert_roll_ptr = trx_undo_roll_ptr_is_insert(roll_ptr);
+    wzg_emit_undo_lookup_step(node, is_insert_roll_ptr);
+
+    if (is_insert_roll_ptr) {
       node->state = UNDO_NODE_INSERT;
     } else {
       node->state = UNDO_NODE_MODIFY;

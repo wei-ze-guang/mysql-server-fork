@@ -34,8 +34,147 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "read0read.h"
 #include "clone0clone.h"
 
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <string>
+#include <string_view>
+
+#include "current_thd.h"
+#include "mysql/plugin.h"
 #include "srv0srv.h"
+#include "sql/sql_class.h"
+#include "sql/sql_lex.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "trx0sys.h"
+#include "trx0trx.h"
+
+namespace {
+
+bool wzg_mvcc_should_log(THD *thd) {
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || thd->thread_id() == 0 ||
+      thd_sql_command(thd) != SQLCOM_SELECT) {
+    return false;
+  }
+
+  std::string_view sql(wzg_probe::raw_sql());
+  if (sql.empty()) {
+    sql = std::string_view(thd->query().str, thd->query().length);
+  }
+  while (!sql.empty() && std::isspace(static_cast<unsigned char>(sql.front()))) {
+    sql.remove_prefix(1);
+  }
+
+  const auto starts_with_ci = [](std::string_view value,
+                                 std::string_view prefix) {
+    if (value.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(value[i])) !=
+          std::tolower(static_cast<unsigned char>(prefix[i]))) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  return thd != nullptr && thd->query().str != nullptr &&
+         (starts_with_ci(sql, "select") || starts_with_ci(sql, "with"));
+}
+
+const char *wzg_mvcc_isolation_name(trx_t::isolation_level_t level) {
+  switch (level) {
+    case trx_t::READ_UNCOMMITTED:
+      return "READ UNCOMMITTED";
+    case trx_t::READ_COMMITTED:
+      return "READ COMMITTED";
+    case trx_t::REPEATABLE_READ:
+      return "REPEATABLE READ";
+    case trx_t::SERIALIZABLE:
+      return "SERIALIZABLE";
+  }
+  return "UNKNOWN";
+}
+
+const char *wzg_mvcc_read_view_scope(trx_t::isolation_level_t level) {
+  switch (level) {
+    case trx_t::READ_COMMITTED:
+      return "语句级 ReadView；普通 SELECT 通常每条语句重新创建快照";
+    case trx_t::REPEATABLE_READ:
+      return "事务级 ReadView；同一事务内普通 SELECT 通常复用同一个快照";
+    case trx_t::READ_UNCOMMITTED:
+      return "READ UNCOMMITTED 通常不依赖旧版本一致性读，可能直接看到未提交版本";
+    case trx_t::SERIALIZABLE:
+      return "SERIALIZABLE 下普通 SELECT 会转成加共享锁的当前读";
+  }
+  return "未知 ReadView 作用范围";
+}
+
+std::string wzg_mvcc_active_ids(const ReadView *view) {
+  if (view == nullptr || view->active_trx_count() == 0) return "无";
+
+  std::ostringstream out;
+  const ulint count = view->active_trx_count();
+  const ulint limit = std::min<ulint>(count, 16);
+  for (ulint i = 0; i < limit; ++i) {
+    if (i != 0) out << ",";
+    out << view->active_trx_id_at(i);
+  }
+  if (count > limit) out << "... 共 " << count << " 个";
+  return out.str();
+}
+
+void wzg_emit_mvcc_read_view_create(trx_t *trx, const ReadView *view) {
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  if (!wzg_mvcc_should_log(thd) || trx == nullptr || view == nullptr) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_read_view_create")
+      .message("为普通 SELECT 创建一致性读视图，用它判断记录版本是否对当前查询可见")
+      .field("read_type", "快照读；普通 SELECT 用版本可见性读取，不申请 InnoDB 行锁")
+      .field("isolation_level", wzg_mvcc_isolation_name(trx->isolation_level))
+      .field("read_view_scope", wzg_mvcc_read_view_scope(trx->isolation_level))
+      .field("creator_transaction_id", view->creator_trx_id())
+      .field("up_limit_id", view->up_limit_id())
+      .field("low_limit_id", view->low_limit_id())
+      .field("low_limit_no", view->low_limit_no())
+      .field("active_transaction_count",
+             static_cast<std::uint64_t>(view->active_trx_count()))
+      .field("active_transaction_ids", wzg_mvcc_active_ids(view))
+      .field("visibility_rule",
+             "记录版本的事务 id 小于 up_limit_id 通常可见；等于当前事务 id 可见；大于等于 low_limit_id "
+             "说明是快照之后才开始的事务，不可见；落在 active_transaction_ids 中说明快照创建时还没提交，不可见")
+      .field("different_from_current_read",
+             "UPDATE、DELETE、SELECT FOR UPDATE 会读最新版本并申请锁；普通 SELECT 使用 ReadView 找到对自己可见的版本")
+      .field("next_step", "读取记录时逐条检查记录版本的事务 id 是否落在这个 ReadView 可见范围内")
+      .emit();
+}
+
+void wzg_emit_mvcc_read_view_reuse(trx_t *trx, const ReadView *view,
+                                   const char *reuse_reason) {
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  if (!wzg_mvcc_should_log(thd) || trx == nullptr || view == nullptr) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_read_view_reuse")
+      .message("当前普通 SELECT 复用已有 ReadView，继续读取同一个一致性快照")
+      .field("read_type", "快照读；复用 ReadView 时不会重新计算活跃事务列表")
+      .field("isolation_level", wzg_mvcc_isolation_name(trx->isolation_level))
+      .field("reuse_reason", reuse_reason)
+      .field("effect",
+             "后续普通 SELECT 仍按这个 ReadView 判断版本可见性；在 REPEATABLE READ 中，这正是同一事务内多次普通 SELECT 结果可重复的关键原因")
+      .field("creator_transaction_id", view->creator_trx_id())
+      .field("up_limit_id", view->up_limit_id())
+      .field("low_limit_id", view->low_limit_id())
+      .field("active_transaction_count",
+             static_cast<std::uint64_t>(view->active_trx_count()))
+      .field("active_transaction_ids", wzg_mvcc_active_ids(view))
+      .field("different_from_new_view",
+             "如果重新创建 ReadView，后来已经提交的事务可能会变成可见；复用 ReadView 则保持原来的可见性边界")
+      .emit();
+}
+
+}  // namespace
 
 /*
 -------------------------------------------------------------------------------
@@ -522,11 +661,19 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
       view->m_closed = false;
 
       if (view->m_low_limit_id == trx_sys_get_next_trx_id_or_no()) {
+        wzg_emit_mvcc_read_view_reuse(
+            trx, view,
+            "自动提交的普通 SELECT 复用一个已关闭的空 ReadView；期间没有新的读写事务启动，所以可见性边界没有变化");
         return;
       } else {
         view->m_closed = true;
       }
     }
+  } else if (MVCC::is_view_active(view)) {
+    wzg_emit_mvcc_read_view_reuse(
+        trx, view,
+        "事务中已经有活跃 ReadView；普通 SELECT 继续使用它，不重新创建快照");
+    return;
   }
 
   trx_sys_mutex_enter();
@@ -540,6 +687,8 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
 
   if (view != nullptr) {
     view->prepare(trx->id);
+
+    wzg_emit_mvcc_read_view_create(trx, view);
 
     UT_LIST_ADD_FIRST(m_views, view);
 

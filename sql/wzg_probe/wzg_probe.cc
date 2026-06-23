@@ -204,4 +204,6 @@ void on_connection_end(THD *thd) {
   current_context().clear_connection();
 }
 
+const std::string &raw_sql() { return current_context().raw_sql(); }
+
 }  // namespace wzg_probe

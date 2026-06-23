@@ -61,6 +61,7 @@ class Scope {
 void on_connection_start(THD *thd);
 void on_connection_end(THD *thd);
 void set_raw_sql(const char *sql, std::size_t length);
+const std::string &raw_sql();
 void clear_raw_sql();
 
 }  // namespace wzg_probe

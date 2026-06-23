@@ -33,6 +33,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <stddef.h>
 
+#include <algorithm>
+#include <sstream>
+#include <string>
+#include <string_view>
+
 #include "btr0btr.h"
 #include "current_thd.h"
 #include "dict0boot.h"
@@ -56,6 +61,165 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0undo.h"
 
 #include "my_dbug.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+namespace {
+
+bool wzg_mvcc_vers_should_log(THD *thd, const dict_table_t *table) {
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+bool wzg_mvcc_undo_should_sample(THD *thd, int limit) {
+  if (thd == nullptr) return false;
+  struct State {
+    query_id_t query_id = 0;
+    int count = 0;
+  };
+  static thread_local State state;
+  if (state.query_id != thd->query_id) {
+    state.query_id = thd->query_id;
+    state.count = 0;
+  }
+  if (state.count >= limit) return false;
+  ++state.count;
+  return true;
+}
+
+bool wzg_mvcc_undo_step_should_sample(THD *thd, int limit) {
+  if (thd == nullptr) return false;
+  struct State {
+    query_id_t query_id = 0;
+    int count = 0;
+  };
+  static thread_local State state;
+  if (state.query_id != thd->query_id) {
+    state.query_id = thd->query_id;
+    state.count = 0;
+  }
+  if (state.count >= limit) return false;
+  ++state.count;
+  return true;
+}
+
+std::string wzg_mvcc_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_mvcc_index_name(const dict_index_t *index) {
+  if (index == nullptr) return "无";
+  return index->name() == nullptr ? "<unnamed>" : index->name();
+}
+
+const char *wzg_mvcc_undo_result_text(dberr_t err, const rec_t *old_vers) {
+  if (err == DB_MISSING_HISTORY) return "missing_history";
+  if (old_vers == nullptr) return "record_not_exist_in_read_view";
+  return "found_older_version";
+}
+
+const char *wzg_mvcc_undo_result_meaning(dberr_t err, const rec_t *old_vers) {
+  if (err == DB_MISSING_HISTORY) {
+    return "需要的历史版本已经缺失，无法继续构造这个 ReadView 需要的旧记录";
+  }
+  if (old_vers == nullptr) {
+    return "沿 undo 链没有找到可见旧版本，说明这条记录是在当前 ReadView 之后新插入的";
+  }
+  return "沿 undo 链找到了一个对当前 ReadView 可见的旧版本，普通 SELECT 会读取这个版本";
+}
+
+void wzg_emit_mvcc_undo_chain_step(dict_index_t *index, ulint step,
+                                   const rec_t *version_rec,
+                                   const ulint *version_offsets,
+                                   trx_id_t version_trx_id,
+                                   const ReadView *view, bool visible) {
+  THD *thd = current_thd;
+  if (index == nullptr || version_rec == nullptr || version_offsets == nullptr ||
+      !wzg_mvcc_vers_should_log(thd, index->table) ||
+      !wzg_mvcc_undo_step_should_sample(thd, 3)) {
+    return;
+  }
+
+  const roll_ptr_t version_roll_ptr =
+      row_get_rec_roll_ptr(version_rec, index, version_offsets);
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_undo_chain_step")
+      .message("沿 undo 链回溯到一个旧版本，并检查这个旧版本是否对当前 ReadView 可见")
+      .field("table", wzg_mvcc_table_name(index->table))
+      .field("index", wzg_mvcc_index_name(index))
+      .field("step", static_cast<std::uint64_t>(step))
+      .field("version_trx_id", version_trx_id)
+      .field("version_db_trx_id", version_trx_id)
+      .field("version_db_roll_ptr", static_cast<std::uint64_t>(version_roll_ptr))
+      .field("version_hidden_columns",
+             "这个旧版本同样带有 DB_TRX_ID 和 DB_ROLL_PTR；如果它仍不可见，就继续用它的 DB_ROLL_PTR 找更早版本")
+      .field("db_roll_ptr_type",
+             "undo log 位置引用，不是 C++ 内存地址")
+      .field("read_view_up_limit_id", view == nullptr ? 0 : view->up_limit_id())
+      .field("read_view_low_limit_id",
+             view == nullptr ? 0 : view->low_limit_id())
+      .field("version_visible", visible)
+      .field("reason",
+             visible ? "这个旧版本满足 ReadView 可见性规则，可以作为普通 SELECT 看到的版本"
+                     : "这个旧版本仍然不满足 ReadView 可见性规则，需要继续沿 undo 链向前找")
+      .field("next_step", visible ? "停止回溯，复制这个旧版本返回给上层"
+                                  : "继续读取更早的 undo 记录")
+      .emit();
+}
+
+void wzg_emit_mvcc_undo_version_lookup(dict_index_t *index,
+                                       trx_id_t current_trx_id,
+                                       const ReadView *view, dberr_t err,
+                                       const rec_t *old_vers,
+                                       const ulint *old_offsets) {
+  THD *thd = current_thd;
+  if (index == nullptr || !wzg_mvcc_vers_should_log(thd, index->table) ||
+      !wzg_mvcc_undo_should_sample(thd, 8)) {
+    return;
+  }
+
+  trx_id_t older_trx_id = 0;
+  bool older_visible = false;
+  if (old_vers != nullptr && old_offsets != nullptr) {
+    older_trx_id = row_get_rec_trx_id(old_vers, index, old_offsets);
+    older_visible = view != nullptr &&
+                    view->changes_visible(older_trx_id, index->table->name);
+  }
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_undo_version_lookup")
+      .message("当前记录版本不可见，沿 undo 版本链查找更旧版本")
+      .field("table", wzg_mvcc_table_name(index->table))
+      .field("index", wzg_mvcc_index_name(index))
+      .field("index_kind", "聚簇索引；undo 旧版本基于聚簇索引记录构造")
+      .field("current_record_trx_id", current_trx_id)
+      .field("read_view_up_limit_id", view == nullptr ? 0 : view->up_limit_id())
+      .field("read_view_low_limit_id",
+             view == nullptr ? 0 : view->low_limit_id())
+      .field("undo_lookup_result", wzg_mvcc_undo_result_text(err, old_vers))
+      .field("undo_lookup_result_meaning",
+             wzg_mvcc_undo_result_meaning(err, old_vers))
+      .field("older_record_trx_id", older_trx_id)
+      .field("older_version_visible", older_visible)
+      .field("why_use_undo",
+             "undo log 保存了记录被修改前的旧版本；普通 SELECT 发现最新版本不可见时，会沿 undo 链还原出对 ReadView 可见的数据")
+      .field("next_step",
+             old_vers == nullptr ? "这条记录对当前 ReadView 不存在，不返回给普通 SELECT"
+                                 : "把这个可见旧版本交回上层继续做 WHERE、投影和返回结果")
+      .emit();
+}
+
+}  // namespace
 
 /** Check whether all non-virtual columns in a index entries match
 @param[in]      index           the secondary index
@@ -1266,6 +1430,7 @@ dberr_t row_vers_build_for_consistent_read(
   ut_ad(rec_offs_validate(rec, index, *offsets));
 
   trx_id = row_get_rec_trx_id(rec, index, *offsets);
+  const trx_id_t current_trx_id = trx_id;
 
   /* Reset the collected LOB undo information. */
   if (lob_undo != nullptr) {
@@ -1277,6 +1442,7 @@ dberr_t row_vers_build_for_consistent_read(
   ut_ad(!vrow || !(*vrow));
 
   version = rec;
+  ulint undo_step = 0;
 
   for (;;) {
     mem_heap_t *prev_heap = heap;
@@ -1315,8 +1481,14 @@ dberr_t row_vers_build_for_consistent_read(
 #endif /* UNIV_DEBUG || UNIV_BLOB_LIGHT_DEBUG */
 
     trx_id = row_get_rec_trx_id(prev_version, index, *offsets);
+    ++undo_step;
+    const bool prev_version_visible =
+        view->changes_visible(trx_id, index->table->name);
+    wzg_emit_mvcc_undo_chain_step(index, undo_step, prev_version, *offsets,
+                                  trx_id, view,
+                                  prev_version_visible);
 
-    if (view->changes_visible(trx_id, index->table->name)) {
+    if (prev_version_visible) {
       /* The view already sees this version: we can copy
       it to in_heap and return */
 
@@ -1335,6 +1507,9 @@ dberr_t row_vers_build_for_consistent_read(
 
     version = prev_version;
   }
+
+  wzg_emit_mvcc_undo_version_lookup(index, current_trx_id, view, err, *old_vers,
+                                    *old_vers == nullptr ? nullptr : *offsets);
 
   mem_heap_free(heap);
 

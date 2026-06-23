@@ -65,6 +65,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 
 #include <sql_table.h>
 #include "mysql/components/services/system_variable_source.h"
@@ -137,6 +138,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "log0buf.h"
 #include "log0chkp.h"
 #include "log0encryption.h"
+#include "log0log.h"
 #include "log0meb.h"
 #include "log0pfs.h"
 #include "log0pre_8_0_30.h"
@@ -506,6 +508,190 @@ const char *wzg_innodb_index_kind(const dict_index_t *index) {
 
 std::string wzg_innodb_key_len_text(uint key_len) {
   return std::to_string(key_len);
+}
+
+const char *wzg_innodb_data_type_name(const dtype_t *type) {
+  if (type == nullptr) return "UNKNOWN";
+
+  switch (dtype_get_mtype(type)) {
+    case DATA_MISSING:
+      return "DATA_MISSING";
+    case DATA_VARCHAR:
+      return "DATA_VARCHAR";
+    case DATA_CHAR:
+      return "DATA_CHAR";
+    case DATA_FIXBINARY:
+      return "DATA_FIXBINARY";
+    case DATA_BINARY:
+      return "DATA_BINARY";
+    case DATA_BLOB:
+      return "DATA_BLOB";
+    case DATA_INT:
+      return "DATA_INT";
+    case DATA_SYS_CHILD:
+      return "DATA_SYS_CHILD";
+    case DATA_SYS:
+      return "DATA_SYS";
+    case DATA_FLOAT:
+      return "DATA_FLOAT";
+    case DATA_DOUBLE:
+      return "DATA_DOUBLE";
+    case DATA_DECIMAL:
+      return "DATA_DECIMAL";
+    case DATA_VARMYSQL:
+      return "DATA_VARMYSQL";
+    case DATA_MYSQL:
+      return "DATA_MYSQL";
+    case DATA_GEOMETRY:
+      return "DATA_GEOMETRY";
+    case DATA_POINT:
+      return "DATA_POINT";
+    case DATA_VAR_POINT:
+      return "DATA_VAR_POINT";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+std::string wzg_innodb_field_len_text(const dfield_t *field) {
+  if (field == nullptr) return "无";
+  const ulint len = dfield_get_len(field);
+  if (len == UNIV_SQL_NULL) return "SQL NULL";
+  if (len == UNIV_NO_INDEX_VALUE) return "索引字段没有可用值";
+  if (len == UNIV_MULTI_VALUE_ARRAY_MARKER) return "多值索引数组标记";
+  return std::to_string(len);
+}
+
+std::string wzg_innodb_bytes_preview(const void *data, ulint len) {
+  if (data == nullptr) return "无";
+  if (len == UNIV_SQL_NULL) return "SQL NULL";
+  if (len == UNIV_NO_INDEX_VALUE) return "索引字段没有可用值";
+  if (len == UNIV_MULTI_VALUE_ARRAY_MARKER) return "多值索引数组标记";
+  if (len == 0) return "空值";
+
+  const auto *bytes = static_cast<const unsigned char *>(data);
+  const ulint preview_len = std::min<ulint>(len, 16);
+  std::ostringstream out;
+
+  for (ulint i = 0; i < preview_len; ++i) {
+    if (i > 0) out << ' ';
+    constexpr char hex[] = "0123456789ABCDEF";
+    out << hex[(bytes[i] >> 4) & 0x0F] << hex[bytes[i] & 0x0F];
+  }
+
+  if (len > preview_len) out << " ...";
+  return out.str();
+}
+
+std::string wzg_innodb_tuple_fields_text(const dict_index_t *index,
+                                         const dtuple_t *tuple) {
+  if (tuple == nullptr) return "无 search_tuple";
+
+  const ulint n_fields = dtuple_get_n_fields(tuple);
+  if (n_fields == 0) return "没有具体 key 字段；按索引边界定位";
+
+  std::string value;
+  for (ulint i = 0; i < n_fields; ++i) {
+    const dfield_t *field = dtuple_get_nth_field(tuple, i);
+    const dict_field_t *index_field =
+        index == nullptr || i >= index->n_def ? nullptr : index->get_field(i);
+    const dtype_t *type = field == nullptr ? nullptr : dfield_get_type(field);
+
+    if (i > 0) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". column=");
+    value.append(index_field == nullptr || index_field->name() == nullptr
+                     ? "未知字段"
+                     : index_field->name());
+    value.append("，type=");
+    value.append(wzg_innodb_data_type_name(type));
+    value.append("，length_bytes=");
+    value.append(wzg_innodb_field_len_text(field));
+    value.append("，is_null=");
+    value.append(field != nullptr && dfield_is_null(field) ? "true" : "false");
+    value.append("，is_external=");
+    value.append(field != nullptr && dfield_is_ext(field) ? "true" : "false");
+    value.append("，raw_bytes=");
+    value.append(field == nullptr
+                     ? "无"
+                     : wzg_innodb_bytes_preview(dfield_get_data(field),
+                                                dfield_get_len(field)));
+  }
+
+  return value;
+}
+
+void wzg_emit_innodb_search_tuple(THD *thd, const TABLE *table,
+                                  const dict_index_t *index,
+                                  const dtuple_t *tuple,
+                                  const uchar *key_ptr) {
+  if (!wzg_innodb_should_log(table, thd)) return;
+
+  const ulint n_fields = tuple == nullptr ? 0 : dtuple_get_n_fields(tuple);
+  WZG_PROBE_EVENT(thd, "innodb.search_tuple")
+      .message(key_ptr == nullptr
+                   ? "InnoDB 没有收到具体 key 值，将按索引边界定位游标"
+                   : "InnoDB 已把 handler 传入的二进制 key 转成内部 search_tuple，准备用它在 B+Tree 中定位记录")
+      .field("table", wzg_innodb_table_name(table))
+      .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_index_kind", wzg_innodb_index_kind(index))
+      .field("tuple_field_count", std::to_string(n_fields))
+      .field("tuple_fields", wzg_innodb_tuple_fields_text(index, tuple))
+      .field("source", key_ptr == nullptr ? "索引边界定位请求"
+                                           : "handler key buffer")
+      .field("meaning",
+             "search_tuple 是 InnoDB 用来和 B+Tree 索引记录比较的内部 key 结构")
+      .field("value_note",
+             "raw_bytes 是 InnoDB 内部比较用的字节预览；不同类型的可读值解码规则不同，后续可按字段类型继续增强")
+      .field("next_step",
+             "row_search_mvcc 使用 search_tuple 从索引 root page 开始定位记录")
+      .emit();
+}
+
+const char *wzg_innodb_redo_flush_policy() {
+  switch (srv_flush_log_at_trx_commit) {
+    case 0:
+      return "innodb_flush_log_at_trx_commit=0；提交时不强制写入或刷盘 redo，通常由后台周期性处理";
+    case 1:
+      return "innodb_flush_log_at_trx_commit=1；提交时写入并刷盘 redo，崩溃安全性最强";
+    case 2:
+      return "innodb_flush_log_at_trx_commit=2；提交时写入 redo 文件但通常不 fsync，操作系统崩溃时可能丢最近日志";
+    default:
+      return "未知 redo 提交刷盘策略";
+  }
+}
+
+void wzg_emit_innodb_redo_log_flush(THD *thd, bool binlog_group_flush,
+                                    bool sync_to_disk,
+                                    const char *decision_note) {
+  if (!wzg_innodb_should_log_thd(thd)) return;
+
+  const lsn_t current_lsn = log_sys == nullptr ? 0 : log_get_lsn(*log_sys);
+  const lsn_t flushed_lsn =
+      log_sys == nullptr ? 0 : log_sys->flushed_to_disk_lsn.load();
+  const lsn_t checkpoint_lsn =
+      log_sys == nullptr ? 0 : log_sys->last_checkpoint_lsn.load();
+
+  WZG_PROBE_EVENT(thd, "innodb.redo_log_flush_commit")
+      .message("事务提交阶段处理 InnoDB redo log，保证崩溃恢复能重做已提交修改")
+      .field("trigger",
+             binlog_group_flush ? "binlog group commit flush stage"
+                                : "FLUSH LOGS 或非 binlog 触发的 redo flush")
+      .field("innodb_flush_log_at_trx_commit",
+             std::to_string(srv_flush_log_at_trx_commit))
+      .field("flush_policy", wzg_innodb_redo_flush_policy())
+      .field("sync_to_disk", sync_to_disk)
+      .field("current_lsn", static_cast<std::uint64_t>(current_lsn))
+      .field("flushed_to_disk_lsn", static_cast<std::uint64_t>(flushed_lsn))
+      .field("last_checkpoint_lsn", static_cast<std::uint64_t>(checkpoint_lsn))
+      .field("lsn_meaning",
+             "current_lsn 是当前 redo 已生成到的位置；flushed_to_disk_lsn 是已写到磁盘的位置；checkpoint_lsn 是崩溃恢复最早需要从哪里开始扫 redo 的位置")
+      .field("decision_note", decision_note)
+      .field("why_redo",
+             "InnoDB 修改数据页时先产生 redo；即使脏页还没写回表空间，崩溃恢复也可以靠 redo 把已提交修改重做回来")
+      .field("relationship_with_binlog",
+             "开启 binlog 时，MySQL 会在两阶段提交中先让 InnoDB prepare，再写 binlog，最后 InnoDB commit，避免两边日志不一致")
+      .emit();
 }
 
 std::string wzg_innodb_db_status_text(dberr_t status) {
@@ -6372,6 +6558,9 @@ static bool innobase_flush_logs(handlerton *hton, bool binlog_group_flush) {
     and we removed !trx->ddl_must_flush from condition which is checked
     inside trx_commit_complete_for_mysql() when we decide if we could
     skip the flush. */
+    wzg_emit_innodb_redo_log_flush(
+        current_thd, binlog_group_flush, false,
+        "当前配置为 innodb_flush_log_at_trx_commit=0；binlog group commit 阶段跳过本次 redo 刷盘，等待后台周期性写入/刷盘");
     return false;
   }
 
@@ -6385,8 +6574,13 @@ static bool innobase_flush_logs(handlerton *hton, bool binlog_group_flush) {
   Sync it to disc if we are in FLUSH LOGS, or if
   innodb_flush_log_at_trx_commit=1
   (write and sync at each commit). */
-  log_buffer_flush_to_disk(!binlog_group_flush ||
-                           srv_flush_log_at_trx_commit == 1);
+  const bool sync_to_disk =
+      !binlog_group_flush || srv_flush_log_at_trx_commit == 1;
+  wzg_emit_innodb_redo_log_flush(
+      current_thd, binlog_group_flush, sync_to_disk,
+      sync_to_disk ? "本次会要求 redo 写入并同步到磁盘"
+                   : "本次只推进 redo 写入流程，不要求同步到磁盘");
+  log_buffer_flush_to_disk(sync_to_disk);
 
   return false;
 }
@@ -10980,6 +11174,8 @@ int ha_innobase::index_read(
   dberr_t ret;
   bool emitted_finish = false;
 
+  wzg_emit_innodb_search_tuple(m_user_thd, table, index,
+                               m_prebuilt->search_tuple, key_ptr);
   wzg_emit_innodb_index_read_start(m_user_thd, table, index, key_ptr, key_len,
                                    find_flag, mode, match_mode);
 

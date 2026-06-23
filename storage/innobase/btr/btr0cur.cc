@@ -59,11 +59,15 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #ifndef UNIV_HOTBACKUP
 #include <zlib.h>
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
 #include "btr0btr.h"
 #include "btr0sea.h"
 #include "buf0lru.h"
-#ifdef UNIV_DEBUG
 #include "current_thd.h"
+#ifdef UNIV_DEBUG
 #include "debug_sync.h"
 #endif /* UNIV_DEBUG */
 #include "ibuf0ibuf.h"
@@ -71,6 +75,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lock0lock.h"
 #include "mtr0log.h"
 #include "row0upd.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #endif /* !UNIV_HOTBACKUP */
 #include "page0page.h"
 #include "page0zip.h"
@@ -78,6 +84,80 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "que0que.h"
 #endif /* !UNIV_HOTBACKUP */
 #include "rem0cmp.h"
+
+#ifndef UNIV_HOTBACKUP
+namespace {
+
+bool wzg_btr_should_log(const trx_t *trx, const dict_table_t *table) {
+  const THD *thd = trx != nullptr ? trx->mysql_thd : current_thd;
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || thd->thread_id() == 0 || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_btr_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_btr_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+void wzg_emit_delete_mark_clustered_record(const trx_t *trx,
+                                           const dict_index_t *index,
+                                           const buf_block_t *block,
+                                           const rec_t *rec,
+                                           roll_ptr_t roll_ptr) {
+  if (trx == nullptr || index == nullptr ||
+      !wzg_btr_should_log(trx, index->table)) {
+    return;
+  }
+
+  THD *thd = trx->mysql_thd != nullptr ? trx->mysql_thd : current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.delete_mark_record")
+      .message("InnoDB 执行 DELETE 时把聚簇索引记录标记为已删除，而不是立刻物理移除")
+      .field("transaction_id",
+             std::to_string(
+                 static_cast<unsigned long long>(trx_get_id_for_print(trx))))
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", "聚簇索引，叶子页保存整行数据")
+      .field("record_space_id",
+             block == nullptr ? 0 : static_cast<std::uint64_t>(block->page.id.space()))
+      .field("record_page_no",
+             block == nullptr
+                 ? 0
+                 : static_cast<std::uint64_t>(block->page.id.page_no()))
+      .field("record_heap_no",
+             rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(rec)))
+      .field("delete_mark_after", "true")
+      .field("db_trx_id_after", static_cast<std::uint64_t>(trx->id))
+      .field("db_roll_ptr_after", static_cast<std::uint64_t>(roll_ptr))
+      .field("undo_record_type", "TRX_UNDO_DEL_MARK_REC")
+      .field("internal_change",
+             "记录头的 deleted flag 被设为 true，同时 DB_TRX_ID 写成当前删除事务 id，DB_ROLL_PTR 指向刚生成的 delete undo")
+      .field("internal_meaning",
+             "这条记录的最新版本表示它已被当前事务删除；旧版本仍通过 undo 链存在，普通快照读能否看到旧版本由 ReadView 决定")
+      .field("rollback_behavior",
+             "如果事务回滚，InnoDB 会读取这个 delete undo，撤销 deleted flag，让原记录重新可见")
+      .field("commit_behavior",
+             "如果事务提交，记录通常仍暂留在 B+Tree 页中，等 purge 确认没有旧 ReadView 需要它后再物理删除")
+      .field("used_later_by", "rollback、MVCC 快照读、purge 后台线程")
+      .emit();
+}
+
+}  // namespace
+#endif /* !UNIV_HOTBACKUP */
 #include "rem0rec.h"
 #include "row0log.h"
 #ifndef UNIV_HOTBACKUP
@@ -4360,6 +4440,7 @@ dberr_t btr_cur_del_mark_set_clust_rec(
   row_upd_rec_sys_fields(rec, page_zip, index, offsets, trx, roll_ptr);
 
   btr_cur_del_mark_set_clust_rec_log(rec, index, trx->id, roll_ptr, mtr);
+  wzg_emit_delete_mark_clustered_record(trx, index, block, rec, roll_ptr);
 
   return (err);
 }

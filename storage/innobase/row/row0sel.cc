@@ -41,10 +41,15 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0sel.h"
 
 #include <sys/types.h>
+#include <algorithm>
+#include <sstream>
+#include <string>
+#include <string_view>
 
 #include "btr0btr.h"
 #include "btr0cur.h"
 #include "btr0sea.h"
+#include "current_thd.h"
 #include "buf0lru.h"
 #include "dict0boot.h"
 #include "dict0dd.h"
@@ -74,6 +79,161 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0new.h"
 
 #include "my_dbug.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+namespace {
+
+bool wzg_row_sel_should_log(THD *thd, const dict_table_t *table) {
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_row_sel_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_row_sel_index_name(const dict_index_t *index) {
+  if (index == nullptr) return "无";
+  return index->name() == nullptr ? "<unnamed>" : index->name();
+}
+
+const char *wzg_row_sel_lock_mode_text(ulint mode) {
+  switch (mode) {
+    case LOCK_NONE:
+      return "LOCK_NONE";
+    case LOCK_S:
+      return "LOCK_S";
+    case LOCK_X:
+      return "LOCK_X";
+    default:
+      return "UNKNOWN_LOCK_MODE";
+  }
+}
+
+const char *wzg_row_sel_lock_mode_meaning(ulint mode) {
+  switch (mode) {
+    case LOCK_NONE:
+      return "不加 InnoDB 行锁，普通 SELECT 通过 ReadView 做快照读";
+    case LOCK_S:
+      return "共享锁，常见于 SELECT ... FOR SHARE 或 SERIALIZABLE 下的锁定读";
+    case LOCK_X:
+      return "排他锁，常见于 UPDATE、DELETE、SELECT ... FOR UPDATE";
+    default:
+      return "未知读取锁模式";
+  }
+}
+
+const char *wzg_row_sel_current_read_reason(ulint mode) {
+  switch (mode) {
+    case LOCK_S:
+      return "语句要求锁定读，需要读取当前最新版本并申请共享锁";
+    case LOCK_X:
+      return "语句要修改记录或 SELECT FOR UPDATE，需要读取当前最新版本并申请排他锁";
+    default:
+      return "当前读取模式不是快照读";
+  }
+}
+
+const char *wzg_row_sel_isolation_name(trx_t::isolation_level_t level) {
+  switch (level) {
+    case trx_t::READ_UNCOMMITTED:
+      return "READ UNCOMMITTED";
+    case trx_t::READ_COMMITTED:
+      return "READ COMMITTED";
+    case trx_t::REPEATABLE_READ:
+      return "REPEATABLE READ";
+    case trx_t::SERIALIZABLE:
+      return "SERIALIZABLE";
+  }
+  return "UNKNOWN";
+}
+
+bool wzg_row_sel_should_sample(THD *thd, int limit) {
+  if (thd == nullptr) return false;
+  struct State {
+    query_id_t query_id = 0;
+    int count = 0;
+  };
+  static thread_local State state;
+  if (state.query_id != thd->query_id) {
+    state.query_id = thd->query_id;
+    state.count = 0;
+  }
+  if (state.count >= limit) return false;
+  ++state.count;
+  return true;
+}
+
+void wzg_emit_mvcc_read_view_reuse_row(row_prebuilt_t *prebuilt,
+                                       const ReadView *view) {
+  THD *thd = current_thd;
+  if (prebuilt == nullptr || view == nullptr ||
+      !wzg_row_sel_should_log(thd, prebuilt->table) ||
+      !wzg_row_sel_should_sample(thd, 4)) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_read_view_reuse")
+      .message("当前普通 SELECT 复用事务已有的 ReadView，所以继续读取同一个快照")
+      .field("table", wzg_row_sel_table_name(prebuilt->table))
+      .field("index", wzg_row_sel_index_name(prebuilt->index))
+      .field("read_type", "快照读；复用已有 ReadView")
+      .field("reuse_reason",
+             "事务里已经有活跃 ReadView；这次普通 SELECT 不重新创建快照")
+      .field("effect",
+             "在 REPEATABLE READ 中，同一事务后续普通 SELECT 仍按第一次快照判断可见性，因此不会看到其他事务后来提交的新版本")
+      .field("read_view_up_limit_id", view->up_limit_id())
+      .field("read_view_low_limit_id", view->low_limit_id())
+      .field("read_view_creator_transaction_id", view->creator_trx_id())
+      .field("active_transaction_count",
+             static_cast<std::uint64_t>(view->active_trx_count()))
+      .emit();
+}
+
+void wzg_emit_mvcc_current_read(row_prebuilt_t *prebuilt,
+                                bool set_also_gap_locks) {
+  THD *thd = current_thd;
+  if (prebuilt == nullptr || prebuilt->trx == nullptr ||
+      !wzg_row_sel_should_log(thd, prebuilt->table) ||
+      !wzg_row_sel_should_sample(thd, 4)) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_current_read")
+      .message("当前语句不是普通快照读，会读取记录最新版本并按需要申请锁")
+      .field("table", wzg_row_sel_table_name(prebuilt->table))
+      .field("index", wzg_row_sel_index_name(prebuilt->index))
+      .field("read_type", "当前读")
+      .field("uses_read_view", "false")
+      .field("select_lock_type",
+             wzg_row_sel_lock_mode_text(prebuilt->select_lock_type))
+      .field("select_lock_type_meaning",
+             wzg_row_sel_lock_mode_meaning(prebuilt->select_lock_type))
+      .field("isolation_level",
+             wzg_row_sel_isolation_name(prebuilt->trx->isolation_level))
+      .field("why_no_read_view",
+             wzg_row_sel_current_read_reason(prebuilt->select_lock_type))
+      .field("gap_lock_policy",
+             set_also_gap_locks ? "可能申请间隙锁或临键锁来保护范围"
+                                : "当前隔离级别或表属性允许跳过间隙锁，主要锁记录本身")
+      .field("next_step",
+             "进入 InnoDB 锁模块申请表意向锁、记录锁、间隙锁或临键锁，然后读取最新可用版本")
+      .emit();
+}
+
+}  // namespace
 
 /** Maximum number of rows to prefetch; MySQL interface has another parameter */
 constexpr uint32_t SEL_MAX_N_PREFETCH = 16;
@@ -4826,11 +4986,16 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     /* Assign a read view for the query */
 
     if (!srv_read_only_mode) {
+      const bool had_active_view = MVCC::is_view_active(trx->read_view);
       trx_assign_read_view(trx);
+      if (had_active_view && MVCC::is_view_active(trx->read_view)) {
+        wzg_emit_mvcc_read_view_reuse_row(prebuilt, trx->read_view);
+      }
     }
 
     prebuilt->sql_stat_start = false;
   } else {
+    wzg_emit_mvcc_current_read(prebuilt, set_also_gap_locks);
   wait_table_again:
     err = lock_table(0, index->table,
                      prebuilt->select_lock_type == LOCK_S ? LOCK_IS : LOCK_IX,

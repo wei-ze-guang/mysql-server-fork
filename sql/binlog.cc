@@ -116,6 +116,7 @@
 #include "sql/psi_memory_resource.h"
 #include "sql/query_options.h"
 #include "sql/raii/sentry.h"  // raii::Sentry<>
+#include "sql/wzg_probe/wzg_probe.h"
 #include "sql/rpl_filter.h"
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_handler.h"  // RUN_HOOK
@@ -228,6 +229,93 @@ static void binlog_prepare_row_images(const THD *thd, TABLE *table);
 static bool is_loggable_xa_prepare(THD *thd);
 
 namespace {
+bool wzg_binlog_should_log(THD *thd) {
+  return thd != nullptr && thd->query().str != nullptr &&
+         thd->query().length > 0 && thd->thread_id() != 0;
+}
+
+const char *wzg_binlog_format_text(THD *thd) {
+  if (thd == nullptr) return "UNKNOWN";
+  if (thd->is_current_stmt_binlog_format_row()) return "ROW";
+  switch (thd->variables.binlog_format) {
+    case BINLOG_FORMAT_STMT:
+      return "STATEMENT";
+    case BINLOG_FORMAT_ROW:
+      return "ROW";
+    case BINLOG_FORMAT_MIXED:
+      return "MIXED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void wzg_emit_binlog_ordered_commit_start(THD *thd, bool all,
+                                          bool skip_commit) {
+  if (!wzg_binlog_should_log(thd)) return;
+  WZG_PROBE_EVENT(thd, "server.binlog_ordered_commit_start")
+      .message("Server 层进入 binlog group commit，用它协调 binlog 和存储引擎提交顺序")
+      .field("commit_scope", all ? "提交整个事务" : "提交当前语句")
+      .field("skip_engine_commit", skip_commit)
+      .field("binlog_format", wzg_binlog_format_text(thd))
+      .field("why_ordered_commit",
+             "开启 binlog 时，Server 需要把事务按顺序写入 binlog，并让 InnoDB 按同一顺序提交，避免复制顺序和引擎提交顺序不一致")
+      .field("two_phase_commit_order",
+             "InnoDB prepare -> flush prepared redo -> write binlog cache -> sync binlog -> InnoDB commit")
+      .field("previous_step",
+             "InnoDB 已经把事务标成 PREPARED；这时还没有真正提交，正在等待 binlog 成功落下")
+      .field("next_step", "进入 binlog flush stage，把事务的 binlog cache 写入 binlog 文件")
+      .emit();
+}
+
+void wzg_emit_binlog_cache_flush(THD *thd, my_off_t bytes_written,
+                                 const char *binlog_file,
+                                 my_off_t binlog_pos) {
+  if (!wzg_binlog_should_log(thd) || bytes_written <= 0) return;
+  WZG_PROBE_EVENT(thd, "server.binlog_cache_flush")
+      .message("把当前事务的 binlog cache 写入 binlog 文件")
+      .field("binlog_format", wzg_binlog_format_text(thd))
+      .field("bytes_written", static_cast<std::uint64_t>(bytes_written))
+      .field("binlog_file", binlog_file == nullptr ? "未知" : binlog_file)
+      .field("binlog_position_after_write",
+             static_cast<std::uint64_t>(binlog_pos))
+      .field("why_binlog",
+             "binlog 记录逻辑变更，用于主从复制和按时间点恢复；它不是 InnoDB 数据页物理 redo")
+      .field("relationship_with_redo",
+             "这一步发生在 InnoDB prepare 之后、最终 commit 之前；如果 binlog 写失败，事务不能正常提交")
+      .field("next_step", "按 sync_binlog 配置决定是否同步 binlog 文件到磁盘；同步成功后才能通知 InnoDB commit")
+      .emit();
+}
+
+void wzg_emit_binlog_sync(THD *thd, bool sync_error, bool synced,
+                          my_off_t total_bytes) {
+  if (!wzg_binlog_should_log(thd) || total_bytes <= 0) return;
+  WZG_PROBE_EVENT(thd, "server.binlog_sync")
+      .message("按 sync_binlog 策略处理 binlog 刷盘")
+      .field("sync_binlog_period", static_cast<std::uint64_t>(sync_binlog_period))
+      .field("total_bytes_in_group", static_cast<std::uint64_t>(total_bytes))
+      .field("sync_requested", synced)
+      .field("sync_error", sync_error)
+      .field("why_sync_binlog",
+             "binlog 落盘越及时，崩溃后复制和时间点恢复越可靠；sync_binlog=1 通常表示每组提交都同步 binlog")
+      .field("next_step", "binlog 成功写入/同步后，进入存储引擎 commit stage，把 InnoDB prepared 事务推进为真正提交")
+      .emit();
+}
+
+void wzg_emit_binlog_commit_stage(THD *thd) {
+  if (!wzg_binlog_should_log(thd)) return;
+  WZG_PROBE_EVENT(thd, "transaction.two_phase_commit_commit_stage")
+      .message("binlog 已完成写入流程，开始通知存储引擎提交事务")
+      .field("stage", "COMMIT_STAGE")
+      .field("why_two_phase_commit",
+             "如果只写 redo 不写 binlog，主从复制会丢事务；如果只写 binlog 不提交 InnoDB，本机数据又没有事务。两阶段提交用 prepare/binlog/commit 把两边结果对齐")
+      .field("commit_order",
+             "InnoDB prepare -> binlog write/sync -> InnoDB commit")
+      .field("what_commit_stage_does",
+             "这里开始调用各存储引擎的 commit 接口；对 InnoDB 来说，就是把已经 PREPARED 的事务变成 COMMITTED，并释放事务锁")
+      .field("next_step", "调用 handlerton commit，让 InnoDB 把 prepare 状态推进为真正 commit")
+      .emit();
+}
+
 /**
   Finishes the transaction in the engines. If the `commit_low` flag is set,
   will commit in the engines, otherwise, if the underlying statement is an
@@ -8434,6 +8522,8 @@ std::pair<int, my_off_t> MYSQL_BIN_LOG::flush_thread_caches(THD *thd) {
     */
     thd->set_trans_pos(log_file_name, m_binlog_file->position());
     if (wrote_xid) inc_prep_xids(thd);
+    wzg_emit_binlog_cache_flush(thd, bytes, log_file_name,
+                                m_binlog_file->position());
   }
   DBUG_PRINT("debug", ("bytes: %llu", bytes));
   return std::make_pair(error, bytes);
@@ -8917,6 +9007,8 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   int flush_error = 0, sync_error = 0;
   my_off_t total_bytes = 0;
 
+  wzg_emit_binlog_ordered_commit_start(thd, all, skip_commit);
+
   CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_assign_session_to_bgc_ticket");
   thd->rpl_thd_ctx.binlog_group_commit_ctx().assign_ticket();
 
@@ -9059,6 +9151,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     DEBUG_SYNC(thd, "before_sync_binlog_file");
     std::pair<bool, bool> result = sync_binlog_file(false);
     sync_error = result.first;
+    wzg_emit_binlog_sync(thd, sync_error != 0, true, total_bytes);
   }
 
   if (update_binlog_end_pos_after_sync && flush_error == 0 && sync_error == 0) {
@@ -9099,6 +9192,8 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     commit stage if binlog_error_action is ABORT_SERVER.
   */
 commit_stage:
+  wzg_emit_binlog_commit_stage(thd);
+
   /* Clone needs binlog commit order. */
   if ((opt_binlog_order_commits || Clone_handler::need_commit_order()) &&
       (sync_error == 0 || binlog_error_action != ABORT_SERVER)) {

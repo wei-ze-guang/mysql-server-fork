@@ -38,6 +38,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <algorithm>
 #include <set>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -65,6 +67,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "my_psi_config.h"
 #include "mysql/plugin.h"
 #include "mysql/psi/psi_thread.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
 
 /* Flag to enable/disable deadlock detector. */
 bool innobase_deadlock_detect = true;
@@ -101,6 +105,910 @@ static std::unordered_map<uint, const char *> lock_cached_lock_mode_names;
 
 /**  Mutex protecting access to lock_cached_lock_mode_names */
 static std::mutex lock_cached_lock_mode_names_mutex;
+
+namespace {
+
+bool wzg_lock_should_log(THD *thd, const dict_table_t *table) {
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_lock_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_lock_index_name(const dict_index_t *index) {
+  if (index == nullptr) return "无";
+  return index->name() == nullptr ? "<unnamed>" : index->name();
+}
+
+const char *wzg_lock_mode_text(lock_mode mode) {
+  switch (mode) {
+    case LOCK_IS:
+      return "LOCK_IS";
+    case LOCK_IX:
+      return "LOCK_IX";
+    case LOCK_S:
+      return "LOCK_S";
+    case LOCK_X:
+      return "LOCK_X";
+    case LOCK_AUTO_INC:
+      return "LOCK_AUTO_INC";
+    case LOCK_NONE:
+      return "LOCK_NONE";
+    default:
+      return "UNKNOWN_LOCK_MODE";
+  }
+}
+
+const char *wzg_lock_mode_meaning(lock_mode mode) {
+  switch (mode) {
+    case LOCK_IS:
+      return "意向共享锁；表示事务准备在这张表的某些索引记录上加共享锁";
+    case LOCK_IX:
+      return "意向排他锁；表示事务准备在这张表的某些索引记录上加排他锁";
+    case LOCK_S:
+      return "共享锁；允许其他事务共享读取，但会阻止冲突的修改锁";
+    case LOCK_X:
+      return "排他锁；用于修改或锁定读取，会阻止其他事务取得冲突锁";
+    case LOCK_AUTO_INC:
+      return "自增锁；用于保护 AUTO_INCREMENT 值分配";
+    case LOCK_NONE:
+      return "不加锁，通常表示普通一致性读";
+    default:
+      return "未知锁模式";
+  }
+}
+
+const char *wzg_table_lock_type_text(lock_mode mode) {
+  switch (mode) {
+    case LOCK_IS:
+      return "intention shared table lock";
+    case LOCK_IX:
+      return "intention exclusive table lock";
+    case LOCK_S:
+      return "shared table lock";
+    case LOCK_X:
+      return "exclusive table lock";
+    case LOCK_AUTO_INC:
+      return "auto-inc table lock";
+    case LOCK_NONE:
+      return "no table lock";
+    default:
+      return "unknown table lock";
+  }
+}
+
+const char *wzg_table_lock_type_cn(lock_mode mode) {
+  switch (mode) {
+    case LOCK_IS:
+      return "表级意向共享锁";
+    case LOCK_IX:
+      return "表级意向排他锁";
+    case LOCK_S:
+      return "表级共享锁";
+    case LOCK_X:
+      return "表级排他锁";
+    case LOCK_AUTO_INC:
+      return "表级自增锁";
+    case LOCK_NONE:
+      return "不加表锁";
+    default:
+      return "未知表级锁";
+  }
+}
+
+const char *wzg_table_lock_type_meaning(lock_mode mode) {
+  switch (mode) {
+    case LOCK_IS:
+      return "意向共享锁，放在表上；表示事务接下来可能在这张表的某些索引记录上申请共享记录锁";
+    case LOCK_IX:
+      return "意向排他锁，放在表上；表示事务接下来可能在这张表的某些索引记录上申请排他记录锁";
+    case LOCK_S:
+      return "表级共享锁，保护整张表的共享读取，会和表级排他锁冲突";
+    case LOCK_X:
+      return "表级排他锁，保护整张表的修改或独占访问，会阻塞冲突的表级锁";
+    case LOCK_AUTO_INC:
+      return "自增锁，保护 AUTO_INCREMENT 值分配，避免并发插入时自增值分配混乱";
+    case LOCK_NONE:
+      return "没有申请表级锁";
+    default:
+      return "未知表级锁类型";
+  }
+}
+
+const char *wzg_lock_record_type_text(ulint gap_mode) {
+  if (gap_mode & LOCK_INSERT_INTENTION) return "insert intention lock";
+  if (gap_mode == LOCK_GAP) return "gap lock";
+  if (gap_mode == LOCK_REC_NOT_GAP) return "record lock";
+  if (gap_mode == LOCK_ORDINARY) return "next-key lock";
+  return "record-related lock";
+}
+
+const char *wzg_lock_record_type_meaning(ulint gap_mode) {
+  if (gap_mode & LOCK_INSERT_INTENTION) {
+    return "插入意向锁；表示事务准备往某个索引间隙插入记录";
+  }
+  if (gap_mode == LOCK_GAP) {
+    return "间隙锁；锁住索引记录之间的空隙，常用于阻止范围内插入新记录";
+  }
+  if (gap_mode == LOCK_REC_NOT_GAP) {
+    return "记录锁；只锁住当前索引记录本身，不锁它前面的间隙";
+  }
+  if (gap_mode == LOCK_ORDINARY) {
+    return "临键锁；锁住当前索引记录以及它前面的间隙，常用于防止幻读";
+  }
+  return "InnoDB 记录锁相关模式";
+}
+
+const char *wzg_lock_record_type_cn(ulint gap_mode) {
+  if (gap_mode & LOCK_INSERT_INTENTION) return "插入意向锁";
+  if (gap_mode == LOCK_GAP) return "间隙锁";
+  if (gap_mode == LOCK_REC_NOT_GAP) return "记录锁";
+  if (gap_mode == LOCK_ORDINARY) return "临键锁";
+  return "记录相关锁";
+}
+
+std::string wzg_lock_record_components(lock_mode mode, ulint gap_mode) {
+  std::string value;
+  value.append("锁强度=");
+  value.append(wzg_lock_mode_text(mode));
+  value.append("（");
+  value.append(wzg_lock_mode_meaning(mode));
+  value.append("）");
+  value.append("；范围类型=");
+  value.append(wzg_lock_record_type_cn(gap_mode));
+  value.append("（");
+  value.append(wzg_lock_record_type_meaning(gap_mode));
+  value.append("）");
+  return value;
+}
+
+ulint wzg_record_gap_mode_from_lock(const lock_t *lock) {
+  if (lock == nullptr || !lock->is_record_lock()) return 0;
+  return lock->type_mode &
+         (LOCK_GAP | LOCK_REC_NOT_GAP | LOCK_INSERT_INTENTION);
+}
+
+std::string wzg_lock_target_from_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (!lock->is_record_lock()) return wzg_lock_table_name(lock->tab_lock.table);
+
+  const ulint heap_no = lock_rec_find_set_bit(lock);
+  std::ostringstream out;
+  out << "space_id=" << lock->rec_lock.page_id.space()
+      << "，page_no=" << lock->rec_lock.page_id.page_no()
+      << "，heap_no="
+      << (heap_no == ULINT_UNDEFINED ? std::string("未知")
+                                      : std::to_string(heap_no));
+  if (heap_no == PAGE_HEAP_NO_SUPREMUM) out << "，supremum=true";
+  return out.str();
+}
+
+std::string wzg_lock_table_from_any_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (lock->is_record_lock()) {
+    return wzg_lock_table_name(lock->index == nullptr ? nullptr : lock->index->table);
+  }
+  return wzg_lock_table_name(lock->tab_lock.table);
+}
+
+std::string wzg_lock_index_from_any_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (!lock->is_record_lock()) return "无；表级锁不绑定具体索引";
+  return wzg_lock_index_name(lock->index);
+}
+
+const char *wzg_lock_scope_from_lock(const lock_t *lock) {
+  return lock != nullptr && lock->is_record_lock() ? "record" : "table";
+}
+
+std::string wzg_lock_type_text_from_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (lock->is_record_lock()) {
+    return wzg_lock_record_type_text(wzg_record_gap_mode_from_lock(lock));
+  }
+  return wzg_table_lock_type_text(lock->mode());
+}
+
+std::string wzg_lock_type_cn_from_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (lock->is_record_lock()) {
+    return wzg_lock_record_type_cn(wzg_record_gap_mode_from_lock(lock));
+  }
+  return wzg_table_lock_type_cn(lock->mode());
+}
+
+std::string wzg_lock_type_meaning_from_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (lock->is_record_lock()) {
+    return wzg_lock_record_type_meaning(wzg_record_gap_mode_from_lock(lock));
+  }
+  return wzg_table_lock_type_meaning(lock->mode());
+}
+
+std::string wzg_lock_components_from_lock(const lock_t *lock) {
+  if (lock == nullptr) return "无";
+  if (lock->is_record_lock()) {
+    return wzg_lock_record_components(lock->mode(),
+                                      wzg_record_gap_mode_from_lock(lock));
+  }
+
+  std::string value;
+  value.append("表级锁类型=");
+  value.append(wzg_table_lock_type_cn(lock->mode()));
+  value.append("（");
+  value.append(wzg_table_lock_type_meaning(lock->mode()));
+  value.append("）");
+  return value;
+}
+
+THD *wzg_lock_event_thd(const trx_t *trx) {
+  return trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                     : current_thd;
+}
+
+const dict_table_t *wzg_lock_table_ptr_from_any_lock(const lock_t *lock) {
+  if (lock == nullptr) return nullptr;
+  if (lock->is_record_lock()) {
+    return lock->index == nullptr ? nullptr : lock->index->table;
+  }
+  return lock->tab_lock.table;
+}
+
+bool wzg_lock_should_log_lock(THD *thd, const lock_t *lock) {
+  return wzg_lock_should_log(thd, wzg_lock_table_ptr_from_any_lock(lock));
+}
+
+const char *wzg_lock_result_text(dberr_t err) {
+  switch (err) {
+    case DB_SUCCESS:
+      return "DB_SUCCESS";
+    case DB_SUCCESS_LOCKED_REC:
+      return "DB_SUCCESS_LOCKED_REC";
+    case DB_LOCK_WAIT:
+      return "DB_LOCK_WAIT";
+    case DB_DEADLOCK:
+      return "DB_DEADLOCK";
+    case DB_SKIP_LOCKED:
+      return "DB_SKIP_LOCKED";
+    case DB_LOCK_NOWAIT:
+      return "DB_LOCK_NOWAIT";
+    default:
+      return "OTHER";
+  }
+}
+
+const char *wzg_lock_result_meaning(dberr_t err) {
+  switch (err) {
+    case DB_SUCCESS:
+      return "锁请求成功，或者事务已经持有足够强的锁";
+    case DB_SUCCESS_LOCKED_REC:
+      return "锁请求成功，并且这次确实创建或确认了记录锁";
+    case DB_LOCK_WAIT:
+      return "锁请求与其他事务冲突，当前事务需要等待";
+    case DB_DEADLOCK:
+      return "锁请求触发死锁检测，当前事务会按 InnoDB 规则处理";
+    case DB_SKIP_LOCKED:
+      return "由于 SKIP LOCKED，遇到冲突记录时跳过";
+    case DB_LOCK_NOWAIT:
+      return "由于 NOWAIT，遇到冲突锁后立即返回";
+    default:
+      return "锁请求返回了其他 InnoDB 状态";
+  }
+}
+
+std::string wzg_lock_trx_id_text(const trx_t *trx) {
+  if (trx == nullptr) return "无";
+  return std::to_string(static_cast<unsigned long long>(trx_get_id_for_print(trx)));
+}
+
+std::string wzg_lock_record_target(const buf_block_t *block, ulint heap_no) {
+  if (block == nullptr) return "未知记录";
+  std::ostringstream out;
+  out << "space_id=" << block->page.id.space()
+      << "，page_no=" << block->page.id.page_no() << "，heap_no=" << heap_no;
+  if (heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    out << "，supremum=true";
+  }
+  return out.str();
+}
+
+std::string wzg_lock_bytes_preview(const byte *data, ulint len) {
+  if (data == nullptr) return "无";
+  if (len == UNIV_SQL_NULL) return "SQL NULL";
+  if (len == 0) return "空值";
+
+  const ulint preview_len = std::min<ulint>(len, 16);
+  std::ostringstream out;
+  for (ulint i = 0; i < preview_len; ++i) {
+    if (i > 0) out << ' ';
+    constexpr char hex[] = "0123456789ABCDEF";
+    out << hex[(data[i] >> 4) & 0x0F] << hex[data[i] & 0x0F];
+  }
+  if (len > preview_len) out << " ...";
+  return out.str();
+}
+
+std::string wzg_lock_text_value(const byte *data, ulint len) {
+  if (data == nullptr) return "无";
+  std::string value;
+  const ulint preview_len = std::min<ulint>(len, 64);
+  for (ulint i = 0; i < preview_len; ++i) {
+    const unsigned char c = data[i];
+    if (c == '\\') {
+      value.append("\\\\");
+    } else if (c == '"') {
+      value.append("\\\"");
+    } else if (c >= 0x20 && c != 0x7F) {
+      value.push_back(static_cast<char>(c));
+    } else {
+      value.append("\\x");
+      constexpr char hex[] = "0123456789ABCDEF";
+      value.push_back(hex[(c >> 4) & 0x0F]);
+      value.push_back(hex[c & 0x0F]);
+    }
+  }
+  if (len > preview_len) value.append("...");
+  return value;
+}
+
+std::string wzg_lock_int_value(const byte *data, ulint len,
+                               const dtype_t *type) {
+  if (data == nullptr || type == nullptr) return "无法解码";
+
+  const ulint prtype = dtype_get_prtype(type);
+  unsigned long long val = 0;
+  switch (len) {
+    case 1:
+      val = mach_read_from_1(data);
+      if (!(prtype & DATA_UNSIGNED)) val &= ~0x80ULL;
+      break;
+    case 2:
+      val = mach_read_from_2(data);
+      if (!(prtype & DATA_UNSIGNED)) val &= ~0x8000ULL;
+      break;
+    case 3:
+      val = mach_read_from_3(data);
+      if (!(prtype & DATA_UNSIGNED)) val &= ~0x800000ULL;
+      break;
+    case 4:
+      val = mach_read_from_4(data);
+      if (!(prtype & DATA_UNSIGNED)) val &= ~0x80000000ULL;
+      break;
+    case 6:
+      val = mach_read_from_6(data);
+      break;
+    case 7:
+      val = mach_read_from_7(data);
+      break;
+    case 8:
+      val = mach_read_from_8(data);
+      break;
+    default:
+      return "无法解码整数，raw_bytes=" + wzg_lock_bytes_preview(data, len);
+  }
+  return std::to_string(val);
+}
+
+const char *wzg_lock_data_type_name(const dtype_t *type) {
+  if (type == nullptr) return "UNKNOWN";
+
+  switch (dtype_get_mtype(type)) {
+    case DATA_INT:
+      return "DATA_INT";
+    case DATA_CHAR:
+      return "DATA_CHAR";
+    case DATA_VARCHAR:
+      return "DATA_VARCHAR";
+    case DATA_MYSQL:
+      return "DATA_MYSQL";
+    case DATA_VARMYSQL:
+      return "DATA_VARMYSQL";
+    case DATA_BINARY:
+      return "DATA_BINARY";
+    case DATA_FIXBINARY:
+      return "DATA_FIXBINARY";
+    case DATA_BLOB:
+      return "DATA_BLOB";
+    case DATA_SYS:
+      return "DATA_SYS";
+    case DATA_FLOAT:
+      return "DATA_FLOAT";
+    case DATA_DOUBLE:
+      return "DATA_DOUBLE";
+    case DATA_DECIMAL:
+      return "DATA_DECIMAL";
+    case DATA_GEOMETRY:
+      return "DATA_GEOMETRY";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+std::string wzg_lock_field_value(const byte *data, ulint len,
+                                 const dtype_t *type) {
+  if (len == UNIV_SQL_NULL) return "NULL";
+  if (type == nullptr) return "raw_bytes=" + wzg_lock_bytes_preview(data, len);
+
+  switch (dtype_get_mtype(type)) {
+    case DATA_INT:
+      return wzg_lock_int_value(data, len, type);
+    case DATA_CHAR:
+    case DATA_VARCHAR:
+    case DATA_MYSQL:
+    case DATA_VARMYSQL:
+      return "\"" + wzg_lock_text_value(data, len) + "\"";
+    default:
+      return "raw_bytes=" + wzg_lock_bytes_preview(data, len);
+  }
+}
+
+std::string wzg_lock_record_values(const rec_t *rec, dict_index_t *index,
+                                   const ulint *offsets) {
+  if (rec == nullptr || index == nullptr || offsets == nullptr) return "无法读取记录值";
+  if (page_rec_is_supremum(rec)) return "supremum 伪记录；表示页面上的最大边界，不是用户数据行";
+
+  const ulint n_fields = std::min<ulint>(
+      std::min<ulint>(rec_offs_n_fields(offsets), index->n_fields), 8);
+  if (n_fields == 0) return "没有可显示的索引字段";
+
+  std::string value;
+  for (ulint i = 0; i < n_fields; ++i) {
+    const dict_field_t *index_field = index->get_field(i);
+    dtype_t field_type;
+    const dtype_t *type = nullptr;
+    if (index_field != nullptr && index_field->col != nullptr) {
+      index_field->col->copy_type(&field_type);
+      type = &field_type;
+    }
+    ulint len = 0;
+    const byte *data = rec_get_nth_field_instant(rec, offsets, i, index, &len);
+
+    if (i > 0) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". ");
+    value.append(index_field == nullptr || index_field->name() == nullptr
+                     ? "未知字段"
+                     : index_field->name());
+    value.append("=");
+    value.append(wzg_lock_field_value(data, len, type));
+    value.append("，type=");
+    value.append(wzg_lock_data_type_name(type));
+    value.append("，length_bytes=");
+    value.append(len == UNIV_SQL_NULL ? "SQL NULL" : std::to_string(len));
+  }
+
+  if (rec_offs_n_fields(offsets) > n_fields) value.append("；...");
+  return value;
+}
+
+std::string wzg_lock_record_reason(lock_mode mode, ulint gap_mode) {
+  std::string value;
+  value.append(mode == LOCK_X ? "当前读或写操作需要排他保护" : "当前读操作需要共享保护");
+  value.append("；");
+  value.append(wzg_lock_record_type_meaning(gap_mode));
+  return value;
+}
+
+std::string wzg_mvcc_visibility_reason(const ReadView *view, trx_id_t trx_id,
+                                       bool visible) {
+  if (view == nullptr) return "没有 ReadView，无法判断版本可见性";
+  if (visible) {
+    if (trx_id == view->creator_trx_id()) {
+      return "这个版本由当前事务自己创建，当前事务可以看到自己的修改";
+    }
+    if (trx_id < view->up_limit_id()) {
+      return "修改这个版本的事务早于 ReadView 中最老的活跃事务，当前 SELECT 可以看到";
+    }
+    return "这个事务 id 不在 ReadView 活跃事务列表中，说明创建快照时它已经提交";
+  }
+  if (trx_id >= view->low_limit_id()) {
+    return "修改这个版本的事务在 ReadView 创建之后才开始，所以当前 SELECT 不能看到";
+  }
+  return "修改这个版本的事务在 ReadView 创建时仍未提交，所以当前 SELECT 不能看到";
+}
+
+bool wzg_mvcc_should_sample(THD *thd, int limit) {
+  if (thd == nullptr) return false;
+  struct State {
+    query_id_t query_id = 0;
+    int count = 0;
+  };
+  static thread_local State state;
+  if (state.query_id != thd->query_id) {
+    state.query_id = thd->query_id;
+    state.count = 0;
+  }
+  if (state.count >= limit) return false;
+  ++state.count;
+  return true;
+}
+
+std::string wzg_mvcc_record_target_from_rec(const rec_t *rec) {
+  if (rec == nullptr) return "无";
+  const page_t *page = page_align(rec);
+  std::ostringstream out;
+  out << "space_id=" << page_get_space_id(page)
+      << "，page_no=" << page_get_page_no(page)
+      << "，heap_no=" << page_rec_get_heap_no(rec);
+  if (page_rec_is_supremum(rec)) out << "，supremum=true";
+  return out.str();
+}
+
+void wzg_emit_mvcc_clust_version_check(const rec_t *rec, dict_index_t *index,
+                                       const ulint *offsets,
+                                       trx_id_t trx_id, const ReadView *view,
+                                       bool visible) {
+  THD *thd = current_thd;
+  if (index == nullptr || rec == nullptr || offsets == nullptr ||
+      !wzg_lock_should_log(thd, index->table)) {
+    return;
+  }
+  if (visible || !wzg_mvcc_should_sample(thd, 8)) return;
+
+  const roll_ptr_t roll_ptr = row_get_rec_roll_ptr(rec, index, offsets);
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_version_check")
+      .message("检查聚簇索引记录的当前版本是否对这个普通 SELECT 可见")
+      .field("table", wzg_lock_table_name(index->table))
+      .field("index", wzg_lock_index_name(index))
+      .field("index_kind", "聚簇索引；记录里带有 DB_TRX_ID，可以判断这一行最后由哪个事务修改")
+      .field("record_system_columns",
+             "聚簇索引记录包含 DB_TRX_ID 和 DB_ROLL_PTR，这是 InnoDB 做 MVCC 的关键隐藏字段")
+      .field("db_trx_id", trx_id)
+      .field("db_trx_id_meaning",
+             "DB_TRX_ID 表示最后一次插入或修改这条记录的事务 id，本日志的 record_trx_id 就来自这里")
+      .field("db_roll_ptr", static_cast<std::uint64_t>(roll_ptr))
+      .field("db_roll_ptr_type",
+             "undo log 位置引用，不是 C++ 内存地址；InnoDB 用这个值定位上一版本相关的 undo 记录")
+      .field("db_roll_ptr_meaning",
+             "DB_ROLL_PTR 指向 undo 记录；如果当前版本不可见，InnoDB 会沿它找到修改前的旧版本")
+      .field("hidden_column_source",
+             "db_trx_id 来自 row_get_rec_trx_id(rec,index,offsets)；db_roll_ptr 来自 row_get_rec_roll_ptr(rec,index,offsets)")
+      .field("record_target", wzg_mvcc_record_target_from_rec(rec))
+      .field("record_trx_id", trx_id)
+      .field("read_view_creator_transaction_id",
+             view == nullptr ? 0 : view->creator_trx_id())
+      .field("read_view_up_limit_id", view == nullptr ? 0 : view->up_limit_id())
+      .field("read_view_low_limit_id",
+             view == nullptr ? 0 : view->low_limit_id())
+      .field("record_visible", visible)
+      .field("visible_reason",
+             wzg_mvcc_visibility_reason(view, trx_id, visible))
+      .field("next_step", "当前版本不可见，沿 undo 版本链查找更旧、对这个 ReadView 可见的记录版本")
+      .emit();
+}
+
+void wzg_emit_mvcc_sec_version_check(const rec_t *rec, const dict_index_t *index,
+                                     trx_id_t max_trx_id,
+                                     const ReadView *view, bool visible) {
+  THD *thd = current_thd;
+  if (index == nullptr || rec == nullptr ||
+      !wzg_lock_should_log(thd, index->table)) {
+    return;
+  }
+  if (visible || !wzg_mvcc_should_sample(thd, 8)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.mvcc_version_check")
+      .message("检查二级索引页是否可能包含当前 SELECT 看不见的新版本")
+      .field("table", wzg_lock_table_name(index->table))
+      .field("index", wzg_lock_index_name(index))
+      .field("index_kind", "二级索引；页上只有最大事务 id，不能直接还原整行旧版本")
+      .field("why_cluster_lookup_needed",
+             "二级索引记录不保存完整行版本链；真正精确的 DB_TRX_ID 和 undo 旧版本判断要回到聚簇索引记录完成")
+      .field("record_target", wzg_mvcc_record_target_from_rec(rec))
+      .field("page_max_trx_id", max_trx_id)
+      .field("read_view_up_limit_id", view == nullptr ? 0 : view->up_limit_id())
+      .field("read_view_low_limit_id",
+             view == nullptr ? 0 : view->low_limit_id())
+      .field("record_visible", visible)
+      .field("visible_reason",
+             visible ? "二级索引页的最大事务 id 小于 ReadView 的 up_limit_id，可以直接确认可见"
+                     : "二级索引页可能有 ReadView 看不见的新版本，需要再到聚簇索引记录上做精确判断")
+      .field("next_step", "读取对应的聚簇索引记录，必要时再沿 undo 版本链构造旧版本")
+      .emit();
+}
+
+void wzg_emit_innodb_table_lock_request(dict_table_t *table, lock_mode mode,
+                                        trx_t *trx, dberr_t err) {
+  THD *thd = current_thd;
+  if (!wzg_lock_should_log(thd, table)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_request")
+      .message("InnoDB 申请表级锁或意向锁")
+      .field("table", wzg_lock_table_name(table))
+      .field("index", "无；表级锁不绑定具体索引")
+      .field("lock_scope", "table")
+      .field("lock_mode", wzg_lock_mode_text(mode))
+      .field("lock_mode_meaning", wzg_lock_mode_meaning(mode))
+      .field("lock_type", wzg_table_lock_type_text(mode))
+      .field("lock_type_cn", wzg_table_lock_type_cn(mode))
+      .field("lock_type_meaning", wzg_table_lock_type_meaning(mode))
+      .field("lock_target", wzg_lock_table_name(table))
+      .field("why_lock",
+             mode == LOCK_IS || mode == LOCK_IX
+                 ? "在申请行锁之前，InnoDB 先在表上放意向锁，让表锁和行锁可以快速判断冲突"
+                 : "SQL 操作需要保护整张表或表级资源")
+      .field("transaction_id", wzg_lock_trx_id_text(trx))
+      .field("request_result", wzg_lock_result_text(err))
+      .field("request_result_meaning", wzg_lock_result_meaning(err))
+      .emit();
+}
+
+void wzg_emit_innodb_record_lock_request(const char *record_kind,
+                                         const buf_block_t *block,
+                                         const rec_t *rec, const ulint *offsets,
+                                         ulint heap_no,
+                                         dict_index_t *index, lock_mode mode,
+                                         ulint gap_mode, que_thr_t *thr,
+                                         dberr_t err) {
+  THD *thd = current_thd;
+  if (index == nullptr || !wzg_lock_should_log(thd, index->table)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_request")
+      .message("InnoDB 申请索引记录锁")
+      .field("table", wzg_lock_table_name(index->table))
+      .field("index", wzg_lock_index_name(index))
+      .field("innodb_index_kind",
+             index->is_clustered() ? "聚簇索引，锁住的索引记录就是整行数据所在记录"
+                                   : "二级索引，锁住的是二级索引记录，必要时还会访问聚簇索引")
+      .field("lock_scope", "record")
+      .field("record_kind", record_kind == nullptr ? "索引记录" : record_kind)
+      .field("lock_mode", wzg_lock_mode_text(mode))
+      .field("lock_mode_meaning", wzg_lock_mode_meaning(mode))
+      .field("lock_type", wzg_lock_record_type_text(gap_mode))
+      .field("lock_type_cn", wzg_lock_record_type_cn(gap_mode))
+      .field("lock_type_meaning", wzg_lock_record_type_meaning(gap_mode))
+      .field("lock_components", wzg_lock_record_components(mode, gap_mode))
+      .field("lock_target", wzg_lock_record_target(block, heap_no))
+      .field("record_values", wzg_lock_record_values(rec, index, offsets))
+      .field("record_values_note",
+             "这里按锁所在索引记录解码前几个索引字段；聚簇索引通常能看到主键及部分行字段，二级索引看到的是二级索引键和主键尾部")
+      .field("why_lock", wzg_lock_record_reason(mode, gap_mode))
+      .field("transaction_id", wzg_lock_trx_id_text(thr_get_trx(thr)))
+      .field("request_result", wzg_lock_result_text(err))
+      .field("request_result_meaning", wzg_lock_result_meaning(err))
+      .field("note",
+             "InnoDB 行锁实际加在索引记录或索引间隙上；这里的 page/heap 坐标是锁系统定位记录的事实坐标")
+      .emit();
+}
+
+std::string wzg_lock_wait_why(lock_mode mode, ulint gap_mode) {
+  std::string value;
+  value.append("当前事务想申请 ");
+  value.append(wzg_lock_mode_text(mode));
+  value.append(" ");
+  value.append(wzg_lock_record_type_text(gap_mode));
+  value.append("，但已有事务持有不兼容锁，所以当前事务进入等待");
+  return value;
+}
+
+std::string wzg_lock_table_wait_why(lock_mode mode) {
+  std::string value;
+  value.append("当前事务想申请表级 ");
+  value.append(wzg_lock_mode_text(mode));
+  value.append("，但已有事务在这张表上持有不兼容表锁，所以当前事务进入等待");
+  return value;
+}
+
+std::string wzg_lock_release_summary(trx_t *trx) {
+  if (trx == nullptr) return "无事务";
+
+  size_t table_locks = 0;
+  size_t record_locks = 0;
+  size_t waiting_locks = 0;
+  std::string samples;
+
+  for (const lock_t *lock = UT_LIST_GET_FIRST(trx->lock.trx_locks);
+       lock != nullptr; lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
+    if (lock->is_record_lock()) {
+      ++record_locks;
+    } else {
+      ++table_locks;
+    }
+    if (lock->is_waiting()) ++waiting_locks;
+
+    if (table_locks + record_locks <= 5) {
+      if (!samples.empty()) samples.append("；");
+      samples.append(std::to_string(table_locks + record_locks));
+      samples.append(". ");
+      samples.append(wzg_lock_type_cn_from_lock(lock));
+      samples.append("，table=");
+      samples.append(wzg_lock_table_from_any_lock(lock));
+      samples.append("，index=");
+      samples.append(wzg_lock_index_from_any_lock(lock));
+      samples.append("，mode=");
+      samples.append(wzg_lock_mode_text(lock->mode()));
+      samples.append("，target=");
+      samples.append(wzg_lock_target_from_lock(lock));
+      samples.append("，status=");
+      samples.append(lock->is_waiting() ? "WAITING" : "GRANTED");
+    }
+  }
+
+  std::ostringstream out;
+  out << "table_locks=" << table_locks << "，record_locks=" << record_locks
+      << "，waiting_locks=" << waiting_locks << "，samples="
+      << (samples.empty() ? "无" : samples);
+  return out.str();
+}
+
+void wzg_emit_innodb_lock_release_transaction(trx_t *trx,
+                                              const char *release_reason) {
+  THD *thd = wzg_lock_event_thd(trx);
+  if (thd == nullptr || trx == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0) {
+    return;
+  }
+
+  const size_t lock_count = UT_LIST_GET_LEN(trx->lock.trx_locks);
+  const size_t record_lock_count =
+      trx->lock.n_rec_locks.load(std::memory_order_relaxed);
+  if (lock_count == 0) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_release_transaction")
+      .message("事务结束，InnoDB 开始释放这个事务持有的表锁和记录锁")
+      .field("transaction_id", wzg_lock_trx_id_text(trx))
+      .field("release_reason",
+             release_reason == nullptr ? "transaction_finish" : release_reason)
+      .field("lock_count_before_release", std::to_string(lock_count))
+      .field("record_lock_count_before_release",
+             std::to_string(record_lock_count))
+      .field("lock_summary", wzg_lock_release_summary(trx))
+      .field("what_will_release",
+             "释放这个事务持有的表级意向锁、表级自增锁、记录锁、间隙锁、临键锁、插入意向锁等真实锁对象")
+      .field("what_happens_next",
+             "每释放一个锁对象，InnoDB 会检查同一表或同一索引记录上的等待队列，其他事务可能获得锁并继续执行")
+      .emit();
+}
+
+void wzg_emit_innodb_lock_granted_after_wait(lock_t *lock) {
+  if (lock == nullptr) return;
+
+  THD *thd = current_thd != nullptr ? current_thd : wzg_lock_event_thd(lock->trx);
+  if (!wzg_lock_should_log_lock(thd, lock)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_granted_after_wait")
+      .message("阻塞锁释放或等待队列重新检查后，等待中的锁请求被授予")
+      .field("granted_transaction_id", wzg_lock_trx_id_text(lock->trx))
+      .field("grant_trigger",
+             "当前线程释放或调整了冲突锁，InnoDB 因此重新检查等待队列并授予这个等待锁")
+      .field("event_context_note",
+             "事件顶层线程通常是触发授予的释放锁线程；granted_transaction_id 才是获得锁的事务")
+      .field("table", wzg_lock_table_from_any_lock(lock))
+      .field("index", wzg_lock_index_from_any_lock(lock))
+      .field("lock_scope", wzg_lock_scope_from_lock(lock))
+      .field("lock_mode", wzg_lock_mode_text(lock->mode()))
+      .field("lock_mode_meaning", wzg_lock_mode_meaning(lock->mode()))
+      .field("lock_type", wzg_lock_type_text_from_lock(lock))
+      .field("lock_type_cn", wzg_lock_type_cn_from_lock(lock))
+      .field("lock_type_meaning", wzg_lock_type_meaning_from_lock(lock))
+      .field("lock_components", wzg_lock_components_from_lock(lock))
+      .field("lock_target", wzg_lock_target_from_lock(lock))
+      .field("grant_reason",
+             "之前阻塞它的事务释放了冲突锁，或者等待队列重新检查后发现前面已没有不兼容锁")
+      .field("what_happens_next",
+             "事务从 InnoDB 锁等待中恢复，继续执行原来的 SQL")
+      .emit();
+}
+
+void wzg_emit_innodb_lock_wait_timeout(trx_t *trx, const lock_t *lock) {
+  THD *thd = wzg_lock_event_thd(trx);
+  if (!wzg_lock_should_log_lock(thd, lock)) return;
+
+  const trx_t *blocking_trx =
+      trx == nullptr ? nullptr : trx->lock.blocking_trx.load();
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_wait_timeout")
+      .message("事务等待锁超过 innodb_lock_wait_timeout，InnoDB 取消本次锁等待")
+      .field("waiting_transaction_id", wzg_lock_trx_id_text(trx))
+      .field("blocking_transaction_id", wzg_lock_trx_id_text(blocking_trx))
+      .field("table", wzg_lock_table_from_any_lock(lock))
+      .field("index", wzg_lock_index_from_any_lock(lock))
+      .field("lock_scope", wzg_lock_scope_from_lock(lock))
+      .field("waiting_lock_mode", wzg_lock_mode_text(lock->mode()))
+      .field("waiting_lock_mode_meaning", wzg_lock_mode_meaning(lock->mode()))
+      .field("waiting_lock_type", wzg_lock_type_text_from_lock(lock))
+      .field("waiting_lock_type_cn", wzg_lock_type_cn_from_lock(lock))
+      .field("waiting_lock_type_meaning", wzg_lock_type_meaning_from_lock(lock))
+      .field("waiting_lock_components", wzg_lock_components_from_lock(lock))
+      .field("lock_target", wzg_lock_target_from_lock(lock))
+      .field("timeout_result", "DB_LOCK_WAIT_TIMEOUT")
+      .field("difference_from_deadlock",
+             "这里没有确认等待环；只是这个事务等待同一个锁的时间超过 innodb_lock_wait_timeout")
+      .field("what_happens_next",
+             "InnoDB 移除这个等待锁请求，当前 SQL 返回锁等待超时错误，事务是否继续取决于上层处理")
+      .emit();
+}
+
+void wzg_emit_innodb_table_lock_wait(dict_table_t *table, lock_mode mode,
+                                     trx_t *waiting_trx, const lock_t *wait_for,
+                                     dberr_t err) {
+  THD *thd = current_thd;
+  if (err != DB_LOCK_WAIT || !wzg_lock_should_log(thd, table)) return;
+
+  const trx_t *blocking_trx =
+      wait_for != nullptr ? wait_for->trx
+                          : waiting_trx == nullptr
+                                ? nullptr
+                                : waiting_trx->lock.blocking_trx.load();
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_wait")
+      .message("表级锁请求与其他事务冲突，当前事务进入等待")
+      .field("table", wzg_lock_table_name(table))
+      .field("index", "无；表级锁不绑定具体索引")
+      .field("lock_scope", "table")
+      .field("waiting_transaction_id", wzg_lock_trx_id_text(waiting_trx))
+      .field("blocking_transaction_id", wzg_lock_trx_id_text(blocking_trx))
+      .field("waiting_lock_mode", wzg_lock_mode_text(mode))
+      .field("waiting_lock_mode_meaning", wzg_lock_mode_meaning(mode))
+      .field("waiting_lock_type", wzg_table_lock_type_text(mode))
+      .field("waiting_lock_type_cn", wzg_table_lock_type_cn(mode))
+      .field("waiting_lock_type_meaning", wzg_table_lock_type_meaning(mode))
+      .field("lock_target", wzg_lock_table_name(table))
+      .field("why_wait", wzg_lock_table_wait_why(mode))
+      .field("what_happens_next",
+             "当前事务挂起等待；如果阻塞事务提交或回滚则继续，如果形成等待环则可能触发死锁检测")
+      .emit();
+}
+
+void wzg_emit_innodb_record_lock_wait(const char *record_kind,
+                                      const buf_block_t *block,
+                                      const rec_t *rec, const ulint *offsets,
+                                      ulint heap_no, dict_index_t *index,
+                                      lock_mode mode, ulint gap_mode,
+                                      que_thr_t *thr, dberr_t err) {
+  THD *thd = current_thd;
+  if (err != DB_LOCK_WAIT || index == nullptr ||
+      !wzg_lock_should_log(thd, index->table)) {
+    return;
+  }
+
+  trx_t *waiting_trx = thr_get_trx(thr);
+  const trx_t *blocking_trx =
+      waiting_trx == nullptr ? nullptr : waiting_trx->lock.blocking_trx.load();
+
+  WZG_PROBE_EVENT(thd, "innodb.lock_wait")
+      .message("索引记录锁请求与其他事务冲突，当前事务进入等待")
+      .field("table", wzg_lock_table_name(index->table))
+      .field("index", wzg_lock_index_name(index))
+      .field("innodb_index_kind",
+             index->is_clustered() ? "聚簇索引，等待的锁目标是整行数据所在记录"
+                                   : "二级索引，等待的锁目标是二级索引记录，必要时还会访问聚簇索引")
+      .field("lock_scope", "record")
+      .field("record_kind", record_kind == nullptr ? "索引记录" : record_kind)
+      .field("waiting_transaction_id", wzg_lock_trx_id_text(waiting_trx))
+      .field("blocking_transaction_id", wzg_lock_trx_id_text(blocking_trx))
+      .field("waiting_lock_mode", wzg_lock_mode_text(mode))
+      .field("waiting_lock_mode_meaning", wzg_lock_mode_meaning(mode))
+      .field("waiting_lock_type", wzg_lock_record_type_text(gap_mode))
+      .field("waiting_lock_type_cn", wzg_lock_record_type_cn(gap_mode))
+      .field("waiting_lock_type_meaning", wzg_lock_record_type_meaning(gap_mode))
+      .field("waiting_lock_components",
+             wzg_lock_record_components(mode, gap_mode))
+      .field("lock_target", wzg_lock_record_target(block, heap_no))
+      .field("waiting_record_values", wzg_lock_record_values(rec, index, offsets))
+      .field("why_wait", wzg_lock_wait_why(mode, gap_mode))
+      .field("what_happens_next",
+             "当前事务挂起等待；如果阻塞事务提交或回滚则继续，如果形成等待环则可能触发死锁检测")
+      .field("note",
+             "这里记录的是进入 InnoDB 锁等待时的等待边；最终是否超时或死锁由后续锁等待和死锁检测逻辑决定")
+      .emit();
+}
+
+}  // namespace
 
 /** A static class for reporting notifications about deadlocks */
 class Deadlock_notifier {
@@ -257,7 +1165,9 @@ bool lock_clust_rec_cons_read_sees(
 
   trx_id_t trx_id = row_get_rec_trx_id(rec, index, offsets);
 
-  return (view->changes_visible(trx_id, index->table->name));
+  const bool visible = view->changes_visible(trx_id, index->table->name);
+  wzg_emit_mvcc_clust_version_check(rec, index, offsets, trx_id, view, visible);
+  return (visible);
 }
 
 /** Checks that a non-clustered index record is seen in a consistent read.
@@ -297,7 +1207,9 @@ bool lock_sec_rec_cons_read_sees(
 
   ut_ad(max_trx_id > 0);
 
-  return (view->sees(max_trx_id));
+  const bool visible = view->sees(max_trx_id);
+  wzg_emit_mvcc_sec_version_check(rec, index, max_trx_id, view, visible);
+  return (visible);
 }
 
 /** Creates the lock system at database start. */
@@ -1944,6 +2856,8 @@ lock, but not the lock->trx->mutex.
 static void lock_grant(lock_t *lock) {
   ut_ad(locksys::owns_lock_shard(lock));
   ut_ad(!trx_mutex_own(lock->trx));
+
+  wzg_emit_innodb_lock_granted_after_wait(lock);
 
   trx_mutex_enter(lock->trx);
 
@@ -3637,6 +4551,8 @@ dberr_t lock_table(ulint flags, /*!< in: if BTR_NO_LOCKING_FLAG bit is set,
   trx_mutex_exit(trx);
 
   ut_ad(err == DB_SUCCESS || err == DB_LOCK_WAIT || err == DB_DEADLOCK);
+  wzg_emit_innodb_table_lock_request(table, mode, trx, err);
+  wzg_emit_innodb_table_lock_wait(table, mode, trx, wait_for, err);
   return (err);
 }
 
@@ -5503,6 +6419,10 @@ dberr_t lock_sec_rec_read_check_and_lock(
   ut_ad(err == DB_SUCCESS || err == DB_SUCCESS_LOCKED_REC ||
         err == DB_LOCK_WAIT || err == DB_DEADLOCK || err == DB_SKIP_LOCKED ||
         err == DB_LOCK_NOWAIT);
+  wzg_emit_innodb_record_lock_request("二级索引记录", block, rec, offsets,
+                                      heap_no, index, mode, gap_mode, thr, err);
+  wzg_emit_innodb_record_lock_wait("二级索引记录", block, rec, offsets, heap_no,
+                                   index, mode, gap_mode, thr, err);
   return (err);
 }
 
@@ -5555,6 +6475,10 @@ dberr_t lock_clust_rec_read_check_and_lock(
   ut_ad(err == DB_SUCCESS || err == DB_SUCCESS_LOCKED_REC ||
         err == DB_LOCK_WAIT || err == DB_DEADLOCK || err == DB_SKIP_LOCKED ||
         err == DB_LOCK_NOWAIT);
+  wzg_emit_innodb_record_lock_request("聚簇索引记录", block, rec, offsets,
+                                      heap_no, index, mode, gap_mode, thr, err);
+  wzg_emit_innodb_record_lock_wait("聚簇索引记录", block, rec, offsets, heap_no,
+                                   index, mode, gap_mode, thr, err);
   return (err);
 }
 /** Checks if locks of other transactions prevent an immediate read, or passing
@@ -5833,6 +6757,10 @@ void lock_cancel_waiting_and_release(trx_t *trx) {
   const auto lock = trx->lock.wait_lock.load();
   ut_ad(locksys::owns_lock_shard(lock));
 
+  if (trx->error_state == DB_LOCK_WAIT_TIMEOUT) {
+    wzg_emit_innodb_lock_wait_timeout(trx, lock);
+  }
+
   if (lock_get_type_low(lock) == LOCK_REC) {
     lock_rec_dequeue_from_page(lock);
   } else {
@@ -5926,6 +6854,10 @@ void lock_trx_release_locks(trx_t *trx) /*!< in/out: transaction */
   }
 
   ut_ad(!trx_is_referenced(trx));
+  trx_mutex_exit(trx);
+
+  trx_mutex_enter(trx);
+  wzg_emit_innodb_lock_release_transaction(trx, "transaction_commit_or_rollback");
   trx_mutex_exit(trx);
 
   while (!locksys::try_release_all_locks(trx)) {
@@ -6155,9 +7087,194 @@ void Deadlock_notifier::print_title(size_t pos_on_cycle, const char *title) {
   print(buff.str().c_str());
 }
 
+namespace {
+
+THD *wzg_deadlock_event_thd(const ut::vector<const trx_t *> &trxs_on_cycle,
+                            const trx_t *victim_trx) {
+  if (victim_trx != nullptr && victim_trx->mysql_thd != nullptr) {
+    return victim_trx->mysql_thd;
+  }
+
+  for (const trx_t *trx : trxs_on_cycle) {
+    if (trx != nullptr && trx->mysql_thd != nullptr) return trx->mysql_thd;
+  }
+
+  return current_thd;
+}
+
+const dict_table_t *wzg_lock_table_from_lock(const lock_t *lock) {
+  if (lock == nullptr) return nullptr;
+  if (lock->is_record_lock()) {
+    return lock->index == nullptr ? nullptr : lock->index->table;
+  }
+  return lock->tab_lock.table;
+}
+
+std::string wzg_deadlock_record_target(const lock_t *lock) {
+  if (lock == nullptr || !lock->is_record_lock()) return "无";
+
+  const ulint heap_no = lock_rec_find_set_bit(lock);
+  std::ostringstream out;
+  out << "space_id=" << lock->rec_lock.page_id.space()
+      << "，page_no=" << lock->rec_lock.page_id.page_no()
+      << "，heap_no="
+      << (heap_no == ULINT_UNDEFINED ? std::string("未知")
+                                      : std::to_string(heap_no));
+  if (heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    out << "，supremum=true";
+  }
+  return out.str();
+}
+
+std::string wzg_deadlock_lock_summary(const lock_t *lock) {
+  if (lock == nullptr) return "没有锁对象";
+
+  std::ostringstream out;
+  if (lock->is_record_lock()) {
+    const ulint gap_mode =
+        lock->type_mode &
+        (LOCK_GAP | LOCK_REC_NOT_GAP | LOCK_INSERT_INTENTION);
+    out << "索引记录锁"
+        << "，table=" << wzg_lock_table_name(wzg_lock_table_from_lock(lock))
+        << "，index=" << wzg_lock_index_name(lock->index)
+        << "，lock_mode=" << wzg_lock_mode_text(lock->mode())
+        << "，lock_type=" << wzg_lock_record_type_text(gap_mode)
+        << "，lock_type_cn=" << wzg_lock_record_type_cn(gap_mode)
+        << "，lock_components="
+        << wzg_lock_record_components(lock->mode(), gap_mode)
+        << "，target=" << wzg_deadlock_record_target(lock);
+  } else {
+    out << "表级锁"
+        << "，table=" << wzg_lock_table_name(lock->tab_lock.table)
+        << "，index=无"
+        << "，lock_mode=" << wzg_lock_mode_text(lock->mode())
+        << "，lock_type=" << wzg_table_lock_type_text(lock->mode())
+        << "，lock_type_cn=" << wzg_table_lock_type_cn(lock->mode())
+        << "，lock_type_meaning="
+        << wzg_table_lock_type_meaning(lock->mode())
+        << "，target=" << wzg_lock_table_name(lock->tab_lock.table);
+  }
+
+  out << "，status=" << (lock->is_waiting() ? "WAITING" : "GRANTED");
+  return out.str();
+}
+
+bool wzg_deadlock_should_log(THD *thd,
+                             const ut::vector<const trx_t *> &trxs_on_cycle) {
+  for (const trx_t *trx : trxs_on_cycle) {
+    if (trx == nullptr || trx->lock.wait_lock == nullptr) continue;
+    if (wzg_lock_should_log(thd, wzg_lock_table_from_lock(trx->lock.wait_lock))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+std::string wzg_deadlock_cycle_text(
+    const ut::vector<const trx_t *> &trxs_on_cycle) {
+  if (trxs_on_cycle.empty()) return "没有等待环事务";
+
+  std::string value;
+  for (size_t i = 0; i < trxs_on_cycle.size(); ++i) {
+    const trx_t *waiting_trx = trxs_on_cycle[i];
+    const trx_t *blocking_trx = trxs_on_cycle[(i + 1) % trxs_on_cycle.size()];
+
+    if (!value.empty()) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". trx ");
+    value.append(wzg_lock_trx_id_text(waiting_trx));
+    value.append(" 正在等待 trx ");
+    value.append(wzg_lock_trx_id_text(blocking_trx));
+    value.append(" 持有的锁");
+  }
+
+  return value;
+}
+
+std::string wzg_deadlock_cycle_details(
+    const ut::vector<const trx_t *> &trxs_on_cycle) {
+  if (trxs_on_cycle.empty()) return "没有等待环明细";
+
+  std::string value;
+  for (size_t i = 0; i < trxs_on_cycle.size(); ++i) {
+    const trx_t *waiting_trx = trxs_on_cycle[i];
+    const trx_t *blocking_trx = trxs_on_cycle[(i + 1) % trxs_on_cycle.size()];
+    const lock_t *waiting_lock =
+        waiting_trx == nullptr ? nullptr : waiting_trx->lock.wait_lock.load();
+    const lock_t *blocking_lock =
+        waiting_lock == nullptr || blocking_trx == nullptr
+            ? nullptr
+            : lock_has_to_wait_in_queue(waiting_lock, blocking_trx);
+
+    if (!value.empty()) value.append("；");
+    value.append(std::to_string(i + 1));
+    value.append(". waiting_trx=");
+    value.append(wzg_lock_trx_id_text(waiting_trx));
+    value.append("，waiting_for=");
+    value.append(wzg_deadlock_lock_summary(waiting_lock));
+    value.append("，blocking_trx=");
+    value.append(wzg_lock_trx_id_text(blocking_trx));
+    value.append("，blocking_lock=");
+    value.append(wzg_deadlock_lock_summary(blocking_lock));
+  }
+
+  return value;
+}
+
+std::string wzg_deadlock_tables(
+    const ut::vector<const trx_t *> &trxs_on_cycle) {
+  std::string value;
+  for (const trx_t *trx : trxs_on_cycle) {
+    if (trx == nullptr || trx->lock.wait_lock == nullptr) continue;
+    const std::string table =
+        wzg_lock_table_name(wzg_lock_table_from_lock(trx->lock.wait_lock));
+    if (table == "无" || value.find(table) != std::string::npos) continue;
+    if (!value.empty()) value.append(", ");
+    value.append(table);
+  }
+
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_deadlock_victim_position(
+    const ut::vector<const trx_t *> &trxs_on_cycle, const trx_t *victim_trx) {
+  const auto victim_it =
+      std::find(trxs_on_cycle.begin(), trxs_on_cycle.end(), victim_trx);
+  if (victim_it == trxs_on_cycle.end()) return "未知";
+  return std::to_string(std::distance(trxs_on_cycle.begin(), victim_it) + 1);
+}
+
+void wzg_emit_innodb_deadlock_detected(
+    const ut::vector<const trx_t *> &trxs_on_cycle, const trx_t *victim_trx) {
+  THD *thd = wzg_deadlock_event_thd(trxs_on_cycle, victim_trx);
+  if (!wzg_deadlock_should_log(thd, trxs_on_cycle)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.deadlock_detected")
+      .message("InnoDB 检测到锁等待形成环路，决定回滚其中一个事务打破死锁")
+      .field("cycle_transaction_count", std::to_string(trxs_on_cycle.size()))
+      .field("tables", wzg_deadlock_tables(trxs_on_cycle))
+      .field("victim_transaction_id", wzg_lock_trx_id_text(victim_trx))
+      .field("victim_position",
+             wzg_deadlock_victim_position(trxs_on_cycle, victim_trx))
+      .field("deadlock_cycle", wzg_deadlock_cycle_text(trxs_on_cycle))
+      .field("cycle_details", wzg_deadlock_cycle_details(trxs_on_cycle))
+      .field("victim_reason",
+             "InnoDB 已确认这些事务互相等待形成闭环；回滚 victim_transaction_id 可以释放它持有的锁，让等待环断开")
+      .field("what_happens_next",
+             "被选中的事务返回死锁错误并回滚；其他事务会在锁释放后继续等待、被唤醒或重新检查锁")
+      .field("note",
+             "这里记录的是死锁检测器看到的真实等待锁和阻塞锁；记录锁目标用 space/page/heap 定位，具体行值以前面的 lock_request/lock_wait 为准")
+      .emit();
+}
+
+}  // namespace
+
 void Deadlock_notifier::notify(const ut::vector<const trx_t *> &trxs_on_cycle,
                                const trx_t *victim_trx) {
   ut_ad(locksys::owns_exclusive_global_latch());
+
+  wzg_emit_innodb_deadlock_detected(trxs_on_cycle, victim_trx);
 
   start_print();
   const auto n = trxs_on_cycle.size();

@@ -54,6 +54,78 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "current_thd.h"
 #include "debug_sync.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+namespace {
+
+std::string wzg_undo_mod_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_undo_mod_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+bool wzg_undo_mod_should_log(const undo_node_t *node) {
+  const THD *thd =
+      node != nullptr && node->trx.mysql_thd != nullptr ? node->trx.mysql_thd
+                                                       : current_thd;
+  if (node == nullptr || thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || thd->thread_id() == 0 ||
+      node->table == nullptr || node->table->name.m_name == nullptr) {
+    return false;
+  }
+  const std::string_view name(node->table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+void wzg_emit_rollback_delete_mark(const undo_node_t *node,
+                                   const dict_index_t *index,
+                                   dberr_t err) {
+  if (node == nullptr || node->rec_type != TRX_UNDO_DEL_MARK_REC ||
+      !wzg_undo_mod_should_log(node)) {
+    return;
+  }
+
+  THD *thd =
+      node->trx.mysql_thd != nullptr ? node->trx.mysql_thd : current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.rollback_delete_mark")
+      .message("事务回滚 DELETE，InnoDB 根据 undo 记录撤销聚簇索引记录的删除标记")
+      .field("transaction_id",
+             std::to_string(static_cast<unsigned long long>(
+                 trx_get_id_for_print(&node->trx))))
+      .field("table", wzg_undo_mod_table_name(node->table))
+      .field("index", wzg_undo_mod_index_name(index))
+      .field("undo_record_type", "TRX_UNDO_DEL_MARK_REC")
+      .field("undo_no", static_cast<std::uint64_t>(node->undo_no))
+      .field("roll_ptr", static_cast<std::uint64_t>(node->roll_ptr))
+      .field("new_trx_id_to_restore",
+             static_cast<std::uint64_t>(node->new_trx_id))
+      .field("rollback_result", err == DB_SUCCESS ? "DB_SUCCESS" : "DB_ERROR")
+      .field("internal_change",
+             "根据 delete undo 找到原聚簇索引记录，把 deleted flag 从 true 改回 false，并恢复记录需要的事务系统字段")
+      .field("internal_meaning",
+             "回滚 DELETE 不是重新 INSERT 一条新行，而是在原索引记录上撤销删除标记，让这条旧记录重新成为可见版本")
+      .field("used_undo",
+             "undo 记录保存了删除前版本和系统字段，rollback 依靠它知道要恢复哪条记录")
+      .field("next_step",
+             "继续处理这条 undo 相关的二级索引记录，最后事务结束时释放锁")
+      .emit();
+}
+
+}  // namespace
 
 /* Considerations on undoing a modify operation.
 (1) Undoing a delete marking: all index records should be found. Some of
@@ -340,6 +412,7 @@ introduced where a call to log_free_check() is bypassed. */
   }
 
   ut_ad(rec_get_trx_id(pcur->get_rec(), index) == node->new_trx_id);
+  wzg_emit_rollback_delete_mark(node, index, err);
 
   pcur->commit_specify_mtr(&mtr);
 

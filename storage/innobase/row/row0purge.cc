@@ -64,6 +64,76 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0rseg.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+namespace {
+
+std::string wzg_purge_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_purge_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+bool wzg_purge_should_log(const purge_node_t *node) {
+  if (node == nullptr || node->table == nullptr ||
+      node->table->name.m_name == nullptr || dict_table_is_system(node->table->id) ||
+      dict_table_is_sdi(node->table->id)) {
+    return false;
+  }
+  const std::string_view name(node->table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+void wzg_emit_purge_delete_record(const purge_node_t *node,
+                                  const dict_index_t *index,
+                                  const rec_t *rec, bool success) {
+  if (!wzg_purge_should_log(node) || node->rec_type != TRX_UNDO_DEL_MARK_REC) {
+    return;
+  }
+
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.purge_delete_record")
+      .message("purge 后台线程物理清理已提交 DELETE 留下的 delete-marked 记录")
+      .field("purge_thread", "true")
+      .field("deleting_transaction_id",
+             static_cast<std::uint64_t>(node->trx_id))
+      .field("table", wzg_purge_table_name(node->table))
+      .field("index", wzg_purge_index_name(index))
+      .field("undo_record_type", "TRX_UNDO_DEL_MARK_REC")
+      .field("undo_no", static_cast<std::uint64_t>(node->undo_no))
+      .field("roll_ptr", static_cast<std::uint64_t>(node->roll_ptr))
+      .field("record_space_id",
+             index == nullptr ? 0 : static_cast<std::uint64_t>(index->space))
+      .field("record_heap_no",
+             rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(rec)))
+      .field("purge_result", success ? "removed_or_already_gone" : "postponed")
+      .field("internal_change",
+             success
+                 ? "从聚簇索引 B+Tree 页中物理删除这条 delete-marked 记录，相关二级索引记录也会被 purge 尝试清理"
+                 : "本次没有物理删除，可能因为记录后来又被修改、页结构需要重试或空间条件不满足")
+      .field("internal_meaning",
+             "COMMIT 后 DELETE 记录不会立刻消失；只有当 purge 判断没有 ReadView 还需要旧版本时，才真正从索引页清掉")
+      .field("relationship_with_mvcc",
+             "purge 是 MVCC 版本链的垃圾回收；太早清理会破坏老事务快照读")
+      .field("used_later_by",
+             "清理后 B+Tree 页空间可复用，undo 历史链也可以继续向前推进")
+      .emit();
+}
+
+}  // namespace
 
 /*************************************************************************
 IMPORTANT NOTE: Any operation that generates redo MUST check that there
@@ -218,6 +288,8 @@ static bool row_purge_reposition_pcur(
         ut_error;
     }
   }
+
+  wzg_emit_purge_delete_record(node, index, rec, success);
 
 func_exit:
   if (heap) {

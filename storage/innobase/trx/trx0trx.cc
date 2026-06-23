@@ -68,8 +68,116 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0vec.h"
 
 #include "my_dbug.h"
+#include "current_thd.h"
 #include "mysql/plugin.h"
 #include "sql/clone_handler.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+#include <string>
+
+namespace {
+
+bool wzg_trx_should_log(trx_t *trx) {
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  return thd != nullptr && thd->query().str != nullptr &&
+         thd->query().length > 0 && thd->thread_id() != 0;
+}
+
+std::string wzg_trx_id_text(const trx_t *trx) {
+  if (trx == nullptr) return "无";
+  return std::to_string(
+      static_cast<unsigned long long>(trx_get_id_for_print(trx)));
+}
+
+const char *wzg_trx_isolation_text(const trx_t *trx) {
+  if (trx == nullptr) return "未知";
+  switch (trx->isolation_level) {
+    case TRX_ISO_READ_UNCOMMITTED:
+      return "READ UNCOMMITTED";
+    case TRX_ISO_READ_COMMITTED:
+      return "READ COMMITTED";
+    case TRX_ISO_REPEATABLE_READ:
+      return "REPEATABLE READ";
+    case TRX_ISO_SERIALIZABLE:
+      return "SERIALIZABLE";
+    default:
+      return "未知";
+  }
+}
+
+const char *wzg_trx_state_text(trx_state_t state) {
+  switch (state) {
+    case TRX_STATE_NOT_STARTED:
+      return "TRX_STATE_NOT_STARTED";
+    case TRX_STATE_FORCED_ROLLBACK:
+      return "TRX_STATE_FORCED_ROLLBACK";
+    case TRX_STATE_ACTIVE:
+      return "TRX_STATE_ACTIVE";
+    case TRX_STATE_PREPARED:
+      return "TRX_STATE_PREPARED";
+    case TRX_STATE_COMMITTED_IN_MEMORY:
+      return "TRX_STATE_COMMITTED_IN_MEMORY";
+    default:
+      return "UNKNOWN_TRX_STATE";
+  }
+}
+
+void wzg_emit_trx_prepare_start(trx_t *trx, bool has_redo_undo,
+                                bool has_temp_undo) {
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  if (!wzg_trx_should_log(trx)) return;
+
+  WZG_PROBE_EVENT(thd, "transaction.two_phase_commit_prepare_start")
+      .message("InnoDB 开始 prepare 事务，把事务先固定成可恢复的 prepared 状态")
+      .field("stage", "PREPARE_START")
+      .field("transaction_id", wzg_trx_id_text(trx))
+      .field("state_before_prepare",
+             wzg_trx_state_text(trx->state.load(std::memory_order_relaxed)))
+      .field("isolation_level", wzg_trx_isolation_text(trx))
+      .field("has_redo_undo", has_redo_undo)
+      .field("has_temp_undo", has_temp_undo)
+      .field("what_prepare_will_do",
+             "把本事务的 undo 段从 ACTIVE 标成 PREPARED，并写入 redo；这样崩溃恢复时能判断这个事务已经到达提交前的安全点")
+      .field("why_prepare",
+             "两阶段提交不能先直接 commit InnoDB；必须先让 InnoDB 进入 prepared 状态，然后 Server 才能写 binlog。如果 binlog 后面失败，prepared 事务还能回滚；如果 binlog 成功但崩溃，恢复时可以继续提交")
+      .field("next_step",
+             "修改 undo log header 状态并提交 mini-transaction，得到 prepare LSN")
+      .emit();
+}
+
+void wzg_emit_trx_prepare_finish(trx_t *trx, lsn_t prepare_lsn,
+                                 bool released_gap_locks) {
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  if (!wzg_trx_should_log(trx)) return;
+
+  WZG_PROBE_EVENT(thd, "transaction.two_phase_commit_prepare_finish")
+      .message("InnoDB prepare 完成，事务已经从 ACTIVE 进入 PREPARED 状态")
+      .field("stage", "PREPARE_FINISH")
+      .field("transaction_id", wzg_trx_id_text(trx))
+      .field("state_after_prepare",
+             wzg_trx_state_text(trx->state.load(std::memory_order_relaxed)))
+      .field("prepare_lsn", static_cast<std::uint64_t>(prepare_lsn))
+      .field("prepare_lsn_meaning",
+             prepare_lsn > 0
+                 ? "这个 LSN 是 undo 状态变成 PREPARED 时产生的 redo 位置；后续需要保证相关 redo 可恢复"
+                 : "本次没有产生 redo prepare LSN，通常表示没有需要 redo 保护的 undo 段")
+      .field("released_gap_locks", released_gap_locks)
+      .field("released_gap_locks_meaning",
+             released_gap_locks
+                 ? "隔离级别允许 prepare 后释放部分 gap/read locks，减少等待"
+                 : "prepare 后没有释放 gap/read locks，事务继续持有需要的锁直到 commit/rollback")
+      .field("why_this_matters",
+             "此刻 InnoDB 还没有真正提交；它只是承诺事务可以安全地提交或回滚，等待 Server 把 binlog 写成功后再进入 commit stage")
+      .field("next_step",
+             "Server 层进入 binlog group commit，写入并按配置同步 binlog")
+      .emit();
+}
+
+}  // namespace
 
 static const ulint MAX_DETAILED_ERROR_LEN = 256;
 
@@ -3001,11 +3109,17 @@ static void trx_prepare(trx_t *trx) {
 
   DBUG_EXECUTE_IF("ib_trx_crash_during_xa_prepare_step", DBUG_SUICIDE(););
 
-  if (trx->rsegs.m_redo.rseg != nullptr && trx_is_redo_rseg_updated(trx)) {
+  const bool has_redo_undo =
+      trx->rsegs.m_redo.rseg != nullptr && trx_is_redo_rseg_updated(trx);
+  const bool has_temp_undo =
+      trx->rsegs.m_noredo.rseg != nullptr && trx_is_temp_rseg_updated(trx);
+  wzg_emit_trx_prepare_start(trx, has_redo_undo, has_temp_undo);
+
+  if (has_redo_undo) {
     lsn = trx_prepare_low(trx, &trx->rsegs.m_redo, false);
   }
 
-  if (trx->rsegs.m_noredo.rseg != nullptr && trx_is_temp_rseg_updated(trx)) {
+  if (has_temp_undo) {
     trx_prepare_low(trx, &trx->rsegs.m_noredo, true);
   }
 
@@ -3016,6 +3130,8 @@ static void trx_prepare(trx_t *trx) {
   trx_sys->n_prepared_trx++;
   trx_sys_mutex_exit();
 
+  const bool releases_gap_locks = trx->releases_gap_locks_at_prepare();
+
   /* Force isolation level to RC and release GAP locks
   for test purpose. */
   DBUG_EXECUTE_IF("ib_force_release_gap_lock_prepare",
@@ -3023,13 +3139,15 @@ static void trx_prepare(trx_t *trx) {
 
   /* Release read locks after PREPARE for READ COMMITTED
   and lower isolation. */
-  if (trx->releases_gap_locks_at_prepare()) {
+  if (releases_gap_locks) {
     /* Stop inheriting GAP locks. */
     trx->skip_lock_inheritance = true;
 
     /* Release only GAP locks for now. */
     lock_trx_release_read_locks(trx, true);
   }
+
+  wzg_emit_trx_prepare_finish(trx, lsn, releases_gap_locks);
 
   if (lsn > 0) {
     trx_flush_logs(trx, lsn);
