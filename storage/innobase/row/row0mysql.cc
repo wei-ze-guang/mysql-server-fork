@@ -176,7 +176,8 @@ namespace {
 bool wzg_row_should_log_autoinc(const dict_table_t *table) {
   THD *thd = current_thd;
   if (thd == nullptr || thd->query().str == nullptr ||
-      thd->query().length == 0 || table == nullptr ||
+      thd->query().length == 0 || wzg_probe::raw_sql().empty() ||
+      table == nullptr ||
       table->name.m_name == nullptr) {
     return false;
   }

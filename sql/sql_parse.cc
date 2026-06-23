@@ -5388,6 +5388,59 @@ static const char *wzg_query_structure(std::uint64_t query_block_count) {
   return "主查询包含子查询或其他嵌套查询块";
 }
 
+static const char *wzg_parser_next_step(enum_sql_command command) {
+  switch (command) {
+    case SQLCOM_SELECT:
+    case SQLCOM_INSERT_SELECT:
+    case SQLCOM_REPLACE_SELECT:
+    case SQLCOM_UPDATE:
+    case SQLCOM_UPDATE_MULTI:
+    case SQLCOM_DELETE:
+    case SQLCOM_DELETE_MULTI:
+      return "交给 resolver 和 optimizer 继续绑定名字、检查语义并选择访问路径";
+    case SQLCOM_INSERT:
+    case SQLCOM_REPLACE:
+    case SQLCOM_CREATE_TABLE:
+    case SQLCOM_ALTER_TABLE:
+    case SQLCOM_DROP_TABLE:
+    case SQLCOM_CREATE_DB:
+    case SQLCOM_ALTER_DB:
+    case SQLCOM_DROP_DB:
+    case SQLCOM_CREATE_INDEX:
+    case SQLCOM_DROP_INDEX:
+    case SQLCOM_SET_OPTION:
+    case SQLCOM_BEGIN:
+    case SQLCOM_COMMIT:
+    case SQLCOM_ROLLBACK:
+    case SQLCOM_ROLLBACK_TO_SAVEPOINT:
+    case SQLCOM_SAVEPOINT:
+    case SQLCOM_RELEASE_SAVEPOINT:
+      return "交给对应 SQL 命令处理逻辑继续执行";
+    default:
+      return "交给后续 SQL 命令分发逻辑决定具体处理路径";
+  }
+}
+
+static const char *wzg_parser_finish_impact(enum_sql_command command,
+                                            std::uint64_t query_block_count) {
+  if (query_block_count > 0)
+    return "后续阶段可以基于解析出的查询块继续做名字解析、语义检查和执行计划选择";
+
+  switch (command) {
+    case SQLCOM_SET_OPTION:
+      return "后续阶段将处理会话或系统变量设置，不需要查询块优化";
+    case SQLCOM_BEGIN:
+    case SQLCOM_COMMIT:
+    case SQLCOM_ROLLBACK:
+    case SQLCOM_ROLLBACK_TO_SAVEPOINT:
+    case SQLCOM_SAVEPOINT:
+    case SQLCOM_RELEASE_SAVEPOINT:
+      return "后续阶段将处理事务控制动作，不需要查询块优化";
+    default:
+      return "后续阶段将根据已识别的 SQL 命令类型进入对应处理逻辑";
+  }
+}
+
 /*
   When you modify dispatch_sql_command(), you may need to modify
   mysql_test_parse_for_slave() in this same file.
@@ -5413,13 +5466,35 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state) {
   thd->reset_rewritten_query();
   lex_start(thd);
 
-  WZG_PROBE_EVENT(thd, "parser.start")
-      .message("开始解析 SQL，服务端准备检查语法并理解语句结构")
-      .field("parse_result", "started")
-      .field("statement_type", "待识别")
-      .field("next_step", "检查 SQL 语法，并生成后续阶段可使用的内部结构")
-      .field("note", "解析器负责读懂 SQL，不负责真正读取表数据或决定最终执行顺序")
-      .emit();
+  const bool wzg_should_log_parser = !wzg_probe::raw_sql().empty();
+
+  if (wzg_should_log_parser) {
+    WZG_PROBE_EVENT(thd, "parser.start")
+        .message("开始解析 SQL，服务端准备检查语法并理解语句结构")
+        .field("actor.component", "parser")
+        .field("actor.subsystem", "sql_parser")
+        .field("actor.role", "把 SQL 文本转换成 MySQL 内部语句结构")
+        .field("action.name", "parse_sql")
+        .field("action.phase", "start")
+        .field("action.summary", "读取当前连接收到的 SQL 文本并准备执行语法分析")
+        .field("object.type", "query")
+        .field("object.source", "THD::query")
+        .field("runtime.raw_sql_length",
+               static_cast<std::uint64_t>(thd->query().length))
+        .field("runtime.has_input_sql", thd->query().str != nullptr &&
+                                            thd->query().length > 0)
+        .field("runtime.digest_enabled", get_max_digest_length() != 0)
+        .field("runtime.parse_result", "started")
+        .field("decision.reason", "客户端命令已进入 SQL 文本处理路径，需要先确认语法并建立内部结构")
+        .field("decision.result", "开始调用解析前插件和 SQL parser")
+        .field("decision.impact", "解析成功后才会进入后续语义检查、优化或命令执行阶段")
+        .field("next_step", "检查 SQL 语法，并生成后续阶段可使用的内部结构")
+        .field("explain_zh.parser_scope",
+               "解析器负责读懂 SQL，不负责真正读取表数据或决定最终执行顺序")
+        .field("debug.source_function", "dispatch_sql_command")
+        .field("debug.parser_state_ready", parser_state != nullptr)
+        .emit();
+  }
 
   thd->m_parser_state = parser_state;
   invoke_pre_parse_rewrite_plugins(thd);
@@ -5444,38 +5519,77 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state) {
     qlen = found_semicolon ? (found_semicolon - thd->query().str)
                            : thd->query().length;
 
-    const std::uint64_t query_block_count = wzg_query_block_count(thd->lex);
-    if (!err) {
+    const std::uint64_t query_block_count =
+        wzg_should_log_parser ? wzg_query_block_count(thd->lex) : 0;
+    if (!err && wzg_should_log_parser) {
       WZG_PROBE_EVENT(thd, "parser.finish")
           .message(query_block_count > 1
                        ? "SQL 语法解析完成，发现主查询中包含子查询结构"
                        : "SQL 语法解析完成，服务端已经理解这条语句要做什么")
           .sql_command(get_sql_command_string(thd->lex->sql_command))
-          .field("parse_result", "success")
+          .field("actor.component", "parser")
+          .field("actor.subsystem", "sql_parser")
+          .field("actor.role", "把 SQL 文本转换成 MySQL 内部语句结构")
+          .field("action.name", "parse_sql")
+          .field("action.phase", "finish")
+          .field("action.summary", "SQL parser 已识别语句类型并生成 LEX/查询块结构")
+          .field("object.type", query_block_count > 0 ? "query" : "statement")
+          .field("object.source", "LEX")
+          .field("runtime.parse_result", "success")
+          .field("runtime.sql_command",
+                 get_sql_command_string(thd->lex->sql_command))
           .field("statement_type", wzg_statement_type(thd->lex->sql_command))
           .field("statement_summary",
                  wzg_statement_summary(thd->lex->sql_command))
-          .field("has_subquery", query_block_count > 1)
-          .field("query_block_count", query_block_count)
-          .field("query_structure", wzg_query_structure(query_block_count))
-          .field("has_multiple_statements", found_semicolon != nullptr)
-          .field("has_comment", parser_state->has_comment())
-          .field("current_statement_length", static_cast<std::uint64_t>(qlen))
-          .field("parser_output",
+          .field("runtime.has_subquery", query_block_count > 1)
+          .field("runtime.query_block_count", query_block_count)
+          .field("runtime.query_structure",
+                 wzg_query_structure(query_block_count))
+          .field("runtime.has_multiple_statements", found_semicolon != nullptr)
+          .field("runtime.has_comment", parser_state->has_comment())
+          .field("runtime.current_statement_length",
+                 static_cast<std::uint64_t>(qlen))
+          .field("decision.result",
                  query_block_count > 1
                      ? "已生成主查询和子查询的内部结构，供后续优化器使用"
                      : "已生成当前语句的内部结构，供后续阶段使用")
-          .field("next_step",
-                 "进入优化器或执行阶段，由后续阶段决定改写方式、表访问顺序和索引选择")
-          .field("note", "解析器识别语句结构，但不最终决定哪一部分先执行")
+          .field("decision.impact",
+                 wzg_parser_finish_impact(thd->lex->sql_command,
+                                          query_block_count))
+          .field("next_step", wzg_parser_next_step(thd->lex->sql_command))
+          .field("explain_zh.parser_scope",
+                 "解析器识别语句结构，但不最终决定索引、表访问顺序或子查询执行顺序")
+          .field("explain_zh.query_block_count",
+                 "query_block_count 来自 LEX 的查询块链表，用来判断是否存在嵌套查询结构")
+          .field("debug.source_function", "dispatch_sql_command")
+          .field("debug.found_semicolon", found_semicolon != nullptr)
           .emit();
-    } else {
+    } else if (wzg_should_log_parser) {
       WZG_PROBE_EVENT(thd, "parser.error")
           .message("SQL 语法解析失败，服务端无法理解这条语句")
-          .field("parse_result", "error")
-          .field("statement_type", "未知")
+          .field("actor.component", "parser")
+          .field("actor.subsystem", "sql_parser")
+          .field("actor.role", "检查 SQL 文本是否符合 MySQL 语法")
+          .field("action.name", "parse_sql")
+          .field("action.phase", "error")
+          .field("action.summary", "SQL parser 返回错误，当前语句没有可继续执行的正常解析结果")
+          .field("object.type", "query")
+          .field("object.source", "THD::query")
+          .field("runtime.parse_result", "error")
+          .field("runtime.raw_sql_length",
+                 static_cast<std::uint64_t>(thd->query().length))
+          .field("runtime.mysql_errno",
+                 static_cast<std::uint64_t>(thd->get_stmt_da()->mysql_errno()))
+          .field("runtime.warning_count",
+                 static_cast<std::uint64_t>(
+                     thd->get_stmt_da()->current_statement_cond_count()))
+          .field("decision.reason", "语法分析或解析插件阶段报告错误，无法生成正常语句结构")
+          .field("decision.result", "停止当前 SQL 的正常解析执行链路")
+          .field("decision.impact", "不会进入 optimizer/executor 的正常主流程")
           .field("next_step", "返回语法错误给客户端，不进入正常执行阶段")
-          .field("note", "这一步失败后不会进入优化器和执行器主流程")
+          .field("explain_zh.parser_scope",
+                 "解析失败说明服务端还没有得到可靠的语句结构，因此不能继续按正常 SQL 执行")
+          .field("debug.source_function", "dispatch_sql_command")
           .emit();
     }
     /*

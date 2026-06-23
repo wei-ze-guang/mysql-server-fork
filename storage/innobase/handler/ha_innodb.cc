@@ -320,7 +320,8 @@ namespace {
 
 bool wzg_innodb_should_log(const TABLE *table, THD *thd) {
   if (thd == nullptr || thd->query().str == nullptr ||
-      thd->query().length == 0 || table == nullptr || table->s == nullptr)
+      thd->query().length == 0 || wzg_probe::raw_sql().empty() ||
+      table == nullptr || table->s == nullptr)
     return false;
   if (table->s->db.str == nullptr) return true;
 
@@ -331,7 +332,7 @@ bool wzg_innodb_should_log(const TABLE *table, THD *thd) {
 
 bool wzg_innodb_should_log_thd(THD *thd) {
   return thd != nullptr && thd->query().str != nullptr &&
-         thd->query().length > 0;
+         thd->query().length > 0 && !wzg_probe::raw_sql().empty();
 }
 
 std::string wzg_innodb_table_name(const TABLE *table) {

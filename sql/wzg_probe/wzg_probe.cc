@@ -12,6 +12,22 @@ namespace {
 
 constexpr std::size_t kMaxQueryBytes = 4096;
 
+bool starts_with_event_name(const std::string &value, const char *prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
+
+bool is_sql_chain_event(const std::string &event_name) {
+  return starts_with_event_name(event_name, "sql.") ||
+         starts_with_event_name(event_name, "parser.") ||
+         starts_with_event_name(event_name, "resolver.") ||
+         starts_with_event_name(event_name, "optimizer.") ||
+         starts_with_event_name(event_name, "executor.") ||
+         starts_with_event_name(event_name, "handler.") ||
+         starts_with_event_name(event_name, "server.") ||
+         starts_with_event_name(event_name, "transaction.") ||
+         starts_with_event_name(event_name, "innodb.");
+}
+
 std::string copy_lex_cstring(const LEX_CSTRING &value,
                              std::size_t max_length = 0) {
   if (value.str == nullptr || value.length == 0) return {};
@@ -94,6 +110,10 @@ class Event::Impl {
 
   void emit() {
     if (m_emitted) return;
+    if (m_event.raw_sql.empty() && is_sql_chain_event(m_event.event_name)) {
+      m_emitted = true;
+      return;
+    }
     if (current_context().suppress_current_sql() &&
         !m_event.raw_sql.empty()) {
       m_emitted = true;

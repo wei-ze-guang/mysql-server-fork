@@ -110,7 +110,8 @@ namespace {
 
 bool wzg_lock_should_log(THD *thd, const dict_table_t *table) {
   if (thd == nullptr || thd->query().str == nullptr ||
-      thd->query().length == 0 || table == nullptr ||
+      thd->query().length == 0 || wzg_probe::raw_sql().empty() ||
+      table == nullptr ||
       table->name.m_name == nullptr) {
     return false;
   }
@@ -849,7 +850,7 @@ void wzg_emit_innodb_lock_release_transaction(trx_t *trx,
                                               const char *release_reason) {
   THD *thd = wzg_lock_event_thd(trx);
   if (thd == nullptr || trx == nullptr || thd->query().str == nullptr ||
-      thd->query().length == 0) {
+      thd->query().length == 0 || wzg_probe::raw_sql().empty()) {
     return;
   }
 

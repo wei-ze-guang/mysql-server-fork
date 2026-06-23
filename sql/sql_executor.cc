@@ -324,6 +324,61 @@ void WzgEmitTempTableCreate(THD *thd, const JOIN *join, const QEP_TAB *tab,
   WZG_PROBE_EVENT(thd, "executor.temp_table_create")
       .message("执行器创建内部临时表，用来保存 SQL 执行过程中的中间结果")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "executor")
+      .field("actor.subsystem", "temporary_table")
+      .field("actor.role", "内部临时表创建器")
+      .field("action.name", "create_temp_table")
+      .field("action.phase", "finish")
+      .field("action.summary", "创建执行计划需要的内部临时表结构")
+      .field("object.type", "temp_table")
+      .field("object.id", WzgTempTableName(table))
+      .field("runtime.query_block_number",
+             join == nullptr || join->query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("runtime.plan_table_index",
+             tab == nullptr ? std::uint64_t{0}
+                            : static_cast<std::uint64_t>(tab->idx()))
+      .field("runtime.temporary_table", WzgTempTableName(table))
+      .field("runtime.temporary_table_kind",
+             "internal_executor_temp_table")
+      .field("runtime.expected_memory_engine",
+             WzgTempTableMemEngineName(thd->variables.internal_tmp_mem_storage_engine))
+      .field("runtime.tmp_table_size",
+             static_cast<std::uint64_t>(thd->variables.tmp_table_size))
+      .field("runtime.max_heap_table_size",
+             static_cast<std::uint64_t>(thd->variables.max_heap_table_size))
+      .field("runtime.rows_limit", WzgTempTableRowsLimitText(rows_limit))
+      .field("runtime.field_count", static_cast<std::uint64_t>(fields.size()))
+      .field("runtime.visible_field_count",
+             static_cast<std::uint64_t>(CountVisibleFields(fields)))
+      .field("runtime.hidden_field_count",
+             param == nullptr ? std::uint64_t{0}
+                              : static_cast<std::uint64_t>(
+                                    param->hidden_field_count))
+      .field("runtime.columns", WzgTempTableFieldText(fields))
+      .field("runtime.group_by", WzgTempTableGroupText(group))
+      .field("runtime.distinct",
+             distinct || (table->s != nullptr && table->s->is_distinct))
+      .field("runtime.save_sum_fields", save_sum_fields)
+      .field("runtime.for_window",
+             param != nullptr && param->m_window != nullptr)
+      .field("decision.summary", "执行器需要临时表保存中间结果")
+      .field("decision.reason",
+             WzgTempTableReasonText(join, table, param, group, distinct,
+                                    save_sum_fields))
+      .field("decision.result",
+             "临时表结构已经创建，后续 iterator 可向其中写入或从中读取行")
+      .field("decision.impact",
+             "实际是否写满、是否从内存临时表转为磁盘临时表，要看后续执行状态")
+      .field("explain_zh.hidden_field_count",
+             "隐藏列用于执行器内部计算、排序、分组或窗口处理，不直接返回给客户端")
+      .field("explain_zh.expected_memory_engine",
+             "internal_tmp_mem_storage_engine 指示内存临时表优先使用的引擎，不保证最终不会落盘")
+      .field("debug.source_file", "sql/sql_executor.cc")
+      .field("debug.source_function", "WzgEmitTempTableCreate")
+      .field("debug.source_note",
+             "这里记录临时表结构创建，不扫描或记录临时表中的业务行值")
       .field("query_block_number",
              join == nullptr || join->query_block == nullptr
                  ? std::uint64_t{0}

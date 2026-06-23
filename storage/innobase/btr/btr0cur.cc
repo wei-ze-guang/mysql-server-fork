@@ -91,7 +91,8 @@ namespace {
 bool wzg_btr_should_log(const trx_t *trx, const dict_table_t *table) {
   const THD *thd = trx != nullptr ? trx->mysql_thd : current_thd;
   if (thd == nullptr || thd->query().str == nullptr ||
-      thd->query().length == 0 || thd->thread_id() == 0 || table == nullptr ||
+      thd->query().length == 0 || thd->thread_id() == 0 ||
+      wzg_probe::raw_sql().empty() || table == nullptr ||
       table->name.m_name == nullptr || table->is_system_table ||
       table->is_dd_table) {
     return false;

@@ -405,6 +405,151 @@ std::string wzg_executor_subquery_overview(Query_expression *unit) {
   return value;
 }
 
+std::string wzg_executor_field_list(THD *thd,
+                                    const mem_root_deque<Item *> *fields) {
+  if (fields == nullptr || fields->empty()) return "无输出列";
+
+  std::string value;
+  int count = 0;
+  for (Item *field : VisibleFields(*fields)) {
+    if (count > 0) value.append("；");
+    if (count >= kWzgExecutorMaxListItems) {
+      value.append("...");
+      break;
+    }
+    value.append(std::to_string(count + 1));
+    value.append(". ");
+    value.append(wzg_executor_item_text(thd, field));
+    ++count;
+  }
+  return count == 0 ? "无可见输出列" : value;
+}
+
+std::uint64_t wzg_executor_visible_field_count(
+    const mem_root_deque<Item *> *fields) {
+  if (fields == nullptr) return 0;
+  std::uint64_t count = 0;
+  for (Item *field : VisibleFields(*fields)) {
+    if (field != nullptr) ++count;
+  }
+  return count;
+}
+
+const char *wzg_executor_result_destination(Query_expression *unit) {
+  return unit != nullptr && unit->item != nullptr ? "outer_query" : "client";
+}
+
+const char *wzg_executor_result_destination_zh(Query_expression *unit) {
+  return unit != nullptr && unit->item != nullptr ? "返回给外层查询继续判断"
+                                                  : "返回给客户端";
+}
+
+void wzg_emit_projection(THD *thd, Query_expression *unit,
+                         const mem_root_deque<Item *> *fields) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  WZG_PROBE_EVENT(thd, "executor.projection")
+      .message("执行器确定最终输出列，后续每行按这些表达式形成结果行")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "executor")
+      .field("actor.subsystem", "projection")
+      .field("actor.role", "结果列计算器")
+      .field("action.name", "prepare_projection")
+      .field("action.phase", "ready")
+      .field("action.summary", "确定 SELECT 列表对应的输出表达式")
+      .field("object.type", "result_set")
+      .field("object.id",
+             query_block == nullptr
+                 ? "query_block=0"
+                 : std::string("query_block=") +
+                       std::to_string(query_block->select_number))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.visible_field_count",
+             wzg_executor_visible_field_count(fields))
+      .field("runtime.projection_fields",
+             wzg_executor_field_list(thd, fields))
+      .field("runtime.result_destination",
+             wzg_executor_result_destination(unit))
+      .field("decision.summary", "执行器将按 SELECT 列表生成最终结果行")
+      .field("decision.reason",
+             "RowIterator 只负责产生当前行上下文；发送结果前需要按输出表达式取值或计算")
+      .field("decision.result",
+             "后续 query_result->send_data 每次发送一行时读取这些输出表达式")
+      .field("decision.impact",
+             "客户端看到的是 projection 后的列，不一定是存储引擎原始记录列")
+      .field("next_step",
+             "根迭代器每返回一行后，Query_result 按这些字段写入协议或上层临时结果")
+      .field("explain_zh.visible_field_count",
+             "最终对外可见的输出列数量")
+      .field("explain_zh.projection_fields",
+             "SELECT 列表或上层查询需要的表达式，日志只记录表达式文本，不记录每行数据值")
+      .field("debug.source_file", "sql/sql_union.cc")
+      .field("debug.source_function", "Query_expression::ExecuteIteratorQuery")
+      .field("debug.source_note",
+             "这里记录结果列结构，不逐行记录具体业务值")
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("projection_fields", wzg_executor_field_list(thd, fields))
+      .emit();
+}
+
+void wzg_emit_result_send_start(THD *thd, Query_expression *unit,
+                                const mem_root_deque<Item *> *fields) {
+  Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
+  WZG_PROBE_EVENT(thd, "executor.result_send_start")
+      .message("执行器开始把最终结果行交给 Query_result 发送或写入上层结果")
+      .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "executor")
+      .field("actor.subsystem", "result")
+      .field("actor.role", "结果发送协调器")
+      .field("action.name", "send_result_rows")
+      .field("action.phase", "start")
+      .field("action.summary", "根迭代器开始产出最终行，Query_result 准备逐行消费")
+      .field("object.type", "result_set")
+      .field("object.id",
+             query_block == nullptr
+                 ? "query_block=0"
+                 : std::string("query_block=") +
+                       std::to_string(query_block->select_number))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.result_destination",
+             wzg_executor_result_destination(unit))
+      .field("runtime.visible_field_count",
+             wzg_executor_visible_field_count(fields))
+      .field("runtime.sent_rows_at_start", std::uint64_t{0})
+      .field("decision.summary",
+             "SQL 层开始消费根 RowIterator 的输出行")
+      .field("decision.reason",
+             "元数据已经发送或上层结果已准备好，执行器可以逐行读取并发送结果")
+      .field("decision.result",
+             "每次 m_root_iterator->Read 成功后调用 query_result->send_data")
+      .field("decision.impact",
+             "ORDER BY、GROUP BY、DISTINCT、窗口函数等若存在，应已由前面的执行节点完成")
+      .field("next_step",
+             "循环调用根迭代器 Read；每读到一行就把 projection 后的字段交给 Query_result")
+      .field("explain_zh.result_destination",
+             "client 表示按 MySQL 客户端协议返回；outer_query 表示作为子查询结果给外层继续使用")
+      .field("explain_zh.sent_rows_at_start",
+             "开始发送时本 executor 已发送行数为 0，最终数量看 executor.finish")
+      .field("debug.source_file", "sql/sql_union.cc")
+      .field("debug.source_function", "Query_expression::ExecuteIteratorQuery")
+      .field("debug.source_note",
+             "只记录结果发送开始，不逐行记录行值")
+      .field("query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("result_destination", wzg_executor_result_destination_zh(unit))
+      .emit();
+}
+
 void wzg_emit_executor_start(THD *thd, Query_expression *unit) {
   Query_block *query_block = unit == nullptr ? nullptr : unit->first_query_block();
   JOIN *join = query_block == nullptr ? nullptr : query_block->join;
@@ -413,6 +558,47 @@ void wzg_emit_executor_start(THD *thd, Query_expression *unit) {
                    ? "开始执行子查询计划，准备生成外层查询可使用的结果"
                    : "开始执行查询计划，准备真正读取数据")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "executor")
+      .field("actor.subsystem", "query_execution")
+      .field("actor.role", "执行计划驱动器")
+      .field("action.name", "run_query_plan")
+      .field("action.phase", "start")
+      .field("action.summary", "开始执行优化器已经确定的访问路径树")
+      .field("object.type", "query")
+      .field("object.id",
+             query_block == nullptr
+                 ? "query_block=0"
+                 : std::string("query_block=") +
+                       std::to_string(query_block->select_number))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.query_role",
+             unit != nullptr && unit->item != nullptr ? "subquery"
+                                                      : "top_level_or_outer")
+      .field("runtime.read_order", wzg_executor_read_order(unit))
+      .field("runtime.access_methods", wzg_executor_access_methods(unit))
+      .field("runtime.filters", wzg_executor_filters(thd, unit))
+      .field("runtime.join_plan", wzg_executor_join_plan(unit))
+      .field("runtime.temporary_table", wzg_executor_temporary_plan(unit))
+      .field("runtime.filesort", wzg_executor_filesort_plan(unit))
+      .field("runtime.estimated_result_rows",
+             join == nullptr ? "未知" : wzg_executor_to_string(join->best_rowcount))
+      .field("runtime.subquery_context", wzg_executor_subquery_overview(unit))
+      .field("decision.summary", "执行器将按 RowIterator 树拉取结果行")
+      .field("decision.reason",
+             "优化和 iterator 创建已经完成，当前阶段开始真正调用 Init/Read")
+      .field("decision.result",
+             "根迭代器会驱动表访问、JOIN、过滤、排序、聚合或临时表节点")
+      .field("decision.impact",
+             "后续 executor.iterator_create、join_method、result_send_start 和 finish 事件可与该 query_block 串联")
+      .field("explain_zh.estimated_result_rows",
+             "优化器估算的最终行数，不等于实际返回行数")
+      .field("explain_zh.read_order",
+             "执行器读取表或输入节点的大致顺序")
+      .field("debug.source_file", "sql/sql_union.cc")
+      .field("debug.source_function", "Query_expression::ExecuteIteratorQuery")
       .field("query_block_number",
              query_block == nullptr
                  ? std::uint64_t{0}
@@ -458,9 +644,53 @@ void wzg_emit_executor_finish(THD *thd, Query_expression *unit,
       .field("thd_total_examined_rows_before_cleanup",
              wzg_executor_to_string(thd->get_examined_row_count()))
       .field("result_destination",
-             unit != nullptr && unit->item != nullptr
-                 ? "返回给外层查询继续判断"
-                 : "返回给客户端")
+             wzg_executor_result_destination_zh(unit))
+      .field("actor.component", "executor")
+      .field("actor.subsystem", "query_execution")
+      .field("actor.role", "执行计划驱动器")
+      .field("action.name", "run_query_plan")
+      .field("action.phase", "finish")
+      .field("action.summary", "执行计划结束并记录真实行数")
+      .field("object.type", "query")
+      .field("object.id",
+             query_block == nullptr
+                 ? "query_block=0"
+                 : std::string("query_block=") +
+                       std::to_string(query_block->select_number))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.query_role",
+             unit != nullptr && unit->item != nullptr ? "subquery"
+                                                      : "top_level_or_outer")
+      .field("runtime.execution_result", error ? "error" : "success")
+      .field("runtime.sent_rows_from_this_executor",
+             wzg_executor_to_string(sent_records))
+      .field("runtime.examined_rows_from_this_query_block",
+             wzg_executor_to_string(examined_rows))
+      .field("runtime.thd_total_sent_rows",
+             wzg_executor_to_string(thd->get_sent_row_count()))
+      .field("runtime.thd_total_examined_rows_before_cleanup",
+             wzg_executor_to_string(thd->get_examined_row_count()))
+      .field("runtime.result_destination",
+             wzg_executor_result_destination(unit))
+      .field("decision.summary",
+             error ? "执行器因错误或中断结束" : "执行器正常读完根迭代器")
+      .field("decision.reason",
+             error ? "THD 已处于错误状态或查询被 kill"
+                   : "根迭代器返回 EOF，所有可返回行已经处理")
+      .field("decision.result",
+             error ? "结果可能只发送了部分行或未发送 EOF"
+                   : "已发送 EOF 或把结果完整交给上层查询")
+      .field("decision.impact",
+             "runtime.sent_rows_from_this_executor 是本 executor 的实际输出行数")
+      .field("explain_zh.sent_rows_from_this_executor",
+             "当前 Query_expression 实际向客户端或上层查询输出的行数")
+      .field("explain_zh.examined_rows_from_this_query_block",
+             "JOIN 统计的实际检查行数，区别于优化器估算")
+      .field("debug.source_file", "sql/sql_union.cc")
+      .field("debug.source_function", "Query_expression::ExecuteIteratorQuery")
       .field("note", "这里是真实执行后的统计，不是优化器估算值")
       .emit();
 }
@@ -2075,6 +2305,7 @@ bool Query_expression::ExecuteIteratorQuery(THD *thd) {
     return true;
   }
 
+  wzg_emit_projection(thd, this, fields);
   set_executed();
   wzg_emit_executor_start(thd, this);
   bool wzg_executor_finish_emitted = false;
@@ -2144,6 +2375,7 @@ bool Query_expression::ExecuteIteratorQuery(THD *thd) {
   }
   *send_records_ptr = 0;
 
+  wzg_emit_result_send_start(thd, this, fields);
   thd->get_stmt_da()->reset_current_row_for_condition();
 
   {

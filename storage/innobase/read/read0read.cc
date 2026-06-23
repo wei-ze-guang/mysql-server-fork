@@ -54,14 +54,12 @@ namespace {
 bool wzg_mvcc_should_log(THD *thd) {
   if (thd == nullptr || thd->query().str == nullptr ||
       thd->query().length == 0 || thd->thread_id() == 0 ||
-      thd_sql_command(thd) != SQLCOM_SELECT) {
+      thd_sql_command(thd) != SQLCOM_SELECT ||
+      wzg_probe::raw_sql().empty()) {
     return false;
   }
 
   std::string_view sql(wzg_probe::raw_sql());
-  if (sql.empty()) {
-    sql = std::string_view(thd->query().str, thd->query().length);
-  }
   while (!sql.empty() && std::isspace(static_cast<unsigned char>(sql.front()))) {
     sql.remove_prefix(1);
   }
@@ -78,8 +76,7 @@ bool wzg_mvcc_should_log(THD *thd) {
     return true;
   };
 
-  return thd != nullptr && thd->query().str != nullptr &&
-         (starts_with_ci(sql, "select") || starts_with_ci(sql, "with"));
+  return starts_with_ci(sql, "select") || starts_with_ci(sql, "with");
 }
 
 const char *wzg_mvcc_isolation_name(trx_t::isolation_level_t level) {

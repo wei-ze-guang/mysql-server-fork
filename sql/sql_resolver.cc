@@ -314,6 +314,8 @@ void wzg_emit_resolver_error(THD *thd, Query_block *query_block,
                              const char *stage,
                              const char *message,
                              const char *note) {
+  if (wzg_probe::raw_sql().empty()) return;
+
   WZG_PROBE_EVENT(thd, "resolver.error")
       .message(message)
       .field("resolve_result", "error")
@@ -395,21 +397,24 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
 
   Query_expression *const unit = master_query_expression();
   const bool wzg_had_select_star = with_wild != 0;
+  const bool wzg_should_log_resolver = !wzg_probe::raw_sql().empty();
 
-  WZG_PROBE_EVENT(thd, "resolver.start")
-      .message("开始解析 SQL 名字和表达式，准备把文本里的表名、字段名绑定到内部对象")
-      .sql_command(get_sql_command_string(parent_lex->sql_command))
-      .field("query_block_number", static_cast<std::uint64_t>(select_number))
-      .field("has_from", get_table_list() != nullptr)
-      .field("has_where", m_where_cond != nullptr)
-      .field("has_group_by", group_list.elements != 0)
-      .field("has_order_by", order_list.elements != 0)
-      .field("has_limit", select_limit != nullptr)
-      .field("has_select_star", wzg_had_select_star)
-      .field("resolver_goal",
-             "检查表和字段是否存在，检查 SELECT 权限，绑定名字，推导表达式类型，并准备交给优化器")
-      .field("note", "这一阶段不真正读取数据行，也不决定最终表访问顺序")
-      .emit();
+  if (wzg_should_log_resolver) {
+    WZG_PROBE_EVENT(thd, "resolver.start")
+        .message("开始解析 SQL 名字和表达式，准备把文本里的表名、字段名绑定到内部对象")
+        .sql_command(get_sql_command_string(parent_lex->sql_command))
+        .field("query_block_number", static_cast<std::uint64_t>(select_number))
+        .field("has_from", get_table_list() != nullptr)
+        .field("has_where", m_where_cond != nullptr)
+        .field("has_group_by", group_list.elements != 0)
+        .field("has_order_by", order_list.elements != 0)
+        .field("has_limit", select_limit != nullptr)
+        .field("has_select_star", wzg_had_select_star)
+        .field("resolver_goal",
+               "检查表和字段是否存在，检查 SELECT 权限，绑定名字，推导表达式类型，并准备交给优化器")
+        .field("note", "这一阶段不真正读取数据行，也不决定最终表访问顺序")
+        .emit();
+  }
 
   if (!m_table_nest.empty()) propagate_nullability(&m_table_nest, false);
 
@@ -470,18 +475,20 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     return true;
   }
 
-  WZG_PROBE_EVENT(thd, "resolver.tables_resolved")
-      .message("表名解析完成，SQL 中的表名已经绑定到 MySQL 内部表对象")
-      .sql_command(get_sql_command_string(parent_lex->sql_command))
-      .field("resolve_result", "success")
-      .field("query_block_number", static_cast<std::uint64_t>(select_number))
-      .field("table_lookup_result", "所有当前查询块需要的表都已找到或解析为内部表对象")
-      .field("leaf_table_count", static_cast<std::uint64_t>(leaf_table_count))
-      .field("tables", wzg_leaf_tables(this))
-      .field("privilege_check", "已进入 SELECT 权限检查路径，列权限会在字段绑定时继续检查")
-      .field("next_step", "解析 SELECT 字段列表，并展开 SELECT *")
-      .field("note", "这里的 leaf table 是后续优化器看到的输入表列表，视图和派生表可能已经展开或保留为内部对象")
-      .emit();
+  if (wzg_should_log_resolver) {
+    WZG_PROBE_EVENT(thd, "resolver.tables_resolved")
+        .message("表名解析完成，SQL 中的表名已经绑定到 MySQL 内部表对象")
+        .sql_command(get_sql_command_string(parent_lex->sql_command))
+        .field("resolve_result", "success")
+        .field("query_block_number", static_cast<std::uint64_t>(select_number))
+        .field("table_lookup_result", "所有当前查询块需要的表都已找到或解析为内部表对象")
+        .field("leaf_table_count", static_cast<std::uint64_t>(leaf_table_count))
+        .field("tables", wzg_leaf_tables(this))
+        .field("privilege_check", "已进入 SELECT 权限检查路径，列权限会在字段绑定时继续检查")
+        .field("next_step", "解析 SELECT 字段列表，并展开 SELECT *")
+        .field("note", "这里的 leaf table 是后续优化器看到的输入表列表，视图和派生表可能已经展开或保留为内部对象")
+        .emit();
+  }
 
   if ((derived_table_count || table_func_count) &&
       resolve_placeholder_tables(thd, true)) {
@@ -538,22 +545,24 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     return true;
   }
 
-  WZG_PROBE_EVENT(thd, "resolver.fields_resolved")
-      .message(wzg_had_select_star
-                   ? "字段解析完成，SELECT * 已展开成真实字段列表"
-                   : "字段解析完成，SELECT 列表已经绑定到字段或表达式对象")
-      .sql_command(get_sql_command_string(parent_lex->sql_command))
-      .field("resolve_result", "success")
-      .field("query_block_number", static_cast<std::uint64_t>(select_number))
-      .field("select_star_expanded", wzg_had_select_star)
-      .field("visible_field_count",
-             static_cast<std::uint64_t>(CountVisibleFields(fields)))
-      .field("select_items", wzg_visible_select_items(thd, this))
-      .field("name_binding", "SELECT 列表中的字段名、函数和表达式已经绑定到内部 Item 对象")
-      .field("type_inference", "SELECT 列表表达式已经具备 MySQL 内部字段类型")
-      .field("privilege_check", "字段解析过程中已检查当前用户读取相关列所需的 SELECT 权限")
-      .field("next_step", "解析 WHERE、JOIN ON、GROUP BY、HAVING、ORDER BY 等表达式")
-      .emit();
+  if (wzg_should_log_resolver) {
+    WZG_PROBE_EVENT(thd, "resolver.fields_resolved")
+        .message(wzg_had_select_star
+                     ? "字段解析完成，SELECT * 已展开成真实字段列表"
+                     : "字段解析完成，SELECT 列表已经绑定到字段或表达式对象")
+        .sql_command(get_sql_command_string(parent_lex->sql_command))
+        .field("resolve_result", "success")
+        .field("query_block_number", static_cast<std::uint64_t>(select_number))
+        .field("select_star_expanded", wzg_had_select_star)
+        .field("visible_field_count",
+               static_cast<std::uint64_t>(CountVisibleFields(fields)))
+        .field("select_items", wzg_visible_select_items(thd, this))
+        .field("name_binding", "SELECT 列表中的字段名、函数和表达式已经绑定到内部 Item 对象")
+        .field("type_inference", "SELECT 列表表达式已经具备 MySQL 内部字段类型")
+        .field("privilege_check", "字段解析过程中已检查当前用户读取相关列所需的 SELECT 权限")
+        .field("next_step", "解析 WHERE、JOIN ON、GROUP BY、HAVING、ORDER BY 等表达式")
+        .emit();
+  }
 
   resolve_place = RESOLVE_NONE;
 
@@ -574,18 +583,20 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     return true;
   }
 
-  WZG_PROBE_EVENT(thd, "resolver.conditions_resolved")
-      .message("条件解析完成，WHERE 和 JOIN 条件已经绑定并完成基本类型检查")
-      .sql_command(get_sql_command_string(parent_lex->sql_command))
-      .field("resolve_result", "success")
-      .field("query_block_number", static_cast<std::uint64_t>(select_number))
-      .field("has_where", m_where_cond != nullptr)
-      .field("where_condition", wzg_condition_summary(thd, m_where_cond))
-      .field("join_condition_count", static_cast<std::uint64_t>(cond_count))
-      .field("condition_binding", "条件中的字段名已经绑定到内部字段对象，常量和函数已经绑定到表达式对象")
-      .field("type_check", "条件表达式已经能产生布尔判断需要的结果，必要的类型处理由 MySQL 表达式系统记录")
-      .field("next_step", "继续解析 GROUP BY、HAVING、ORDER BY、LIMIT，并做局部查询改写")
-      .emit();
+  if (wzg_should_log_resolver) {
+    WZG_PROBE_EVENT(thd, "resolver.conditions_resolved")
+        .message("条件解析完成，WHERE 和 JOIN 条件已经绑定并完成基本类型检查")
+        .sql_command(get_sql_command_string(parent_lex->sql_command))
+        .field("resolve_result", "success")
+        .field("query_block_number", static_cast<std::uint64_t>(select_number))
+        .field("has_where", m_where_cond != nullptr)
+        .field("where_condition", wzg_condition_summary(thd, m_where_cond))
+        .field("join_condition_count", static_cast<std::uint64_t>(cond_count))
+        .field("condition_binding", "条件中的字段名已经绑定到内部字段对象，常量和函数已经绑定到表达式对象")
+        .field("type_check", "条件表达式已经能产生布尔判断需要的结果，必要的类型处理由 MySQL 表达式系统记录")
+        .field("next_step", "继续解析 GROUP BY、HAVING、ORDER BY、LIMIT，并做局部查询改写")
+        .emit();
+  }
 
   // Set up the GROUP BY clause
   int all_fields_count = fields.size();
@@ -986,23 +997,25 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   }
 
   assert(!thd->is_error());
-  WZG_PROBE_EVENT(thd, "resolver.finish")
-      .message("名字解析和表达式准备完成，查询块已经形成优化器可以继续分析的结构")
-      .sql_command(get_sql_command_string(parent_lex->sql_command))
-      .field("resolve_result", "success")
-      .field("query_block_number", static_cast<std::uint64_t>(select_number))
-      .field("leaf_table_count", static_cast<std::uint64_t>(leaf_table_count))
-      .field("visible_field_count",
-             static_cast<std::uint64_t>(CountVisibleFields(fields)))
-      .field("has_where", m_where_cond != nullptr)
-      .field("has_group_by", group_list.elements != 0)
-      .field("has_having", m_having_cond != nullptr)
-      .field("has_order_by", order_list.elements != 0)
-      .field("has_limit", select_limit != nullptr)
-      .field("optimizer_input",
-             "表对象、字段对象、条件表达式和结果列结构已经准备好，优化器接下来选择访问路径、连接顺序和索引")
-      .field("note", "resolver 会做必要的名字绑定、权限检查、类型推导和局部改写，但不真正读取数据行")
-      .emit();
+  if (wzg_should_log_resolver) {
+    WZG_PROBE_EVENT(thd, "resolver.finish")
+        .message("名字解析和表达式准备完成，查询块已经形成优化器可以继续分析的结构")
+        .sql_command(get_sql_command_string(parent_lex->sql_command))
+        .field("resolve_result", "success")
+        .field("query_block_number", static_cast<std::uint64_t>(select_number))
+        .field("leaf_table_count", static_cast<std::uint64_t>(leaf_table_count))
+        .field("visible_field_count",
+               static_cast<std::uint64_t>(CountVisibleFields(fields)))
+        .field("has_where", m_where_cond != nullptr)
+        .field("has_group_by", group_list.elements != 0)
+        .field("has_having", m_having_cond != nullptr)
+        .field("has_order_by", order_list.elements != 0)
+        .field("has_limit", select_limit != nullptr)
+        .field("optimizer_input",
+               "表对象、字段对象、条件表达式和结果列结构已经准备好，优化器接下来选择访问路径、连接顺序和索引")
+        .field("note", "resolver 会做必要的名字绑定、权限检查、类型推导和局部改写，但不真正读取数据行")
+        .emit();
+  }
   return false;
 }
 

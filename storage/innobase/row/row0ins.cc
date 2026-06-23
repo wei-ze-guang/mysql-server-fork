@@ -87,6 +87,11 @@ bool wzg_row_ins_should_log(const dict_table_t *table) {
          !name.starts_with("information_schema/");
 }
 
+bool wzg_row_ins_allow_duplicates(const que_thr_t *thr) {
+  return thr != nullptr && thr->prebuilt != nullptr &&
+         thr->prebuilt->allow_duplicates();
+}
+
 std::string wzg_row_ins_table_name(const dict_table_t *table) {
   if (table == nullptr || table->name.m_name == nullptr) return "无";
   std::string value(table->name.m_name);
@@ -2154,7 +2159,8 @@ static bool row_allow_duplicates(que_thr_t *thr) {
     for (ulint i = 0; i < n_unique; i++) {
       if (UNIV_SQL_NULL == dfield_get_len(dtuple_get_nth_field(entry, i))) {
         wzg_emit_duplicate_check(index, entry, thr, "secondary_unique_null",
-                                 n_unique, 0, 0, row_allow_duplicates(thr),
+                                 n_unique, 0, 0,
+                                 wzg_row_ins_allow_duplicates(thr),
                                  DB_SUCCESS);
         return DB_SUCCESS;
       }
@@ -2505,7 +2511,7 @@ func_exit:
   }
   wzg_emit_duplicate_check(cursor->index, entry, thr, "clustered_unique_cursor",
                            n_unique, cursor->low_match, cursor->up_match,
-                           row_allow_duplicates(thr), err);
+                           wzg_row_ins_allow_duplicates(thr), err);
   return (err);
 }
 
@@ -2754,7 +2760,7 @@ dberr_t row_ins_clust_index_entry_low(uint32_t flags, ulint mode,
   } else if (!index->allow_duplicates && n_uniq) {
     wzg_emit_duplicate_check(index, entry, thr, "clustered_unique_no_match",
                              n_uniq, cursor->low_match, cursor->up_match,
-                             row_allow_duplicates(thr), DB_SUCCESS);
+                             wzg_row_ins_allow_duplicates(thr), DB_SUCCESS);
   }
 
   if (dup_chk_only) {
@@ -3267,7 +3273,7 @@ dberr_t row_ins_sec_index_entry_low(uint32_t flags, ulint mode,
   if (dict_index_is_unique(index) && !duplicate_check_needed) {
     wzg_emit_duplicate_check(index, entry, thr, "secondary_unique_no_match",
                              n_unique, cursor.low_match, cursor.up_match,
-                             row_allow_duplicates(thr), DB_SUCCESS);
+                             wzg_row_ins_allow_duplicates(thr), DB_SUCCESS);
   }
 
   if (dup_chk_only) {

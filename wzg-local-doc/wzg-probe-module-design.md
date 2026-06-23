@@ -117,6 +117,304 @@ JSON key 必须使用英文，方便后续程序解析、可视化和 ECS adapte
 
 这样可以避免日志太大，也减少泄露业务数据的风险。
 
+## 事实型日志全局规则
+
+WZG Probe 的日志目标不是“阶段说明”，而是“运行现场记录”。
+
+每条重要日志都要尽量让人和后续 AI/adapter 看懂：
+
+- 谁在操作。
+- 正在操作什么对象。
+- 关键运行时变量值是多少。
+- MySQL 为什么做这个动作。
+- 这个动作的结果是什么。
+- 这个结果对后续执行有什么影响。
+
+前端和 adapter 可以负责聚合、建图、生成故事，但不能替 `mysqld` 编造运行时事实。因此源码插桩要尽量输出真实变量值和变量意义，而不是只输出“进入某阶段”“完成某阶段”。
+
+### fields 的推荐骨架
+
+重要事件的 `fields` 尽量按下面的语义骨架组织：
+
+```jsonc
+{
+  "actor": {},
+  "action": {},
+  "object": {},
+  "runtime": {},
+  "decision": {},
+  "next_step": "",
+  "explain_zh": {},
+  "debug": {}
+}
+```
+
+不是每条日志都必须包含全部字段。热路径、循环路径和很轻量的串联事件可以少写；但 optimizer、executor、handler、InnoDB 索引、锁、MVCC、undo、redo、buffer pool 等关键事件应尽量补齐。
+
+### actor：谁在做
+
+`actor` 描述当前动作属于哪个模块或子系统。
+
+```jsonc
+{
+  "actor": {
+    "component": "innodb",
+    "subsystem": "buffer_pool",
+    "role": "后台刷盘线程"
+  }
+}
+```
+
+常见 `component`：
+
+```text
+connection
+command
+parser
+resolver
+optimizer
+executor
+handler
+innodb
+transaction
+lock
+mvcc
+btree
+buffer_pool
+redo
+undo
+binlog
+```
+
+### action：做什么
+
+`action` 写业务语义动作，不把源码函数名当成主信息。
+
+```jsonc
+{
+  "action": {
+    "name": "flush_dirty_pages",
+    "phase": "finish",
+    "summary": "从 flush list 中刷出一批脏页"
+  }
+}
+```
+
+推荐动作名使用稳定英文，例如：
+
+```text
+receive_sql
+parse_sql
+resolve_fields
+choose_access_path
+create_iterator
+read_index
+search_btree
+search_page_directory
+acquire_lock
+check_mvcc_visibility
+write_undo
+write_redo
+mark_page_dirty
+flush_dirty_pages
+send_result_row
+```
+
+### object：操作对象是谁
+
+`object` 要尽量具体，方便 adapter 建立 scene graph。
+
+```jsonc
+{
+  "object": {
+    "type": "page_batch",
+    "id": "buffer_pool_instance=0,flush_type=BUF_FLUSH_LIST"
+  }
+}
+```
+
+常见对象类型：
+
+```text
+query
+table
+index
+btree_page
+record
+transaction
+lock
+read_view
+undo_log
+redo_log
+buffer_pool_page
+temp_table
+result_set
+background_task
+```
+
+如果运行时能拿到更具体的对象值，应尽量输出：
+
+```jsonc
+{
+  "object": {
+    "type": "record",
+    "table": "test.orders",
+    "index": "idx_user_id",
+    "space_id": 8,
+    "page_no": 5,
+    "heap_no": 12,
+    "key_value": "user_id=10",
+    "primary_key_value": "id=1001"
+  }
+}
+```
+
+### runtime：运行时真实变量值
+
+`runtime` 放真实变量值，不放泛泛解释。
+
+```jsonc
+{
+  "runtime": {
+    "buffer_pool_instance": 0,
+    "flush_type": "BUF_FLUSH_LIST",
+    "min_requested_pages": 10000,
+    "pages_flushed": 6,
+    "lsn_limit": "9223372036854775807",
+    "flush_list_bytes": 98304
+  }
+}
+```
+
+要求：
+
+- 同一个变量全局同名同义。
+- 数字能安全转成数字就转数字；不能安全转换时保留字符串。
+- `space_id`、`page_no`、`heap_no`、`trx_id`、`index_name`、`lock_mode`、`read_view_low_limit_id` 等字段要长期稳定。
+- 不要一会儿叫 `page_no`，一会儿叫 `page_number`，一会儿叫 `block_page`。
+
+### decision：为什么发生，结果是什么
+
+`decision` 是避免日志泛泛而谈的关键。它要解释当前变量值对 MySQL 行为的意义。
+
+```jsonc
+{
+  "decision": {
+    "summary": "后台线程决定刷出一批脏页",
+    "reason": "flush_type=BUF_FLUSH_LIST 表示从 flush list 按 LSN 顺序推进脏页刷盘，用于降低脏页压力或推进 checkpoint",
+    "result": "实际刷出 6 页，约 96KB",
+    "impact": "这些数据页修改已经写回磁盘，相关 redo 后续更容易被 checkpoint 覆盖"
+  }
+}
+```
+
+重要事件尽量回答：
+
+```text
+为什么发生？
+依据哪些变量判断？
+实际做了什么？
+成功、失败、等待、跳过？
+对后续有什么影响？
+```
+
+### explain_zh：变量含义解释
+
+结构化变量和中文解释分开。真实值放在 `runtime`，解释放在 `explain_zh`。
+
+```jsonc
+{
+  "explain_zh": {
+    "flush_type": "BUF_FLUSH_LIST 表示从脏页链表中选择页面刷盘",
+    "min_requested_pages": "本次刷盘希望至少处理的页数，不代表一定能刷这么多",
+    "pages_flushed": "本次实际完成刷盘的页数",
+    "lsn_limit": "只刷不超过该 LSN 限制的脏页；最大值通常表示没有额外限制"
+  }
+}
+```
+
+### debug：源码定位信息
+
+`debug` 给 AI、开发者和源码跳转使用，普通前端默认隐藏。
+
+```jsonc
+{
+  "debug": {
+    "source_file": "storage/innobase/buf/buf0rea.cc",
+    "source_function": "buf_flush_do_batch",
+    "source_line": 1234,
+    "source_location": "storage/innobase/buf/buf0rea.cc:1234",
+    "source_note": "这里只用于定位日志插桩位置，不代表 MySQL 逻辑只发生在这一行"
+  }
+}
+```
+
+源码函数名可以写在 `debug.source_function`，但不要把它作为主要展示内容。主要展示应说明 MySQL 正在做什么，例如：
+
+```text
+InnoDB 正在按索引 key 搜索 B+Tree，先定位到 leaf page，再在 page directory 中缩小范围。
+```
+
+不要只写：
+
+```text
+调用了 btr_pcur_open_with_no_init。
+```
+
+### 前后事件要能串起来
+
+如果前面的事件出现了这些值：
+
+```jsonc
+{
+  "index": "idx_user_id",
+  "space_id": 8,
+  "page_no": 5,
+  "heap_no": 12
+}
+```
+
+后续继续操作同一对象时，应继续带这些值。这样 adapter 才能连接：
+
+```text
+Index -> Page -> Record -> Lock -> UndoLog
+```
+
+### 后台事件要明确标记
+
+后台刷脏页、purge、checkpoint、change buffer merge 等事件，应明确标记为后台行为。
+
+```jsonc
+{
+  "actor": {
+    "component": "innodb",
+    "subsystem": "buffer_pool",
+    "role": "后台线程"
+  },
+  "object": {
+    "type": "background_task"
+  }
+}
+```
+
+`thread_id=0` 或 `connection_id=0` 的事件，前端和 adapter 应放入 background lane，不要混入用户 SQL 主线。
+
+### 总结规则
+
+补新日志或重写旧日志时，优先检查这九件事：
+
+```text
+谁 actor
+做什么 action
+对谁 object
+当前值 runtime
+为什么 decision.reason
+结果 decision.result
+影响 decision.impact
+下一步 next_step
+源码在哪 debug
+```
+
 ## 原始事件结构
 
 WZG Probe 输出 JSON Lines，每行是一条事件。

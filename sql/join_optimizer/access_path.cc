@@ -805,6 +805,29 @@ std::string WzgIteratorPurpose(const AccessPath *path) {
   }
 }
 
+wzg_probe::Event &WzgAddExecutorFactFields(wzg_probe::Event &event,
+                                           const char *subsystem,
+                                           const char *role,
+                                           const char *action_name,
+                                           const char *phase,
+                                           const char *summary,
+                                           const char *object_type,
+                                           const std::string &object_id,
+                                           const char *source_function) {
+  return event.field("actor.component", "executor")
+      .field("actor.subsystem", subsystem)
+      .field("actor.role", role)
+      .field("action.name", action_name)
+      .field("action.phase", phase)
+      .field("action.summary", summary)
+      .field("object.type", object_type)
+      .field("object.id", object_id)
+      .field("debug.source_file", "sql/join_optimizer/access_path.cc")
+      .field("debug.source_function", source_function)
+      .field("debug.source_note",
+             "这里记录执行器访问路径对应的 iterator 事实，不重新执行 SQL");
+}
+
 const char *WzgRangeFlagName(enum ha_rkey_function flag) {
   switch (flag) {
     case HA_READ_KEY_EXACT:
@@ -1203,9 +1226,36 @@ void WzgEmitTableScanPlan(THD *thd, const AccessPath *path,
 
   const auto &param = path->table_scan();
   Query_block *query_block = join == nullptr ? nullptr : join->query_block;
-  WZG_PROBE_EVENT(thd, "executor.table_scan")
+  wzg_probe::Event event(thd, "executor.table_scan", "instant");
+  WzgAddExecutorFactFields(event, "iterator", "全表扫描读取器",
+                           "scan_table", "ready",
+                           "准备按 handler 顺序接口读取整张表",
+                           "table", WzgIteratorTableName(param.table),
+                           "WzgEmitTableScanPlan")
       .message("执行器准备做全表扫描，从表数据中逐行读取记录")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.table", WzgIteratorTableName(param.table))
+      .field("runtime.scan_type", "TABLE_SCAN")
+      .field("runtime.handler_init_call", "ha_rnd_init(true)")
+      .field("runtime.handler_read_call", "ha_rnd_next")
+      .field("runtime.table_rows_estimate", WzgTableStatsRowsText(param.table))
+      .field("runtime.estimated_output_rows",
+             WzgIteratorDoubleToString(path->num_output_rows()))
+      .field("runtime.estimated_cost", WzgIteratorDoubleToString(path->cost()))
+      .field("runtime.counts_examined_rows", path->count_examined_rows)
+      .field("decision.summary", "执行器将逐行扫描整张表")
+      .field("decision.reason",
+             "当前访问路径没有可用索引 key 或范围边界来直接定位候选记录")
+      .field("decision.result",
+             "TableScanIterator 会通过 handler 随机/顺序表扫描接口获取下一条记录")
+      .field("decision.impact",
+             "读出的行继续进入过滤、JOIN、排序、聚合或结果发送节点")
+      .field("explain_zh.handler_read_call",
+             "ha_rnd_next 是 handler 层获取下一条表记录的接口")
       .field("query_block_number",
              query_block == nullptr
                  ? std::uint64_t{0}
@@ -1236,9 +1286,41 @@ void WzgEmitIndexScanPlan(THD *thd, const AccessPath *path,
 
   const auto &param = path->index_scan();
   Query_block *query_block = join == nullptr ? nullptr : join->query_block;
-  WZG_PROBE_EVENT(thd, "executor.index_scan")
+  wzg_probe::Event event(thd, "executor.index_scan", "instant");
+  WzgAddExecutorFactFields(event, "iterator", "索引扫描读取器",
+                           "scan_index", "ready",
+                           "准备按索引叶子顺序扫描记录",
+                           "index", WzgIteratorIndexName(param.table, param.idx),
+                           "WzgEmitIndexScanPlan")
       .message("执行器准备做全索引扫描，按索引顺序逐条读取记录")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.table", WzgIteratorTableName(param.table))
+      .field("runtime.index", WzgIteratorIndexName(param.table, param.idx))
+      .field("runtime.scan_type", "INDEX_SCAN")
+      .field("runtime.scan_direction", param.reverse ? "reverse" : "forward")
+      .field("runtime.handler_init_call", "ha_index_init")
+      .field("runtime.handler_read_calls",
+             WzgIndexScanHandlerCallsText(param.reverse))
+      .field("runtime.use_index_order", param.use_order)
+      .field("runtime.covering_index", WzgIndexCoveringText(param.table, param.idx))
+      .field("runtime.table_rows_estimate", WzgTableStatsRowsText(param.table))
+      .field("runtime.estimated_output_rows",
+             WzgIteratorDoubleToString(path->num_output_rows()))
+      .field("runtime.estimated_cost", WzgIteratorDoubleToString(path->cost()))
+      .field("runtime.counts_examined_rows", path->count_examined_rows)
+      .field("decision.summary", "执行器将扫描整个索引")
+      .field("decision.reason",
+             "当前计划需要索引顺序或覆盖索引收益，但没有具体 lookup key 或范围边界")
+      .field("decision.result",
+             "IndexScanIterator 会按方向调用 handler 索引首条/下一条接口")
+      .field("decision.impact",
+             "索引顺序可能满足 ORDER BY，覆盖索引时可减少回表")
+      .field("explain_zh.covering_index",
+             "覆盖索引表示所需列可从索引记录取得，可能不需要读取完整聚簇记录")
       .field("query_block_number",
              query_block == nullptr
                  ? std::uint64_t{0}
@@ -2207,9 +2289,35 @@ void WzgEmitJoinMethod(THD *thd, const AccessPath *path, const JOIN *join) {
   switch (path->type) {
     case AccessPath::NESTED_LOOP_JOIN: {
       const auto &param = path->nested_loop_join();
-      WZG_PROBE_EVENT(thd, "executor.join_method")
+      wzg_probe::Event event(thd, "executor.join_method", "instant");
+      WzgAddExecutorFactFields(event, "join", "JOIN 读取器",
+                               "choose_join_method", "ready",
+                               "准备按嵌套循环方式执行 JOIN",
+                               "join", WzgJoinMethodName(path->type),
+                               "WzgEmitJoinMethod")
           .message("执行器准备按嵌套循环方式执行 JOIN")
           .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("runtime.query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("runtime.join_method", WzgJoinMethodName(path->type))
+          .field("runtime.join_type", WzgJoinTypeName(param.join_type))
+          .field("runtime.outer_input", WzgJoinInputText(param.outer))
+          .field("runtime.inner_input", WzgJoinInputText(param.inner))
+          .field("runtime.join_condition",
+                 WzgJoinConditionText(thd, param.join_predicate))
+          .field("runtime.batch_mode", param.pfs_batch_mode)
+          .field("decision.summary", WzgJoinMethodMeaning(path))
+          .field("decision.reason",
+                 "该 JOIN 节点使用外层行驱动内层读取的执行模型")
+          .field("decision.result",
+                 "NestedLoopIterator 后续反复读取 outer 并初始化 inner")
+          .field("decision.impact",
+                 "inner_input 的读取次数通常受 outer_input 产生的行数影响")
+          .field("explain_zh.outer_input",
+                 "outer_input 是先被读取的一侧，每产生一行会驱动 inner_input")
           .field("query_block_number",
                  query_block == nullptr
                      ? std::uint64_t{0}
@@ -2236,9 +2344,37 @@ void WzgEmitJoinMethod(THD *thd, const AccessPath *path, const JOIN *join) {
       std::string key_name =
           param.key == nullptr || param.key->name == nullptr ? "未知 key"
                                                              : param.key->name;
-      WZG_PROBE_EVENT(thd, "executor.join_method")
+      wzg_probe::Event event(thd, "executor.join_method", "instant");
+      WzgAddExecutorFactFields(event, "join", "半连接去重读取器",
+                               "choose_join_method", "ready",
+                               "准备按带去重的半连接嵌套循环方式执行 JOIN",
+                               "join", WzgJoinMethodName(path->type),
+                               "WzgEmitJoinMethod")
           .message("执行器准备按带去重的半连接嵌套循环方式执行 JOIN")
           .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("runtime.query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("runtime.join_method", WzgJoinMethodName(path->type))
+          .field("runtime.join_type", "SEMI JOIN")
+          .field("runtime.outer_input", WzgJoinInputText(param.outer))
+          .field("runtime.inner_input", WzgJoinInputText(param.inner))
+          .field("runtime.duplicate_removal_table",
+                 WzgIteratorTableName(param.table))
+          .field("runtime.duplicate_removal_key", key_name)
+          .field("runtime.duplicate_removal_key_length",
+                 static_cast<std::uint64_t>(param.key_len))
+          .field("decision.summary", WzgJoinMethodMeaning(path))
+          .field("decision.reason",
+                 "半连接只需要判断是否存在匹配，重复 key 不需要重复输出")
+          .field("decision.result",
+                 "iterator 会按 duplicate_removal_key 跳过已输出过的半连接结果")
+          .field("decision.impact",
+                 "减少同一外层 key 产生的重复半连接输出")
+          .field("explain_zh.duplicate_removal_key",
+                 "用于判断半连接结果是否已经输出过的内部去重 key")
           .field("query_block_number",
                  query_block == nullptr
                      ? std::uint64_t{0}
@@ -2263,9 +2399,39 @@ void WzgEmitJoinMethod(THD *thd, const AccessPath *path, const JOIN *join) {
     }
     case AccessPath::BKA_JOIN: {
       const auto &param = path->bka_join();
-      WZG_PROBE_EVENT(thd, "executor.join_method")
+      wzg_probe::Event event(thd, "executor.join_method", "instant");
+      WzgAddExecutorFactFields(event, "join", "BKA JOIN 读取器",
+                               "choose_join_method", "ready",
+                               "准备按 BKA 批量索引方式执行 JOIN",
+                               "join", WzgJoinMethodName(path->type),
+                               "WzgEmitJoinMethod")
           .message("执行器准备按 BKA 批量索引方式执行 JOIN")
           .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("runtime.query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("runtime.join_method", WzgJoinMethodName(path->type))
+          .field("runtime.join_type", WzgJoinTypeName(param.join_type))
+          .field("runtime.outer_input", WzgJoinInputText(param.outer))
+          .field("runtime.inner_input", WzgJoinInputText(param.inner))
+          .field("runtime.join_buffer_size",
+                 static_cast<std::uint64_t>(thd->variables.join_buff_size))
+          .field("runtime.mrr_length_per_record",
+                 static_cast<std::uint64_t>(param.mrr_length_per_rec))
+          .field("runtime.records_per_key_estimate",
+                 WzgIteratorDoubleToString(param.rec_per_key))
+          .field("runtime.store_rowids", param.store_rowids)
+          .field("decision.summary", WzgJoinMethodMeaning(path))
+          .field("decision.reason",
+                 "批量收集外层 key 后可用 MRR 减少内层随机索引访问")
+          .field("decision.result",
+                 "BKAIterator 使用 join buffer 驱动内层 MultiRangeRowIterator")
+          .field("decision.impact",
+                 "内层索引读取按批次发生，而不是每个 outer 行立即查一次")
+          .field("explain_zh.join_buffer_size",
+                 "本线程 join_buffer_size 变量，决定 BKA 可用于缓存外层 key 的空间上限")
           .field("query_block_number",
                  query_block == nullptr
                      ? std::uint64_t{0}
@@ -2325,9 +2491,38 @@ void WzgEmitJoinMethod(THD *thd, const AccessPath *path, const JOIN *join) {
               ? std::uint64_t{0}
               : static_cast<std::uint64_t>(
                     predicate->expr->equijoin_conditions.size());
-      WZG_PROBE_EVENT(thd, "executor.join_method")
+      wzg_probe::Event event(thd, "executor.join_method", "instant");
+      WzgAddExecutorFactFields(event, "join", "Hash Join 读取器",
+                               "choose_join_method", "ready",
+                               "准备按 Hash Join 方式执行 JOIN",
+                               "join", WzgJoinMethodName(path->type),
+                               "WzgEmitJoinMethod")
           .message("执行器准备按 Hash Join 方式执行 JOIN")
           .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("runtime.query_block_number",
+                 query_block == nullptr
+                     ? std::uint64_t{0}
+                     : static_cast<std::uint64_t>(
+                           query_block->select_number))
+          .field("runtime.join_method", WzgJoinMethodName(path->type))
+          .field("runtime.join_type", WzgJoinTypeName(join_type))
+          .field("runtime.build_input", WzgJoinInputText(param.inner))
+          .field("runtime.probe_input", WzgJoinInputText(param.outer))
+          .field("runtime.hash_key_conditions",
+                 WzgJoinConditionText(thd, predicate))
+          .field("runtime.hash_key_condition_count", condition_count)
+          .field("runtime.allow_spill_to_disk", param.allow_spill_to_disk)
+          .field("runtime.store_rowids", param.store_rowids)
+          .field("runtime.rewrite_semi_to_inner", param.rewrite_semi_to_inner)
+          .field("decision.summary", WzgJoinMethodMeaning(path))
+          .field("decision.reason",
+                 "等值 JOIN 条件可作为 hash key，执行器可以先构建哈希表再探测")
+          .field("decision.result",
+                 "HashJoinIterator 先读取 build_input 建表，再用 probe_input 匹配")
+          .field("decision.impact",
+                 "build/probe 两侧顺序影响内存占用、是否溢写磁盘和匹配方式")
+          .field("explain_zh.hash_key_condition_count",
+                 "参与 hash key 的等值 JOIN 条件数量")
           .field("query_block_number",
                  query_block == nullptr
                      ? std::uint64_t{0}
@@ -2369,9 +2564,39 @@ void WzgEmitRefLookupKey(THD *thd, const AccessPath *path, const JOIN *join) {
     return;
 
   Query_block *query_block = join == nullptr ? nullptr : join->query_block;
-  WZG_PROBE_EVENT(thd, "executor.ref_lookup_key")
+  wzg_probe::Event event(thd, "executor.ref_lookup_key", "instant");
+  WzgAddExecutorFactFields(event, "iterator", "索引精确查找读取器",
+                           "prepare_ref_key", "ready",
+                           "准备把表达式值编码成索引查找 key",
+                           "index", WzgIteratorIndexName(table, ref->key),
+                           "WzgEmitRefLookupKey")
       .message("索引精确查找读取器已准备好 key 参数，后续会用这些值到索引中查找匹配行")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.table", WzgIteratorTableName(table))
+      .field("runtime.index", WzgIteratorIndexName(table, ref->key))
+      .field("runtime.lookup_type", WzgRefLookupTypeText(path->type))
+      .field("runtime.lookup_key_parts", WzgRefLookupKeyParts(table, ref))
+      .field("runtime.lookup_values", WzgRefLookupValues(thd, ref))
+      .field("runtime.lookup_value_source", WzgRefLookupSource(ref))
+      .field("runtime.key_parts_count",
+             static_cast<std::uint64_t>(ref->key_parts))
+      .field("runtime.key_length", static_cast<std::uint64_t>(ref->key_length))
+      .field("runtime.null_rejecting", WzgRefLookupNullRejecting(ref))
+      .field("runtime.has_guarded_conditions", ref->has_guarded_conds())
+      .field("runtime.cache_behavior", WzgRefLookupCacheText(ref))
+      .field("decision.summary", "执行器将用 ref key 做索引匹配读取")
+      .field("decision.reason",
+             "lookup_values 已由常量或前面表的列值确定，可写入 key_buff 做索引定位")
+      .field("decision.result",
+             "RefIterator/EQRefIterator 后续调用 handler 索引读取接口")
+      .field("decision.impact",
+             "内层表可按外层行的 key 精确查找，常见于 JOIN 的 inner lookup")
+      .field("explain_zh.lookup_values",
+             "本次索引查找要编码进 key buffer 的表达式，日志不读取真实业务行值")
       .field("query_block_number",
              query_block == nullptr
                  ? std::uint64_t{0}
@@ -2417,9 +2642,34 @@ void WzgEmitIndexRangeBounds(THD *thd, const AccessPath *path,
     used_map |= param.ranges[i]->max_keypart_map;
   }
   Query_block *query_block = join == nullptr ? nullptr : join->query_block;
-  WZG_PROBE_EVENT(thd, "executor.index_range_bounds")
+  wzg_probe::Event event(thd, "executor.index_range_bounds", "instant");
+  WzgAddExecutorFactFields(event, "iterator", "索引范围读取器",
+                           "prepare_range_bounds", "ready",
+                           "准备索引范围扫描的起止边界",
+                           "index", WzgIteratorIndexName(table, param.index),
+                           "WzgEmitIndexRangeBounds")
       .message("索引范围读取器已准备好边界参数，后续会按这些边界请求存储引擎读取")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.table", WzgIteratorTableName(table))
+      .field("runtime.index", WzgIteratorIndexName(table, param.index))
+      .field("runtime.range_count", static_cast<std::uint64_t>(param.num_ranges))
+      .field("runtime.used_key_parts", WzgUsedKeyPartsText(key, used_map))
+      .field("runtime.range_parameters",
+             WzgRangeParametersList(param.ranges, param.num_ranges,
+                                    key.key_part))
+      .field("decision.summary", "执行器将按索引边界扫描一段或多段范围")
+      .field("decision.reason",
+             "range optimizer 已生成 start_key/end_key，handler 可用这些边界定位 B+Tree")
+      .field("decision.result",
+             "IndexRangeScanIterator 后续调用 handler 范围扫描接口")
+      .field("decision.impact",
+             "存储引擎只需扫描满足边界的索引区间，再把候选记录返回 SQL 层")
+      .field("explain_zh.range_parameters",
+             "start_key/end_key 是传给 handler 的索引边界；flag 表示边界包含和定位方式")
       .field("query_block_number",
              query_block == nullptr
                  ? std::uint64_t{0}
@@ -2793,16 +3043,49 @@ void WzgEmitIteratorCreate(THD *thd, const AccessPath *path, const JOIN *join) {
   if (path == nullptr || thd == nullptr) return;
   if (thd->query().str == nullptr || thd->query().length == 0) return;
   Query_block *query_block = join == nullptr ? nullptr : join->query_block;
-  WZG_PROBE_EVENT(thd, "executor.iterator_create")
+  TABLE *target_table = WzgIteratorTargetTable(path);
+  const std::string target_table_name = WzgIteratorTableName(target_table);
+  wzg_probe::Event event(thd, "executor.iterator_create", "instant");
+  WzgAddExecutorFactFields(event, "iterator", "RowIterator 工厂",
+                           "create_iterator", "finish",
+                           "把访问路径节点转换成可执行 RowIterator",
+                           target_table == nullptr ? "iterator" : "table",
+                           target_table == nullptr
+                               ? WzgIteratorAccessPathName(path->type)
+                               : target_table_name,
+                           "WzgEmitIteratorCreate")
       .message("执行器已根据访问路径创建读取器")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("runtime.query_block_number",
+             query_block == nullptr
+                 ? std::uint64_t{0}
+                 : static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.access_path_type", WzgIteratorAccessPathName(path->type))
+      .field("runtime.iterator_kind", WzgIteratorReadableName(path->type))
+      .field("runtime.target_table", target_table_name)
+      .field("runtime.chosen_index", WzgIteratorChosenIndex(path))
+      .field("runtime.estimated_output_rows",
+             WzgIteratorDoubleToString(path->num_output_rows()))
+      .field("runtime.estimated_cost", WzgIteratorDoubleToString(path->cost()))
+      .field("runtime.counts_examined_rows", path->count_examined_rows)
+      .field("decision.summary", WzgIteratorPurpose(path))
+      .field("decision.reason",
+             "优化器已经选择该 AccessPath，执行器在这里创建对应 RowIterator")
+      .field("decision.result",
+             "后续执行阶段将调用这个 iterator 的 Init 和 Read")
+      .field("decision.impact",
+             "该 iterator 决定这一计划节点如何产出行、是否读取表或驱动上层节点")
+      .field("explain_zh.estimated_output_rows",
+             "优化器估算的输出行数，不等于实际读取或返回行数")
+      .field("explain_zh.counts_examined_rows",
+             "该 iterator 的读取是否计入 examined rows 统计")
       .field("query_block_number",
              query_block == nullptr
                  ? std::uint64_t{0}
                  : static_cast<std::uint64_t>(query_block->select_number))
       .field("access_path_type", WzgIteratorAccessPathName(path->type))
       .field("iterator_kind", WzgIteratorReadableName(path->type))
-      .field("target_table", WzgIteratorTableName(WzgIteratorTargetTable(path)))
+      .field("target_table", target_table_name)
       .field("chosen_index", WzgIteratorChosenIndex(path))
       .field("estimated_output_rows",
              WzgIteratorDoubleToString(path->num_output_rows()))

@@ -77,7 +77,8 @@ namespace {
 
 bool wzg_undo_should_log(THD *thd, const dict_table_t *table) {
   if (thd == nullptr || thd->query().str == nullptr ||
-      thd->query().length == 0 || table == nullptr ||
+      thd->query().length == 0 || wzg_probe::raw_sql().empty() ||
+      table == nullptr ||
       table->name.m_name == nullptr) {
     return false;
   }

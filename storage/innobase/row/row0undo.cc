@@ -64,7 +64,8 @@ namespace {
 bool wzg_row_undo_has_user_sql(const trx_t &trx) {
   const THD *thd = trx.mysql_thd != nullptr ? trx.mysql_thd : current_thd;
   return thd != nullptr && thd->query().str != nullptr &&
-         thd->query().length > 0 && thd->thread_id() != 0;
+         thd->query().length > 0 && thd->thread_id() != 0 &&
+         !wzg_probe::raw_sql().empty();
 }
 
 bool wzg_row_undo_user_table(const dict_table_t *table) {

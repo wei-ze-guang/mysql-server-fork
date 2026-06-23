@@ -82,7 +82,8 @@ bool wzg_trx_should_log(trx_t *trx) {
   THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
                                                          : current_thd;
   return thd != nullptr && thd->query().str != nullptr &&
-         thd->query().length > 0 && thd->thread_id() != 0;
+         thd->query().length > 0 && thd->thread_id() != 0 &&
+         !wzg_probe::raw_sql().empty();
 }
 
 std::string wzg_trx_id_text(const trx_t *trx) {

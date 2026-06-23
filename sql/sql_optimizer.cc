@@ -454,6 +454,35 @@ void wzg_emit_optimizer_condition_analysis(
                                                index_candidate)
                    .c_str())
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "condition_analysis")
+      .field("actor.role", "条件候选分析器")
+      .field("action.name", "analyze_condition_candidate")
+      .field("action.phase", "finish")
+      .field("action.summary", "分析 WHERE 条件是否可以成为索引访问候选")
+      .field("object.type", "predicate")
+      .field("object.id", wzg_optimizer_condition_column(item_field))
+      .field("object.expression", wzg_optimizer_item_text(thd, cond))
+      .field("runtime.condition_shape",
+             wzg_optimizer_condition_shape(functype))
+      .field("runtime.condition_operator",
+             wzg_optimizer_condition_operator(functype))
+      .field("runtime.condition_value",
+             wzg_optimizer_condition_values(thd, value, num_values))
+      .field("runtime.is_index_column", is_index_column)
+      .field("runtime.matched_indexes",
+             matched_keys == nullptr ? "无"
+                                     : wzg_optimizer_key_map_list(table,
+                                                                  *matched_keys))
+      .field("decision.index_candidate", index_candidate)
+      .field("decision.reason", reason)
+      .field("decision.candidate_meaning", candidate_meaning)
+      .field("explain_zh.condition",
+             wzg_optimizer_condition_explain(functype))
+      .field("explain_zh.next_step",
+             "后续优化器继续比较候选方案和其他访问方式的成本")
+      .field("debug.source_function",
+             "wzg_emit_optimizer_condition_analysis")
       .field("where_condition", wzg_optimizer_item_text(thd, cond))
       .field("condition_shape", wzg_optimizer_condition_shape(functype))
       .field("condition_explain", wzg_optimizer_condition_explain(functype))
@@ -577,6 +606,38 @@ void wzg_emit_optimizer_access_paths(THD *thd, JOIN *join) {
     WZG_PROBE_EVENT(thd, "optimizer.access_path")
         .message("优化器已为一张表选择最终访问方式")
         .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("actor.component", "optimizer")
+        .field("actor.subsystem", "access_path")
+        .field("actor.role", "访问路径选择器")
+        .field("action.name", "choose_access_path")
+        .field("action.phase", "finish")
+        .field("action.summary", "为单张表确定最终访问方式")
+        .field("object.type", "table")
+        .field("object.id", wzg_optimizer_access_table_name(tab))
+        .field("runtime.plan_step", static_cast<std::uint64_t>(i + 1))
+        .field("runtime.access_type", join_type_str[tab->type()])
+        .field("runtime.chosen_index", wzg_optimizer_chosen_index(tab))
+        .field("runtime.estimated_rows",
+               position == nullptr
+                   ? "未知"
+                   : wzg_optimizer_double_to_string(position->rows_fetched))
+        .field("runtime.estimated_filtered_rows",
+               position == nullptr
+                   ? "未知"
+                   : wzg_optimizer_double_to_string(
+                         position->rows_fetched * position->filter_effect))
+        .field("runtime.estimated_cost",
+               position == nullptr
+                   ? "未知"
+                   : wzg_optimizer_double_to_string(position->read_cost))
+        .field("decision.chosen_access_type", join_type_str[tab->type()])
+        .field("decision.chosen_index", wzg_optimizer_chosen_index(tab))
+        .field("decision.reason", wzg_optimizer_access_reason(tab))
+        .field("explain_zh.access_type",
+               wzg_optimizer_access_type_explain(tab->type()))
+        .field("explain_zh.next_step",
+               "执行器将按照这个访问方式调用存储引擎读取数据")
+        .field("debug.source_function", "wzg_emit_optimizer_access_paths")
         .field("table", wzg_optimizer_access_table_name(tab))
         .field("access_type", join_type_str[tab->type()])
         .field("access_type_explain",
@@ -694,6 +755,23 @@ void wzg_emit_optimizer_join_order(THD *thd, JOIN *join) {
   WZG_PROBE_EVENT(thd, "optimizer.join_order")
       .message(wzg_optimizer_join_order_message(tabs).c_str())
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "join_order")
+      .field("actor.role", "连接顺序选择器")
+      .field("action.name", "choose_join_order")
+      .field("action.phase", "finish")
+      .field("action.summary", "确定多表查询的读取和连接顺序")
+      .field("object.type", "query_block")
+      .field("object.id", wzg_optimizer_join_order_text(tabs))
+      .field("runtime.table_count", static_cast<std::uint64_t>(tabs.size()))
+      .field("runtime.join_order", wzg_optimizer_join_order_text(tabs))
+      .field("runtime.order_details", wzg_optimizer_join_order_details(tabs))
+      .field("decision.first_table", wzg_optimizer_access_table_name(tabs.front()))
+      .field("decision.last_table", wzg_optimizer_access_table_name(tabs.back()))
+      .field("decision.reason", wzg_optimizer_join_order_reason(tabs))
+      .field("explain_zh.next_step",
+             "执行器将按这个顺序逐表读取和连接数据")
+      .field("debug.source_function", "wzg_emit_optimizer_join_order")
       .field("table_count", static_cast<std::uint64_t>(tabs.size()))
       .field("join_order", wzg_optimizer_join_order_text(tabs))
       .field("first_table", wzg_optimizer_access_table_name(tabs.front()))
@@ -798,6 +876,34 @@ void wzg_emit_optimizer_sort_group(THD *thd, JOIN *join) {
   WZG_PROBE_EVENT(thd, "optimizer.sort_group")
       .message("检查排序、分组和去重是否需要临时表或额外排序")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "sort_group")
+      .field("actor.role", "排序分组计划选择器")
+      .field("action.name", "choose_sort_group_strategy")
+      .field("action.phase", "finish")
+      .field("action.summary", "决定 ORDER BY、GROUP BY、DISTINCT 是否需要临时表或 filesort")
+      .field("object.type", "query_block")
+      .field("object.id", "sort_group_distinct")
+      .field("runtime.has_order_by", has_order_by)
+      .field("runtime.order_by",
+             wzg_optimizer_order_list_text(thd, join->order.order))
+      .field("runtime.has_group_by", has_group_by)
+      .field("runtime.group_by",
+             wzg_optimizer_order_list_text(thd, join->group_list.order))
+      .field("runtime.has_distinct", join->select_distinct)
+      .field("runtime.can_use_index_order",
+             join->m_ordered_index_usage != JOIN::ORDERED_INDEX_VOID)
+      .field("runtime.index_order_usage",
+             wzg_optimizer_ordered_index_usage_text(join->m_ordered_index_usage))
+      .field("decision.need_temporary_table", need_tmp_table)
+      .field("decision.temporary_table_reason",
+             wzg_optimizer_temp_table_reason(join))
+      .field("decision.need_filesort", need_filesort)
+      .field("decision.filesort_reason", wzg_optimizer_filesort_reason(join))
+      .field("decision.result", wzg_optimizer_sort_group_action(join))
+      .field("explain_zh.next_step",
+             "继续生成最终执行计划，执行器后续按计划读取、排序、分组或返回结果")
+      .field("debug.source_function", "wzg_emit_optimizer_sort_group")
       .field("has_order_by", has_order_by)
       .field("order_by", wzg_optimizer_order_list_text(thd, join->order.order))
       .field("has_group_by", has_group_by)
@@ -894,6 +1000,33 @@ void wzg_emit_optimizer_finish(THD *thd, JOIN *join) {
   WZG_PROBE_EVENT(thd, "optimizer.finish")
       .message(wzg_optimizer_finish_message(tabs, join).c_str())
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "join_optimizer")
+      .field("actor.role", "最终计划生成器")
+      .field("action.name", "finalize_plan")
+      .field("action.phase", "finish")
+      .field("action.summary", "生成查询块的最终执行计划摘要")
+      .field("object.type", "query_block")
+      .field("object.id", wzg_optimizer_join_order_text(tabs))
+      .field("runtime.table_count", static_cast<std::uint64_t>(tabs.size()))
+      .field("runtime.join_order", wzg_optimizer_join_order_text(tabs))
+      .field("runtime.access_summary", wzg_optimizer_access_summary(tabs))
+      .field("runtime.estimated_result_rows",
+             wzg_optimizer_final_rows(tabs, join))
+      .field("runtime.estimated_total_cost",
+             wzg_optimizer_final_cost(tabs, join))
+      .field("decision.optimize_result", "success")
+      .field("decision.need_temporary_table",
+             join->explain_flags.any(ESP_USING_TMPTABLE))
+      .field("decision.temporary_table_reason",
+             wzg_optimizer_temp_table_reason(join))
+      .field("decision.need_filesort",
+             join->explain_flags.any(ESP_USING_FILESORT))
+      .field("decision.filesort_reason", wzg_optimizer_filesort_reason(join))
+      .field("decision.plan_summary", wzg_optimizer_plan_summary(tabs, join))
+      .field("explain_zh.next_step",
+             "进入执行器阶段，按这个计划调用存储引擎读取数据")
+      .field("debug.source_function", "wzg_emit_optimizer_finish")
       .field("optimize_result", "success")
       .field("table_count", static_cast<std::uint64_t>(tabs.size()))
       .field("join_order", wzg_optimizer_join_order_text(tabs))
@@ -971,6 +1104,30 @@ void wzg_emit_optimizer_condition_attach(THD *thd, JOIN *join, JOIN_TAB *tab,
       .message(condition == nullptr ? "这张表没有需要单独挂载的过滤条件"
                                     : "优化器已决定这个过滤条件在哪张表读取后判断")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "condition_attach")
+      .field("actor.role", "谓词下推位置选择器")
+      .field("action.name", "attach_condition")
+      .field("action.phase", "finish")
+      .field("action.summary", "决定过滤条件在执行计划中的检查位置")
+      .field("object.type", "table")
+      .field("object.id", wzg_optimizer_table_name(tab->table_ref))
+      .field("runtime.plan_step", static_cast<std::uint64_t>(plan_index + 1))
+      .field("runtime.attached_condition",
+             wzg_optimizer_item_text(thd, condition))
+      .field("runtime.condition_source", wzg_optimizer_condition_source(tab))
+      .field("runtime.condition_uses_tables",
+             condition == nullptr ? "无"
+                                  : wzg_optimizer_tables_for_map(
+                                        join, condition->used_tables()))
+      .field("runtime.available_tables_now",
+             wzg_optimizer_tables_for_map(join, tab->prefix_tables()))
+      .field("decision.when_checked", wzg_optimizer_condition_attach_time(tab))
+      .field("decision.reason",
+             wzg_optimizer_condition_attach_reason(join, tab))
+      .field("explain_zh.next_step",
+             "执行器读取到这张表的行后，会按这里挂载的条件做过滤")
+      .field("debug.source_function", "wzg_emit_optimizer_condition_attach")
       .field("plan_step", static_cast<std::uint64_t>(plan_index + 1))
       .field("target_table", wzg_optimizer_table_name(tab->table_ref))
       .field("attached_condition", wzg_optimizer_item_text(thd, condition))
@@ -1036,6 +1193,364 @@ std::string wzg_optimizer_range_extra(const AccessPath *path) {
   return text.length() == 0 ? "无" : std::string(text.ptr(), text.length());
 }
 
+uint wzg_optimizer_range_index_no(const AccessPath *path) {
+  if (path == nullptr) return MAX_KEY;
+  switch (path->type) {
+    case AccessPath::INDEX_RANGE_SCAN:
+      return path->index_range_scan().index;
+    case AccessPath::INDEX_SKIP_SCAN:
+      return path->index_skip_scan().index;
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      return path->group_index_skip_scan().index;
+    default:
+      return MAX_KEY;
+  }
+}
+
+uint wzg_optimizer_used_key_parts(const AccessPath *path) {
+  if (path == nullptr) return 0;
+  switch (path->type) {
+    case AccessPath::INDEX_RANGE_SCAN:
+      return path->index_range_scan().num_used_key_parts;
+    case AccessPath::INDEX_SKIP_SCAN:
+      return path->index_skip_scan().num_used_key_parts;
+    case AccessPath::GROUP_INDEX_SKIP_SCAN:
+      return path->group_index_skip_scan().num_used_key_parts;
+    default:
+      return 0;
+  }
+}
+
+std::string wzg_optimizer_key_name(const TABLE *table, uint key_no) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  return key.name == nullptr ? "<unnamed>" : key.name;
+}
+
+std::string wzg_optimizer_index_full_name(const TABLE *table, uint key_no) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+  const KEY &key = table->key_info[key_no];
+  std::string value = wzg_optimizer_key_name(table, key_no);
+  value.push_back('(');
+  value.append(wzg_optimizer_key_parts(key));
+  value.push_back(')');
+  return value;
+}
+
+std::string wzg_optimizer_used_keypart_names(const TABLE *table, uint key_no,
+                                             uint used_key_parts) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no >= table->s->keys || used_key_parts == 0)
+    return "无";
+
+  const KEY &key = table->key_info[key_no];
+  const uint limit = std::min<uint>(used_key_parts, key.user_defined_key_parts);
+  std::string value;
+  for (uint part_no = 0; part_no < limit; ++part_no) {
+    if (part_no > 0) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    value.append(part.field != nullptr && part.field->field_name != nullptr
+                     ? part.field->field_name
+                     : "<expression>");
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_optimizer_unused_keypart_names_after_prefix(
+    const TABLE *table, uint key_no, uint used_key_parts) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+
+  const KEY &key = table->key_info[key_no];
+  if (used_key_parts >= key.user_defined_key_parts) return "无";
+
+  std::string value;
+  for (uint part_no = used_key_parts; part_no < key.user_defined_key_parts;
+       ++part_no) {
+    if (!value.empty()) value.append(", ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    value.append(part.field != nullptr && part.field->field_name != nullptr
+                     ? part.field->field_name
+                     : "<expression>");
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_optimizer_keypart_roles(const TABLE *table, uint key_no,
+                                        uint used_key_parts) {
+  if (table == nullptr || table->s == nullptr || table->key_info == nullptr ||
+      key_no >= table->s->keys)
+    return "无";
+
+  const KEY &key = table->key_info[key_no];
+  std::string value;
+  for (uint part_no = 0; part_no < key.user_defined_key_parts; ++part_no) {
+    if (part_no > 0) value.append("; ");
+    const KEY_PART_INFO &part = key.key_part[part_no];
+    const char *field_name =
+        part.field != nullptr && part.field->field_name != nullptr
+            ? part.field->field_name
+            : "<expression>";
+    value.append(wzg_optimizer_to_string(static_cast<ha_rows>(part_no + 1)));
+    value.append(". ");
+    value.append(field_name);
+    value.append(": ");
+    if (part_no < used_key_parts)
+      value.append("用于索引定位前缀");
+    else if (used_key_parts == 0)
+      value.append("未用于索引定位");
+    else
+      value.append("没有继续用于索引定位，可能只能作为过滤或排序参考");
+  }
+  return value.empty() ? "无" : value;
+}
+
+std::string wzg_optimizer_index_candidate_state(const TABLE *table,
+                                                const JOIN_TAB *tab,
+                                                uint key_no,
+                                                uint chosen_range_key) {
+  if (table == nullptr || tab == nullptr || table->s == nullptr ||
+      key_no >= table->s->keys)
+    return "unknown";
+  if (chosen_range_key == key_no) return "chosen_range_access";
+  if (table->quick_keys.is_set(key_no)) return "range_usable_not_final";
+  if (table->possible_quick_keys.is_set(key_no))
+    return "possible_range_candidate";
+  if (tab->const_keys.is_set(key_no)) return "entered_range_analysis";
+  if (tab->skip_scan_keys.is_set(key_no)) return "skip_scan_candidate";
+  if (table->keys_in_use_for_query.is_set(key_no)) return "available_index";
+  return "not_available_for_query";
+}
+
+std::string wzg_optimizer_index_candidate_meaning(const char *state) {
+  if (strcmp(state, "chosen_range_access") == 0)
+    return "这个索引成为本次 range 访问方案使用的索引";
+  if (strcmp(state, "range_usable_not_final") == 0)
+    return "range 优化器确认这个索引能形成范围访问，但最终计划可能因为成本或连接顺序选择了别的访问方式";
+  if (strcmp(state, "possible_range_candidate") == 0)
+    return "这个索引被 range 优化器识别为可能可用，但没有成为 quick range 方案";
+  if (strcmp(state, "entered_range_analysis") == 0)
+    return "这个索引进入 range 分析候选，说明条件里存在可尝试匹配该索引的字段";
+  if (strcmp(state, "skip_scan_candidate") == 0)
+    return "这个组合索引不满足普通最左前缀定位，但可能尝试 skip scan";
+  if (strcmp(state, "available_index") == 0)
+    return "索引在表上可用，但当前条件没有让它进入 range 定位候选";
+  return "这个索引当前不可用于本查询的索引定位路径";
+}
+
+std::string wzg_optimizer_reject_reason(const TABLE *table, const JOIN_TAB *tab,
+                                        uint key_no, uint chosen_range_key) {
+  if (table == nullptr || tab == nullptr || table->s == nullptr ||
+      key_no >= table->s->keys)
+    return "无法判断";
+  if (chosen_range_key == key_no) return "没有拒绝；这是当前 range 方案使用的索引";
+  if (table->quick_keys.is_set(key_no))
+    return "索引本身可以形成 range 访问，但最终计划没有选择它；通常是成本、预计行数、排序需求或连接顺序比较后不占优";
+  if (table->possible_quick_keys.is_set(key_no))
+    return "索引只停留在可能候选，没有形成最终 quick range；常见原因是可用前缀太短、范围太宽、成本不划算或条件无法形成紧凑边界";
+  if (tab->skip_scan_keys.is_set(key_no))
+    return "普通最左前缀不完整，优化器把它当作 skip scan 候选；如果 skip scan 成本不低，就不会采用";
+  if (tab->const_keys.is_set(key_no))
+    return "索引进入过 range 分析候选，但没有形成可采用的 range 方案；常见于函数包字段、隐式转换、LIKE 前导通配符、OR 结构复杂或组合索引前缀断开";
+  if (table->keys_in_use_for_query.is_set(key_no))
+    return "索引在表上可用，但当前 WHERE/JOIN 条件没有匹配它的可定位前缀";
+  return "索引没有进入当前查询可用索引集合，可能被 hint/不可见索引/表状态排除";
+}
+
+void wzg_emit_optimizer_index_candidate_analysis(THD *thd, JOIN_TAB *tab,
+                                                 Item *condition,
+                                                 const AccessPath *range_scan) {
+  if (thd == nullptr || tab == nullptr || tab->table() == nullptr ||
+      tab->table()->s == nullptr || tab->table()->key_info == nullptr)
+    return;
+
+  TABLE *table = tab->table();
+  const uint chosen_range_key = wzg_optimizer_range_index_no(range_scan);
+  for (uint key_no = 0; key_no < table->s->keys; ++key_no) {
+    const std::string state =
+        wzg_optimizer_index_candidate_state(table, tab, key_no,
+                                            chosen_range_key);
+    const uint used_key_parts =
+        chosen_range_key == key_no
+            ? wzg_optimizer_used_key_parts(range_scan)
+            : (table->quick_keys.is_set(key_no) ? table->quick_key_parts[key_no]
+                                                : 0);
+    const bool is_composite =
+        table->key_info[key_no].user_defined_key_parts > 1;
+
+    WZG_PROBE_EVENT(thd, "optimizer.index_candidate_analysis")
+        .message("优化器正在解释这个索引在本次查询中的候选状态")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("actor.component", "optimizer")
+        .field("actor.subsystem", "range_optimizer")
+        .field("actor.role", "索引候选解释器")
+        .field("action.name", "explain_index_candidate")
+        .field("action.phase", "finish")
+        .field("object.type", "index")
+        .field("object.id", wzg_optimizer_index_full_name(table, key_no))
+        .field("runtime.table", wzg_optimizer_table_name(tab->table_ref))
+        .field("runtime.where_condition",
+               wzg_optimizer_item_text(thd, condition))
+        .field("runtime.index", wzg_optimizer_index_full_name(table, key_no))
+        .field("runtime.index_keyparts",
+               wzg_optimizer_key_parts(table->key_info[key_no]))
+        .field("runtime.is_composite_index", is_composite)
+        .field("runtime.entered_range_candidates",
+               tab->const_keys.is_set(key_no))
+        .field("runtime.skip_scan_candidate",
+               tab->skip_scan_keys.is_set(key_no))
+        .field("runtime.range_usable_after_analysis",
+               table->quick_keys.is_set(key_no))
+        .field("runtime.possible_quick_key",
+               table->possible_quick_keys.is_set(key_no))
+        .field("runtime.used_keypart_count",
+               static_cast<std::uint64_t>(used_key_parts))
+        .field("runtime.used_keyparts",
+               wzg_optimizer_used_keypart_names(table, key_no, used_key_parts))
+        .field("runtime.unused_keyparts_after_prefix",
+               wzg_optimizer_unused_keypart_names_after_prefix(
+                   table, key_no, used_key_parts))
+        .field("runtime.estimated_rows_if_quick",
+               table->quick_keys.is_set(key_no)
+                   ? wzg_optimizer_to_string(table->quick_rows[key_no])
+                   : "无")
+        .field("decision.state", state)
+        .field("decision.reason",
+               wzg_optimizer_index_candidate_meaning(state.c_str()))
+        .field("decision.reject_reason",
+               wzg_optimizer_reject_reason(table, tab, key_no,
+                                           chosen_range_key))
+        .field("explain_zh.leftmost_prefix",
+               "组合索引普通定位必须从最左列开始连续使用；中间断开后，后面的列通常不能继续缩小 B+Tree 定位范围")
+        .field("explain_zh.range_stop",
+               "如果某个 keypart 变成范围边界，后续 keypart 常常只能作为过滤条件，不能继续决定 B+Tree 起止位置")
+        .field("debug.source_file", "sql/sql_optimizer.cc")
+        .field("debug.source_function",
+               "wzg_emit_optimizer_index_candidate_analysis")
+        .emit();
+  }
+}
+
+void wzg_emit_optimizer_composite_index_keyparts(THD *thd, JOIN_TAB *tab,
+                                                 const AccessPath *range_scan) {
+  if (thd == nullptr || tab == nullptr || tab->table() == nullptr ||
+      tab->table()->s == nullptr || tab->table()->key_info == nullptr)
+    return;
+
+  TABLE *table = tab->table();
+  const uint chosen_range_key = wzg_optimizer_range_index_no(range_scan);
+  for (uint key_no = 0; key_no < table->s->keys; ++key_no) {
+    const KEY &key = table->key_info[key_no];
+    if (key.user_defined_key_parts <= 1) continue;
+    if (!table->quick_keys.is_set(key_no) && !tab->const_keys.is_set(key_no) &&
+        !tab->skip_scan_keys.is_set(key_no) && chosen_range_key != key_no)
+      continue;
+
+    const uint used_key_parts =
+        chosen_range_key == key_no
+            ? wzg_optimizer_used_key_parts(range_scan)
+            : (table->quick_keys.is_set(key_no) ? table->quick_key_parts[key_no]
+                                                : 0);
+    WZG_PROBE_EVENT(thd, "optimizer.composite_index_keyparts")
+        .message("组合索引每个 keypart 在本次查询中的使用情况已经明确")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("actor.component", "optimizer")
+        .field("actor.subsystem", "range_optimizer")
+        .field("actor.role", "组合索引前缀分析器")
+        .field("action.name", "explain_composite_index_keyparts")
+        .field("action.phase", "finish")
+        .field("object.type", "index")
+        .field("object.id", wzg_optimizer_index_full_name(table, key_no))
+        .field("runtime.table", wzg_optimizer_table_name(tab->table_ref))
+        .field("runtime.index", wzg_optimizer_index_full_name(table, key_no))
+        .field("runtime.keypart_count",
+               static_cast<std::uint64_t>(key.user_defined_key_parts))
+        .field("runtime.used_keypart_count",
+               static_cast<std::uint64_t>(used_key_parts))
+        .field("runtime.used_keyparts",
+               wzg_optimizer_used_keypart_names(table, key_no, used_key_parts))
+        .field("runtime.unused_keyparts_after_prefix",
+               wzg_optimizer_unused_keypart_names_after_prefix(
+                   table, key_no, used_key_parts))
+        .field("runtime.keypart_roles",
+               wzg_optimizer_keypart_roles(table, key_no, used_key_parts))
+        .field("decision.leftmost_prefix_used", used_key_parts > 0)
+        .field("decision.result",
+               used_key_parts == 0
+                   ? "这个组合索引没有形成普通最左前缀定位"
+                   : "这个组合索引使用了从最左列开始的连续前缀")
+        .field("decision.impact",
+               "used_keypart_count 会影响后续 handler 收到的 keypart_map 和范围边界，也决定 InnoDB search_tuple 里有几个索引字段")
+        .field("explain_zh.keypart_role",
+               "用于索引定位前缀的 keypart 会参与 B+Tree 起止位置；未进入前缀的 keypart 可能仍被 Server 层或 ICP 用来过滤")
+        .field("debug.source_file", "sql/sql_optimizer.cc")
+        .field("debug.source_function",
+               "wzg_emit_optimizer_composite_index_keyparts")
+        .emit();
+  }
+}
+
+void wzg_emit_optimizer_index_reject_reason(THD *thd, JOIN_TAB *tab,
+                                            const AccessPath *range_scan) {
+  if (thd == nullptr || tab == nullptr || tab->table() == nullptr ||
+      tab->table()->s == nullptr || tab->table()->key_info == nullptr)
+    return;
+
+  TABLE *table = tab->table();
+  const uint chosen_range_key = wzg_optimizer_range_index_no(range_scan);
+  for (uint key_no = 0; key_no < table->s->keys; ++key_no) {
+    if (chosen_range_key == key_no) continue;
+    if (!table->keys_in_use_for_query.is_set(key_no) &&
+        !tab->const_keys.is_set(key_no) && !tab->skip_scan_keys.is_set(key_no) &&
+        !table->possible_quick_keys.is_set(key_no) &&
+        !table->quick_keys.is_set(key_no))
+      continue;
+
+    const std::string state =
+        wzg_optimizer_index_candidate_state(table, tab, key_no,
+                                            chosen_range_key);
+    WZG_PROBE_EVENT(thd, "optimizer.index_reject_reason")
+        .message("优化器解释一个索引为什么没有成为当前 range 访问索引")
+        .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("actor.component", "optimizer")
+        .field("actor.subsystem", "range_optimizer")
+        .field("actor.role", "索引拒绝原因解释器")
+        .field("action.name", "explain_index_reject_reason")
+        .field("action.phase", "finish")
+        .field("object.type", "index")
+        .field("object.id", wzg_optimizer_index_full_name(table, key_no))
+        .field("runtime.table", wzg_optimizer_table_name(tab->table_ref))
+        .field("runtime.index", wzg_optimizer_index_full_name(table, key_no))
+        .field("runtime.state_before_reject", state)
+        .field("runtime.chosen_range_index",
+               wzg_optimizer_index_full_name(table, chosen_range_key))
+        .field("runtime.entered_range_candidates",
+               tab->const_keys.is_set(key_no))
+        .field("runtime.range_usable_after_analysis",
+               table->quick_keys.is_set(key_no))
+        .field("runtime.used_keypart_count",
+               static_cast<std::uint64_t>(
+                   table->quick_keys.is_set(key_no)
+                       ? table->quick_key_parts[key_no]
+                       : 0))
+        .field("decision.reject_reason",
+               wzg_optimizer_reject_reason(table, tab, key_no,
+                                           chosen_range_key))
+        .field("decision.result", "没有作为当前 range 访问索引")
+        .field("explain_zh.index_invalid",
+               "这里的“索引失效”更准确地说是：这个索引没有形成或没有赢得本次索引定位方案；原因要看候选状态、keypart 前缀和成本比较")
+        .field("debug.source_file", "sql/sql_optimizer.cc")
+        .field("debug.source_function",
+               "wzg_emit_optimizer_index_reject_reason")
+        .emit();
+  }
+}
+
 std::string wzg_optimizer_range_result_text(const AccessPath *path,
                                             bool impossible_range) {
   if (impossible_range) return "range 分析发现条件不可能匹配记录";
@@ -1055,6 +1570,43 @@ void wzg_emit_optimizer_range_analysis(THD *thd, JOIN *join, JOIN_TAB *tab,
   WZG_PROBE_EVENT(thd, "optimizer.range_analysis")
       .message("range 优化器分析过滤条件，判断能否变成索引范围读取")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "range_optimizer")
+      .field("actor.role", "索引范围候选分析器")
+      .field("action.name", "analyze_range_access")
+      .field("action.phase", "finish")
+      .field("action.summary", "分析过滤条件能否形成索引范围访问方案")
+      .field("object.type", "table")
+      .field("object.id", wzg_optimizer_table_name(tab->table_ref))
+      .field("runtime.checked_condition",
+             wzg_optimizer_item_text(thd, condition))
+      .field("runtime.candidate_indexes",
+             wzg_optimizer_key_map_list(tab->table(), tab->const_keys))
+      .field("runtime.skip_scan_candidate_indexes",
+             wzg_optimizer_key_map_list(tab->table(), tab->skip_scan_keys))
+      .field("runtime.table_scan_rows_before_range",
+             wzg_optimizer_to_string(tab->records()))
+      .field("runtime.table_scan_cost_before_range",
+             wzg_optimizer_double_to_string(tab->read_time))
+      .field("decision.range_result",
+             wzg_optimizer_range_result_text(range_scan, impossible_range))
+      .field("decision.range_access_type",
+             wzg_optimizer_range_path_type(range_scan))
+      .field("decision.range_used_index",
+             wzg_optimizer_range_used_index(tab->table(), range_scan))
+      .field("decision.estimated_range_rows",
+             records == HA_POS_ERROR ? "未知"
+                                     : wzg_optimizer_to_string(records))
+      .field("decision.estimated_range_cost",
+             range_scan == nullptr
+                 ? "无"
+                 : wzg_optimizer_double_to_string(range_scan->cost()))
+      .field("explain_zh.range_extra",
+             wzg_optimizer_range_extra(range_scan))
+      .field("explain_zh.next_step",
+             "优化器继续把 range 方案放进整体 join 顺序和访问方式成本比较")
+      .field("debug.impossible_range", impossible_range)
+      .field("debug.source_function", "wzg_emit_optimizer_range_analysis")
       .field("target_table", wzg_optimizer_table_name(tab->table_ref))
       .field("checked_condition", wzg_optimizer_item_text(thd, condition))
       .field("candidate_indexes",
@@ -1081,6 +1633,10 @@ void wzg_emit_optimizer_range_analysis(THD *thd, JOIN *join, JOIN_TAB *tab,
       .field("next_step", "优化器继续把 range 方案放进整体 join 顺序和访问方式成本比较")
       .field("note", "这里是 range optimizer 的分析结果，不等于最终一定采用该 range 方案")
       .emit();
+
+  wzg_emit_optimizer_index_candidate_analysis(thd, tab, condition, range_scan);
+  wzg_emit_optimizer_composite_index_keyparts(thd, tab, range_scan);
+  wzg_emit_optimizer_index_reject_reason(thd, tab, range_scan);
 }
 
 const char *wzg_optimizer_subquery_type_text(
@@ -1191,6 +1747,31 @@ void wzg_emit_optimizer_subquery_strategy_start(
   WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
       .message("优化器开始为子查询选择执行方式")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "subquery_strategy")
+      .field("actor.role", "子查询策略选择器")
+      .field("action.name", "choose_subquery_strategy")
+      .field("action.phase", "start")
+      .field("action.summary", "开始为 IN 子查询选择执行策略")
+      .field("object.type", "subquery")
+      .field("object.id",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("object.expression",
+             wzg_optimizer_query_expression_text(thd, join->query_expression()))
+      .field("runtime.subquery_type",
+             wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
+      .field("runtime.outer_select_number",
+             wzg_optimizer_outer_select_number(join->query_expression()))
+      .field("runtime.current_strategy",
+             wzg_optimizer_subquery_strategy_text(current_strategy))
+      .field("decision.current_status",
+             wzg_optimizer_subquery_strategy_text(current_strategy))
+      .field("explain_zh.strategy_meaning",
+             wzg_optimizer_subquery_strategy_meaning(current_strategy))
+      .field("explain_zh.next_step",
+             "如果存在多个可选策略，继续比较 IN-to-EXISTS 和物化成本")
+      .field("debug.source_function",
+             "wzg_emit_optimizer_subquery_strategy_start")
       .field("decision_stage", "start")
       .field("subquery_type",
              wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
@@ -1216,6 +1797,35 @@ void wzg_emit_optimizer_subquery_strategy_cost(
   WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
       .message("优化器比较 IN-to-EXISTS 和子查询物化的成本")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "subquery_strategy")
+      .field("actor.role", "子查询策略成本比较器")
+      .field("action.name", "compare_subquery_strategy_cost")
+      .field("action.phase", "finish")
+      .field("action.summary", "比较 IN-to-EXISTS 和子查询物化的估算成本")
+      .field("object.type", "subquery")
+      .field("object.id",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("runtime.allowed_strategy",
+             wzg_optimizer_subquery_strategy_text(allowed_strategy))
+      .field("runtime.subquery_evaluations",
+             wzg_optimizer_double_to_string(subq_executions))
+      .field("runtime.cost_exists_total",
+             wzg_optimizer_double_to_string(cost_exists))
+      .field("runtime.cost_materialize_table",
+             wzg_optimizer_double_to_string(cost_mat_table))
+      .field("runtime.cost_materialization_total",
+             wzg_optimizer_double_to_string(cost_mat))
+      .field("decision.chosen_strategy",
+             mat_chosen ? "子查询物化" : "IN-to-EXISTS / EXISTS 执行")
+      .field("decision.reason",
+             mat_chosen
+                 ? "物化总成本更低，或者优化器设置要求使用物化"
+                 : "按当前估算，重复按 EXISTS 方式执行更便宜")
+      .field("explain_zh.next_step", "把选中的子查询策略应用到执行计划")
+      .field("debug.mat_chosen", mat_chosen)
+      .field("debug.source_function",
+             "wzg_emit_optimizer_subquery_strategy_cost")
       .field("decision_stage", "cost_compare")
       .field("subquery_select_number",
              static_cast<std::uint64_t>(join->query_block->select_number))
@@ -1247,6 +1857,29 @@ void wzg_emit_optimizer_subquery_strategy_finish(
   WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
       .message("优化器已确定子查询执行方式")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "subquery_strategy")
+      .field("actor.role", "子查询策略选择器")
+      .field("action.name", "choose_subquery_strategy")
+      .field("action.phase", "finish")
+      .field("action.summary", "确定子查询最终执行策略")
+      .field("object.type", "subquery")
+      .field("object.id",
+             static_cast<std::uint64_t>(join->query_block->select_number))
+      .field("object.expression",
+             wzg_optimizer_query_expression_text(thd, join->query_expression()))
+      .field("runtime.subquery_type",
+             wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
+      .field("runtime.outer_select_number",
+             wzg_optimizer_outer_select_number(join->query_expression()))
+      .field("decision.chosen_strategy",
+             wzg_optimizer_subquery_strategy_text(chosen_strategy))
+      .field("decision.reason",
+             wzg_optimizer_subquery_strategy_meaning(chosen_strategy))
+      .field("explain_zh.next_step",
+             "继续生成包含该子查询策略的最终执行计划")
+      .field("debug.source_function",
+             "wzg_emit_optimizer_subquery_strategy_finish")
       .field("decision_stage", "finish")
       .field("subquery_type",
              wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
@@ -1271,6 +1904,25 @@ void wzg_emit_optimizer_index_subquery_engine(THD *thd, JOIN *join,
   WZG_PROBE_EVENT(thd, "optimizer.subquery_strategy")
       .message("优化器选择使用 index subquery engine 执行这个 IN 子查询")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "subquery_strategy")
+      .field("actor.role", "index subquery engine 选择器")
+      .field("action.name", "choose_index_subquery_engine")
+      .field("action.phase", "finish")
+      .field("action.summary", "为 IN 子查询选择索引探测执行引擎")
+      .field("object.type", "subquery_table")
+      .field("object.id", wzg_optimizer_table_name(tab->table_ref))
+      .field("runtime.subquery_type",
+             wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
+      .field("runtime.access_type", join_type_str[tab->type()])
+      .field("runtime.chosen_index", wzg_optimizer_join_tab_chosen_index(tab))
+      .field("decision.chosen_engine", "index_subquery_engine")
+      .field("decision.reason",
+             "外层给出一个值后，子查询表可以用索引快速判断是否存在匹配值")
+      .field("explain_zh.next_step",
+             "执行阶段会通过 index subquery engine 做匹配检查")
+      .field("debug.source_function",
+             "wzg_emit_optimizer_index_subquery_engine")
       .field("decision_stage", "index_subquery_engine")
       .field("subquery_type",
              wzg_optimizer_subquery_type_text(in_pred->subquery_type()))
@@ -1325,6 +1977,24 @@ void wzg_emit_optimizer_table_stats(THD *thd, Query_block *query_block) {
       WZG_PROBE_EVENT(thd, "optimizer.table_stats")
           .message("查看查询中的内部表对象，准备判断它能怎样参与执行计划")
           .sql_command(get_sql_command_string(thd->lex->sql_command))
+          .field("actor.component", "optimizer")
+          .field("actor.subsystem", "table_stats")
+          .field("actor.role", "表统计信息读取器")
+          .field("action.name", "inspect_table_stats")
+          .field("action.phase", "finish")
+          .field("action.summary", "检查单表统计信息和索引定义")
+          .field("object.type", "table")
+          .field("object.id", wzg_optimizer_table_name(table_ref))
+          .field("runtime.current_filter",
+                 wzg_optimizer_item_text(thd, query_block->where_cond()))
+          .field("runtime.table_rows_estimate", "未知")
+          .field("runtime.found_indexes", "无可直接读取的索引定义")
+          .field("runtime.indexes_that_match_filter_text", "未知")
+          .field("decision.result", "内部表对象尚未打开，不能读取存储引擎统计信息")
+          .field("explain_zh.stats_source", "查询块中的内部表对象")
+          .field("explain_zh.next_step", "继续比较可行的查表方式")
+          .field("debug.table_opened", false)
+          .field("debug.source_function", "wzg_emit_optimizer_table_stats")
           .field("operation", "检查单表统计信息和索引")
           .field("target_table", wzg_optimizer_table_name(table_ref))
           .field("current_filter",
@@ -1347,6 +2017,26 @@ void wzg_emit_optimizer_table_stats(THD *thd, Query_block *query_block) {
     WZG_PROBE_EVENT(thd, "optimizer.table_stats")
         .message("查看表的数据量和索引，判断有哪些查表方式可以选择")
         .sql_command(get_sql_command_string(thd->lex->sql_command))
+        .field("actor.component", "optimizer")
+        .field("actor.subsystem", "table_stats")
+        .field("actor.role", "表统计信息读取器")
+        .field("action.name", "inspect_table_stats")
+        .field("action.phase", "finish")
+        .field("action.summary", "检查单表统计信息和索引定义")
+        .field("object.type", "table")
+        .field("object.id", table_name)
+        .field("runtime.current_filter", filter)
+        .field("runtime.table_rows_estimate",
+               wzg_optimizer_to_string(table->file->stats.records))
+        .field("runtime.found_indexes", wzg_optimizer_index_list(table))
+        .field("runtime.indexes_that_match_filter_text",
+               wzg_optimizer_indexes_matching_filter_text(
+                   thd, table, query_block->where_cond()))
+        .field("decision.result", "表统计信息和索引定义已读出，可用于后续成本比较")
+        .field("explain_zh.stats_source", "表定义和存储引擎提供的统计信息")
+        .field("explain_zh.next_step", "比较全表扫描和索引查找等方案的成本")
+        .field("debug.table_opened", true)
+        .field("debug.source_function", "wzg_emit_optimizer_table_stats")
         .field("operation", "检查单表统计信息和索引")
         .field("target_table", table_name)
         .field("current_filter", filter)
@@ -1627,6 +2317,33 @@ bool JOIN::optimize(bool finalize_access_paths) {
   WZG_PROBE_EVENT(thd, "optimizer.start")
       .message("开始优化查询，准备决定这条 SQL 怎样执行更快")
       .sql_command(get_sql_command_string(thd->lex->sql_command))
+      .field("actor.component", "optimizer")
+      .field("actor.subsystem", "join_optimizer")
+      .field("actor.role", "查询计划优化器")
+      .field("action.name", "optimize_query_block")
+      .field("action.phase", "start")
+      .field("action.summary", "开始为当前查询块选择执行计划")
+      .field("object.type", "query_block")
+      .field("object.id",
+             static_cast<std::uint64_t>(query_block->select_number))
+      .field("runtime.table_count",
+             static_cast<std::uint64_t>(query_block->leaf_table_count))
+      .field("runtime.tables", wzg_optimizer_tables(query_block))
+      .field("runtime.return_columns",
+             wzg_optimizer_return_columns(thd, fields))
+      .field("runtime.where_condition",
+             wzg_optimizer_item_text(thd, query_block->where_cond()))
+      .field("runtime.has_join", query_block->leaf_table_count > 1)
+      .field("runtime.has_subquery",
+             query_block->first_inner_query_expression() != nullptr)
+      .field("runtime.has_order_by", !order.empty())
+      .field("runtime.has_group_by", !group_list.empty())
+      .field("decision.optimize_result", "started")
+      .field("explain_zh.optimizer_input",
+             wzg_optimizer_input_summary(thd, query_block, fields))
+      .field("explain_zh.next_step",
+             "查看表的数据量、索引和过滤条件，选择更省成本的执行方式")
+      .field("debug.source_function", "JOIN::optimize")
       .field("optimize_result", "started")
       .field("query_block_number",
              static_cast<std::uint64_t>(query_block->select_number))

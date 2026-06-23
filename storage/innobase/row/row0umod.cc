@@ -82,6 +82,7 @@ bool wzg_undo_mod_should_log(const undo_node_t *node) {
                                                        : current_thd;
   if (node == nullptr || thd == nullptr || thd->query().str == nullptr ||
       thd->query().length == 0 || thd->thread_id() == 0 ||
+      wzg_probe::raw_sql().empty() ||
       node->table == nullptr || node->table->name.m_name == nullptr) {
     return false;
   }
