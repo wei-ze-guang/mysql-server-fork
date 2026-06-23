@@ -64,14 +64,6 @@ void append_uint_field(std::ostringstream &out, const char *key,
   out << value;
 }
 
-void append_bool_field(std::ostringstream &out, const char *key, bool value,
-                       bool &first) {
-  if (!first) out << ',';
-  first = false;
-  append_key(out, key);
-  out << (value ? "true" : "false");
-}
-
 }  // namespace
 
 std::string to_json_line(const TraceEvent &event) {
@@ -79,28 +71,21 @@ std::string to_json_line(const TraceEvent &event) {
   bool first = true;
 
   out << '{';
-  append_string_field(out, "schema", event.schema, first);
   append_uint_field(out, "event_id", event.event_id, first);
   append_uint_field(out, "ts_ns", event.ts_ns, first);
   append_uint_field(out, "duration_ns", event.duration_ns, first);
   append_string_field(out, "event_name", event.event_name, first);
   append_string_field(out, "event_phase", event.event_phase, first);
-  append_string_field(out, "event_level", event.event_level, first);
   append_string_field(out, "message", event.message, first);
   append_uint_field(out, "thread_id", event.thread_id, first);
   append_uint_field(out, "connection_id", event.connection_id, first);
   append_string_field(out, "connection_uuid", event.connection_uuid, first);
   append_uint_field(out, "query_id", event.query_id, first);
-  append_string_field(out, "user", event.user, first);
-  append_string_field(out, "host", event.host, first);
   append_string_field(out, "db", event.db, first);
   append_string_field(out, "command", event.command, first);
   append_string_field(out, "sql_command", event.sql_command, first);
   append_string_field(out, "raw_sql", event.raw_sql, first);
   append_string_field(out, "query", event.query, first);
-  append_bool_field(out, "error", event.error, first);
-  append_uint_field(out, "error_code", event.error_code, first);
-  append_uint_field(out, "warning_count", event.warning_count, first);
 
   if (!first) out << ',';
   append_key(out, "fields");
