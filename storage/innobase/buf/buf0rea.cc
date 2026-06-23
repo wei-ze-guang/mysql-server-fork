@@ -33,6 +33,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <mysql/service_thd_wait.h>
 #include <stddef.h>
+#include <cstdint>
 
 #include "buf0buf.h"
 #include "buf0dblwr.h"
@@ -46,11 +47,58 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "mtr0mtr.h"
 #include "my_dbug.h"
 
+#include "current_thd.h"
 #include "os0file.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "trx0sys.h"
 #include "ut0new.h"
+
+namespace {
+
+bool wzg_rea_should_log_sql_context() {
+  return current_thd != nullptr && !wzg_probe::raw_sql().empty();
+}
+
+bool wzg_rea_allow_page_read_event() {
+  static thread_local std::uint64_t last_query_id = 0;
+  static thread_local std::uint64_t count_for_query = 0;
+
+  const auto query_id = static_cast<std::uint64_t>(current_thd->query_id);
+  if (query_id != last_query_id) {
+    last_query_id = query_id;
+    count_for_query = 0;
+  }
+
+  return count_for_query++ < 8;
+}
+
+void wzg_emit_tablespace_page_read(const page_id_t &page_id,
+                                   const page_size_t &page_size, bool sync,
+                                   ulint mode, dberr_t err, ulint count) {
+  if (!wzg_rea_should_log_sql_context() ||
+      !wzg_rea_allow_page_read_event()) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.tablespace.page_read")
+      .message(count > 0 ? "已经向表空间文件读取这个 page"
+                         : "尝试从表空间读取 page，但没有成功读入 Buffer Pool")
+      .field("space_id", static_cast<std::uint64_t>(page_id.space()))
+      .field("page_no", static_cast<std::uint64_t>(page_id.page_no()))
+      .field("page_size_bytes",
+             static_cast<std::uint64_t>(page_size.physical()))
+      .field("sync", sync)
+      .field("read_mode", static_cast<std::uint64_t>(mode))
+      .field("error_code", static_cast<std::uint64_t>(err))
+      .field("pages_read", static_cast<std::uint64_t>(count))
+      .field("sample_policy", "每条 SQL 最多记录 8 次 page read")
+      .emit();
+}
+
+}  // namespace
 
 /** There must be at least this many pages in buf_pool in the area to start
 a random read-ahead */
@@ -291,6 +339,9 @@ bool buf_read_page(const page_id_t &page_id, const page_size_t &page_size) {
 
   count = buf_read_page_low(&err, true, 0, BUF_READ_ANY_PAGE, page_id,
                             page_size, false);
+
+  wzg_emit_tablespace_page_read(page_id, page_size, true, BUF_READ_ANY_PAGE,
+                                err, count);
 
   srv_stats.buf_pool_reads.add(count);
 

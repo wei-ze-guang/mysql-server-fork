@@ -84,6 +84,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sql_show.h>
 #include <sql_tablespace.h>
 #include <sql_thd_internal_api.h>
+#include "sql/command_mapping.h"
 #include "sql/wzg_probe/wzg_probe.h"
 #include "api0api.h"
 #include "api0misc.h"
@@ -310,6 +311,10 @@ static bool innodb_inited = false;
 }
 
 static struct handlerton *innodb_hton_ptr;
+
+static const long AUTOINC_OLD_STYLE_LOCKING = 0;
+static const long AUTOINC_NEW_STYLE_LOCKING = 1;
+static const long AUTOINC_NO_LOCKING = 2;
 
 namespace {
 
@@ -621,6 +626,86 @@ std::string wzg_innodb_tuple_fields_text(const dict_index_t *index,
   return value;
 }
 
+std::string wzg_innodb_read_columns_text(const TABLE *table) {
+  if (table == nullptr || table->read_set == nullptr || table->s == nullptr) {
+    return "无";
+  }
+
+  std::string value;
+  for (uint i = 0; i < table->s->fields; ++i) {
+    if (!bitmap_is_set(table->read_set, i)) continue;
+    if (!value.empty()) value.append(", ");
+    const Field *field = table->field[i];
+    value.append(field == nullptr || field->field_name == nullptr
+                     ? std::to_string(i)
+                     : field->field_name);
+  }
+
+  return value.empty() ? "没有显式读取列" : value;
+}
+
+std::string wzg_innodb_template_columns_text(const row_prebuilt_t *prebuilt,
+                                             const TABLE *table) {
+  if (prebuilt == nullptr || prebuilt->mysql_template == nullptr ||
+      table == nullptr || table->s == nullptr) {
+    return "无";
+  }
+
+  std::string value;
+  for (ulint i = 0; i < prebuilt->n_template; ++i) {
+    const mysql_row_templ_t *templ = &prebuilt->mysql_template[i];
+    if (templ->col_no >= table->s->fields) continue;
+    if (!value.empty()) value.append(", ");
+    const Field *field = table->field[templ->col_no];
+    value.append(field == nullptr || field->field_name == nullptr
+                     ? std::to_string(templ->col_no)
+                     : field->field_name);
+  }
+
+  return value.empty() ? "没有需要填充到 MySQL 行缓冲区的列" : value;
+}
+
+void wzg_emit_innodb_covering_index_check(
+    THD *thd, const TABLE *table, const row_prebuilt_t *prebuilt,
+    const dict_index_t *scan_index, const dict_index_t *fetch_index,
+    bool whole_row, bool fetch_all_in_key, bool fetch_primary_key_cols) {
+  if (!wzg_innodb_should_log(table, thd) || prebuilt == nullptr ||
+      scan_index == nullptr || fetch_index == nullptr) {
+    return;
+  }
+
+  const bool secondary_scan = !scan_index->is_clustered();
+  const bool needs_clustered = prebuilt->need_to_access_clustered;
+  const bool covering = secondary_scan && !needs_clustered;
+
+  WZG_PROBE_EVENT(thd, "innodb.covering_index_check")
+      .message(covering ? "当前二级索引已经覆盖查询需要的列，可以避免回表"
+                        : (secondary_scan
+                               ? "当前二级索引不能覆盖查询需要的列，后续需要回表读取聚簇索引"
+                               : "当前直接读取聚簇索引，叶子记录本身就是整行"))
+      .field("table", wzg_innodb_table_name(table))
+      .field("scan_index", wzg_innodb_index_name(scan_index))
+      .field("scan_index_kind", wzg_innodb_index_kind(scan_index))
+      .field("fetch_index", wzg_innodb_index_name(fetch_index))
+      .field("server_needed_columns", wzg_innodb_read_columns_text(table))
+      .field("innodb_template_columns",
+             wzg_innodb_template_columns_text(prebuilt, table))
+      .field("template_column_count",
+             static_cast<std::uint64_t>(prebuilt->n_template))
+      .field("is_covering_index", covering)
+      .field("needs_clustered_index", needs_clustered)
+      .field("whole_row_requested", whole_row)
+      .field("fetch_all_index_columns", fetch_all_in_key)
+      .field("fetch_primary_key_columns", fetch_primary_key_cols)
+      .field("decision_basis",
+             "InnoDB 根据 Server 的 read_set/write_set 和当前索引字段构建 mysql_template；如果需要的列不能从二级索引记录中取到，就把 need_to_access_clustered 置为 true")
+      .field("result_meaning",
+             needs_clustered
+                 ? "后续 row_search 读到二级索引记录后，会用其中保存的主键值再查 PRIMARY，这就是回表"
+                 : "后续可以直接从当前索引记录填充 MySQL 行缓冲区，不需要再查 PRIMARY")
+      .emit();
+}
+
 void wzg_emit_innodb_search_tuple(THD *thd, const TABLE *table,
                                   const dict_index_t *index,
                                   const dtuple_t *tuple,
@@ -884,12 +969,23 @@ void wzg_emit_innodb_index_read_finish(THD *thd, const TABLE *table,
                    : "InnoDB 索引读取已返回，但没有产生可用行或返回了错误")
       .field("table", wzg_innodb_table_name(table))
       .field("innodb_index", wzg_innodb_index_name(index))
+      .field("innodb_index_kind", wzg_innodb_index_kind(index))
       .field("innodb_status", wzg_innodb_db_status_text(db_status))
       .field("innodb_status_meaning",
              wzg_innodb_db_status_meaning(db_status))
       .field("handler_return_code", wzg_innodb_mysql_status_text(mysql_status))
       .field("handler_return_meaning",
              wzg_innodb_mysql_status_meaning(mysql_status))
+      .field("final_find_result",
+             mysql_status == 0
+                 ? "找到记录；InnoDB 已把记录转换到 MySQL handler 的行缓冲区"
+                 : "没有返回记录；可能是精确 key 不存在、范围已结束，或底层返回错误")
+      .field("btree_cursor_relation",
+             "前面的 B+Tree/page 日志只说明 cursor 如何定位到候选位置；这里的 handler 返回码才是这次索引读取对 SQL 层的最终结果")
+      .field("back_lookup_relation",
+             index != nullptr && index->is_clustered()
+                 ? "当前读取的是 PRIMARY/聚簇索引；如果前面刚读过二级索引，这一步通常就是回表读取整行"
+                 : "当前读取的是二级索引；若查询列不被二级索引覆盖，后续通常还会看到一次 PRIMARY/聚簇索引读取")
       .field("return_type", "int handler 状态码")
       .field("record_buffer",
              mysql_status == 0 ? "buf 已填充 MySQL 行格式记录"
@@ -947,11 +1043,161 @@ void wzg_emit_innodb_cursor_fetch_finish(THD *thd, const TABLE *table,
       .emit();
 }
 
-}  // namespace
+const char *wzg_innodb_autoinc_lock_mode_name(long lock_mode) {
+  switch (lock_mode) {
+    case AUTOINC_OLD_STYLE_LOCKING:
+      return "AUTOINC_OLD_STYLE_LOCKING";
+    case AUTOINC_NEW_STYLE_LOCKING:
+      return "AUTOINC_NEW_STYLE_LOCKING";
+    case AUTOINC_NO_LOCKING:
+      return "AUTOINC_NO_LOCKING";
+    default:
+      return "UNKNOWN_AUTOINC_LOCK_MODE";
+  }
+}
 
-static const long AUTOINC_OLD_STYLE_LOCKING = 0;
-static const long AUTOINC_NEW_STYLE_LOCKING = 1;
-static const long AUTOINC_NO_LOCKING = 2;
+const char *wzg_innodb_autoinc_lock_mode_meaning(long lock_mode) {
+  switch (lock_mode) {
+    case AUTOINC_OLD_STYLE_LOCKING:
+      return "传统模式；先取得表级 AUTO-INC lock，再进入自增计数器 mutex";
+    case AUTOINC_NEW_STYLE_LOCKING:
+      return "连续模式；普通 INSERT 优先只拿自增计数器 mutex，遇到已有表级 AUTO-INC lock 时退回传统模式";
+    case AUTOINC_NO_LOCKING:
+      return "交错模式；只保护自增计数器 mutex，不申请表级 AUTO-INC lock";
+    default:
+      return "未知 innodb_autoinc_lock_mode";
+  }
+}
+
+const char *wzg_innodb_sql_command_name(THD *thd) {
+  if (thd == nullptr) return "SQLCOM_UNKNOWN";
+  return get_sql_command_string(static_cast<enum_sql_command>(thd_sql_command(thd)));
+}
+
+std::string wzg_innodb_autoinc_decision_reason(
+    long configured_mode, long effective_mode, bool intrinsic_table,
+    bool no_autoinc_locking, bool simple_insert_or_replace,
+    bool other_auto_inc_lock_exists) {
+  if (intrinsic_table) {
+    return "内部临时表不会被其他连接共享，所以强制只使用 autoinc mutex";
+  }
+  if (no_autoinc_locking) {
+    return "调用方显式要求跳过表级 AUTO-INC lock，所以只使用 autoinc mutex";
+  }
+  if (configured_mode == AUTOINC_NEW_STYLE_LOCKING && simple_insert_or_replace &&
+      other_auto_inc_lock_exists) {
+    return "当前是普通 INSERT/REPLACE，但表上已有其他事务的 AUTO-INC lock，为避免冲突退回传统表级锁路径";
+  }
+  if (configured_mode == AUTOINC_NEW_STYLE_LOCKING && simple_insert_or_replace) {
+    return "当前是普通 INSERT/REPLACE，表上没有已有 AUTO-INC lock，连续模式只需要 autoinc mutex";
+  }
+  if (configured_mode == AUTOINC_NEW_STYLE_LOCKING) {
+    return "当前不是简单 INSERT/REPLACE，连续模式需要走传统表级 AUTO-INC lock 路径";
+  }
+  if (effective_mode == AUTOINC_OLD_STYLE_LOCKING) {
+    return "配置为传统模式，申请表级 AUTO-INC lock 后再读写自增计数器";
+  }
+  if (effective_mode == AUTOINC_NO_LOCKING) {
+    return "配置为交错模式，只用 autoinc mutex 保护计数器读写";
+  }
+  return "按当前 innodb_autoinc_lock_mode 选择自增锁路径";
+}
+
+void wzg_emit_innodb_autoinc_lock_decision(
+    THD *thd, const TABLE *mysql_table, const dict_table_t *ib_table,
+    long configured_mode, long effective_mode, bool intrinsic_table,
+    bool no_autoinc_locking, bool simple_insert_or_replace,
+    bool other_auto_inc_lock_exists) {
+  if (!wzg_innodb_should_log(mysql_table, thd)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.autoinc_lock_decision")
+      .message("InnoDB 为本次 AUTO_INCREMENT 分配选择自增锁策略")
+      .field("table", wzg_innodb_table_name(mysql_table))
+      .field("innodb_table_id",
+             static_cast<std::uint64_t>(ib_table == nullptr ? 0 : ib_table->id))
+      .field("configured_lock_mode_value",
+             static_cast<std::int64_t>(configured_mode))
+      .field("configured_lock_mode",
+             wzg_innodb_autoinc_lock_mode_name(configured_mode))
+      .field("configured_lock_mode_meaning",
+             wzg_innodb_autoinc_lock_mode_meaning(configured_mode))
+      .field("effective_lock_mode_value",
+             static_cast<std::int64_t>(effective_mode))
+      .field("effective_lock_mode",
+             wzg_innodb_autoinc_lock_mode_name(effective_mode))
+      .field("effective_lock_mode_meaning",
+             wzg_innodb_autoinc_lock_mode_meaning(effective_mode))
+      .field("sql_command", wzg_innodb_sql_command_name(thd))
+      .field("is_intrinsic_table", intrinsic_table)
+      .field("no_autoinc_locking", no_autoinc_locking)
+      .field("is_simple_insert_or_replace", simple_insert_or_replace)
+      .field("existing_auto_inc_lock_count",
+             static_cast<std::uint64_t>(
+                 ib_table == nullptr ? 0 : ib_table->count_by_mode[LOCK_AUTO_INC]))
+      .field("other_auto_inc_lock_exists", other_auto_inc_lock_exists)
+      .field("decision_reason",
+             wzg_innodb_autoinc_decision_reason(
+                 configured_mode, effective_mode, intrinsic_table,
+                 no_autoinc_locking, simple_insert_or_replace,
+                 other_auto_inc_lock_exists))
+      .emit();
+}
+
+void wzg_emit_innodb_autoinc_mutex(THD *thd, const TABLE *mysql_table,
+                                   const dict_table_t *ib_table,
+                                   const char *action,
+                                   const char *reason) {
+  if (!wzg_innodb_should_log(mysql_table, thd)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.autoinc_mutex")
+      .message("InnoDB 操作表内自增计数器 mutex")
+      .field("table", wzg_innodb_table_name(mysql_table))
+      .field("innodb_table_id",
+             static_cast<std::uint64_t>(ib_table == nullptr ? 0 : ib_table->id))
+      .field("mutex_name", "dict_table_t::autoinc_mutex")
+      .field("action", action == nullptr ? "unknown" : action)
+      .field("reason", reason == nullptr ? "读写 AUTO_INCREMENT 计数器" : reason)
+      .field("counter_value_before",
+             static_cast<std::uint64_t>(ib_table == nullptr ? 0 : ib_table->autoinc))
+      .emit();
+}
+
+void wzg_emit_innodb_autoinc_interval_reserve(
+    THD *thd, const TABLE *mysql_table, const dict_table_t *ib_table,
+    ulonglong autoinc_read_value, ulonglong first_value,
+    ulonglong nb_desired_values, ulonglong nb_reserved_values,
+    ulonglong next_value, ulonglong offset, ulonglong increment,
+    ulonglong col_max_value, ulonglong trx_remaining_autoinc_rows,
+    bool counter_updated_now, long lock_mode, dberr_t error) {
+  if (!wzg_innodb_should_log(mysql_table, thd)) return;
+
+  WZG_PROBE_EVENT(thd, "innodb.autoinc_interval_reserve")
+      .message("InnoDB 为本条语句预留 AUTO_INCREMENT 取值区间")
+      .field("table", wzg_innodb_table_name(mysql_table))
+      .field("innodb_table_id",
+             static_cast<std::uint64_t>(ib_table == nullptr ? 0 : ib_table->id))
+      .field("autoinc_counter_read", static_cast<std::uint64_t>(autoinc_read_value))
+      .field("first_value", static_cast<std::uint64_t>(first_value))
+      .field("desired_values", static_cast<std::uint64_t>(nb_desired_values))
+      .field("reserved_values", static_cast<std::uint64_t>(nb_reserved_values))
+      .field("next_counter_value", static_cast<std::uint64_t>(next_value))
+      .field("auto_increment_offset", static_cast<std::uint64_t>(offset))
+      .field("auto_increment_increment", static_cast<std::uint64_t>(increment))
+      .field("column_max_value", static_cast<std::uint64_t>(col_max_value))
+      .field("trx_remaining_autoinc_rows",
+             static_cast<std::uint64_t>(trx_remaining_autoinc_rows))
+      .field("counter_updated_now", counter_updated_now)
+      .field("lock_mode", wzg_innodb_autoinc_lock_mode_name(lock_mode))
+      .field("reserve_result", wzg_innodb_db_status_text(error))
+      .field("reserve_result_meaning", wzg_innodb_db_status_meaning(error))
+      .field("note",
+             counter_updated_now
+                 ? "非传统模式会在预留区间时推进表内自增计数器"
+                 : "传统模式先记录区间，表内自增计数器会在写入行后再推进")
+      .emit();
+}
+
+}  // namespace
 
 static long innobase_open_files;
 static long innobase_autoinc_lock_mode;
@@ -9561,6 +9807,10 @@ void ha_innobase::build_template(bool whole_row) {
       templ->rec_field_no = templ->clust_rec_field_no;
     }
   }
+
+  wzg_emit_innodb_covering_index_check(
+      m_user_thd, table, m_prebuilt, m_prebuilt->index, index, whole_row,
+      fetch_all_in_key, fetch_primary_key_cols);
 }
 
 /** This special handling is really to overcome the limitations of MySQL's
@@ -9573,7 +9823,13 @@ void ha_innobase::build_template(bool whole_row) {
 dberr_t ha_innobase::innobase_lock_autoinc(void) {
   DBUG_TRACE;
   dberr_t error = DB_SUCCESS;
-  long lock_mode = innobase_autoinc_lock_mode;
+  const long configured_lock_mode = innobase_autoinc_lock_mode;
+  long lock_mode = configured_lock_mode;
+  bool simple_insert_or_replace =
+      m_user_thd != nullptr &&
+      (thd_sql_command(m_user_thd) == SQLCOM_INSERT ||
+       thd_sql_command(m_user_thd) == SQLCOM_REPLACE);
+  bool other_auto_inc_lock_exists = false;
 
   ut_ad(!srv_read_only_mode || m_prebuilt->table->is_intrinsic());
 
@@ -9585,9 +9841,22 @@ dberr_t ha_innobase::innobase_lock_autoinc(void) {
     lock_mode = AUTOINC_NO_LOCKING;
   }
 
+  if (lock_mode == AUTOINC_NEW_STYLE_LOCKING && simple_insert_or_replace) {
+    other_auto_inc_lock_exists =
+        m_prebuilt->table->count_by_mode[LOCK_AUTO_INC] != 0;
+  }
+
+  wzg_emit_innodb_autoinc_lock_decision(
+      m_user_thd, table, m_prebuilt->table, configured_lock_mode, lock_mode,
+      m_prebuilt->table->is_intrinsic(), m_prebuilt->no_autoinc_locking,
+      simple_insert_or_replace, other_auto_inc_lock_exists);
+
   switch (lock_mode) {
     case AUTOINC_NO_LOCKING:
       /* Acquire only the AUTOINC mutex. */
+      wzg_emit_innodb_autoinc_mutex(m_user_thd, table, m_prebuilt->table,
+                                    "lock",
+                                    "交错模式或内部表只需要保护自增计数器 mutex");
       dict_table_autoinc_lock(m_prebuilt->table);
       break;
 
@@ -9601,12 +9870,18 @@ dberr_t ha_innobase::innobase_lock_autoinc(void) {
         dict_table_t *ib_table = m_prebuilt->table;
 
         /* Acquire the AUTOINC mutex. */
+        wzg_emit_innodb_autoinc_mutex(
+            m_user_thd, table, ib_table, "lock",
+            "连续模式先取得自增计数器 mutex，并检查是否已有表级 AUTO-INC lock");
         dict_table_autoinc_lock(ib_table);
 
         /* We need to check that another transaction isn't
         already holding the AUTOINC lock on the table. */
         if (ib_table->count_by_mode[LOCK_AUTO_INC]) {
           /* Release the mutex to avoid deadlocks. */
+          wzg_emit_innodb_autoinc_mutex(
+              m_user_thd, table, ib_table, "unlock",
+              "发现已有表级 AUTO-INC lock，先释放 mutex，再退回传统表级锁路径");
           dict_table_autoinc_unlock(ib_table);
         } else {
           break;
@@ -9621,6 +9896,9 @@ dberr_t ha_innobase::innobase_lock_autoinc(void) {
 
       if (error == DB_SUCCESS) {
         /* Acquire the AUTOINC mutex. */
+        wzg_emit_innodb_autoinc_mutex(
+            m_user_thd, table, m_prebuilt->table, "lock",
+            "传统模式已经取得表级 AUTO-INC lock，现在进入自增计数器 mutex");
         dict_table_autoinc_lock(m_prebuilt->table);
       }
       break;
@@ -20568,6 +20846,9 @@ dberr_t ha_innobase::innobase_get_autoinc(
     /* It should have been initialized during open. */
     if (*value == 0) {
       m_prebuilt->autoinc_error = DB_UNSUPPORTED;
+      wzg_emit_innodb_autoinc_mutex(
+          m_user_thd, table, m_prebuilt->table, "unlock",
+          "自增计数器尚未初始化，本次读取失败并释放 autoinc mutex");
       dict_table_autoinc_unlock(m_prebuilt->table);
     }
   }
@@ -20691,12 +20972,15 @@ void ha_innobase::get_auto_increment(
 
   *nb_reserved_values = trx->n_autoinc_rows;
 
+  ulonglong next_value = 0;
+  bool counter_updated_now = false;
+  dberr_t reserve_result = DB_SUCCESS;
+
   /* With old style AUTOINC locking we only update the table's
   AUTOINC counter after attempting to insert the row. */
   if (innobase_autoinc_lock_mode != AUTOINC_OLD_STYLE_LOCKING ||
       m_prebuilt->no_autoinc_locking) {
     ulonglong current;
-    ulonglong next_value;
 
     current = *first_value > col_max_value ? autoinc : *first_value;
 
@@ -20708,10 +20992,12 @@ void ha_innobase::get_auto_increment(
 
     if (m_prebuilt->autoinc_last_value < *first_value) {
       *first_value = (~(ulonglong)0);
+      reserve_result = DB_UNSUPPORTED;
     } else {
       /* Update the table autoinc variable */
       dict_table_autoinc_update_if_greater(m_prebuilt->table,
                                            m_prebuilt->autoinc_last_value);
+      counter_updated_now = true;
     }
   } else {
     /* This will force write_row() into attempting an update
@@ -20726,6 +21012,14 @@ void ha_innobase::get_auto_increment(
   m_prebuilt->autoinc_offset = offset;
   m_prebuilt->autoinc_increment = increment;
 
+  wzg_emit_innodb_autoinc_interval_reserve(
+      m_user_thd, table, m_prebuilt->table, autoinc, *first_value,
+      nb_desired_values, *nb_reserved_values, next_value, offset, increment,
+      col_max_value, trx->n_autoinc_rows, counter_updated_now,
+      innobase_autoinc_lock_mode, reserve_result);
+
+  wzg_emit_innodb_autoinc_mutex(m_user_thd, table, m_prebuilt->table, "unlock",
+                                "AUTO_INCREMENT 区间已经预留完毕，释放自增计数器 mutex");
   dict_table_autoinc_unlock(m_prebuilt->table);
 }
 

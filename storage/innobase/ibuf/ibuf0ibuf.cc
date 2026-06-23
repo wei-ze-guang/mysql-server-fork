@@ -74,6 +74,13 @@ constexpr uint32_t IBUF_BITMAP = PAGE_DATA;
 #include "row0upd.h"
 #include "srv0start.h"
 #include "trx0sys.h"
+#include "current_thd.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
 
 /*      STRUCTURE OF AN INSERT BUFFER RECORD
 
@@ -210,6 +217,208 @@ uint ibuf_debug;
 
 /** The insert buffer control structure */
 ibuf_t *ibuf = nullptr;
+
+namespace {
+
+const char *wzg_ibuf_op_name(ibuf_op_t op) {
+  switch (op) {
+    case IBUF_OP_INSERT:
+      return "insert";
+    case IBUF_OP_DELETE_MARK:
+      return "delete_mark";
+    case IBUF_OP_DELETE:
+      return "delete";
+    case IBUF_OP_COUNT:
+      return "unknown";
+  }
+
+  return "unknown";
+}
+
+const char *wzg_ibuf_use_name(ibuf_use_t use) {
+  switch (use) {
+    case IBUF_USE_NONE:
+      return "none";
+    case IBUF_USE_INSERT:
+      return "inserts";
+    case IBUF_USE_DELETE_MARK:
+      return "deletes";
+    case IBUF_USE_INSERT_DELETE_MARK:
+      return "changes";
+    case IBUF_USE_DELETE:
+      return "purges";
+    case IBUF_USE_ALL:
+      return "all";
+  }
+
+  return "unknown";
+}
+
+std::string wzg_ibuf_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_ibuf_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+bool wzg_ibuf_should_log(const dict_index_t *index) {
+  if (current_thd == nullptr || wzg_probe::raw_sql().empty() ||
+      index == nullptr || index->table == nullptr ||
+      index->table->name.m_name == nullptr || index->table->is_system_table ||
+      index->table->is_dd_table) {
+    return false;
+  }
+
+  const std::string_view name(index->table->name.m_name);
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+void wzg_ibuf_add_page_fields(wzg_probe::Event &event,
+                              const page_id_t &page_id,
+                              const page_size_t *page_size) {
+  event.field("space_id", static_cast<std::uint64_t>(page_id.space()))
+      .field("page_no", static_cast<std::uint64_t>(page_id.page_no()));
+
+  if (page_size != nullptr) {
+    event.field("page_size_bytes",
+                static_cast<std::uint64_t>(page_size->physical()))
+        .field("compressed_page", page_size->is_compressed());
+  }
+}
+
+void wzg_emit_ibuf_candidate(ibuf_op_t op, ibuf_use_t use,
+                             const dtuple_t *entry, const dict_index_t *index,
+                             const page_id_t &page_id,
+                             const page_size_t &page_size) {
+  if (!wzg_ibuf_should_log(index)) return;
+
+  wzg_probe::Event event(current_thd, "innodb.change_buffer.candidate",
+                         "instant");
+  event.message("目标二级索引叶子页不在 Buffer Pool，准备尝试写入 Change Buffer")
+      .field("table", wzg_ibuf_table_name(index->table))
+      .field("index", wzg_ibuf_index_name(index))
+      .field("operation", wzg_ibuf_op_name(op))
+      .field("change_buffering", wzg_ibuf_use_name(use))
+      .field("entry_fields",
+             static_cast<std::uint64_t>(dtuple_get_n_fields(entry)))
+      .field("reason",
+             "普通二级索引修改命中了不在 Buffer Pool 的 leaf page，先尝试把变更缓存在 Change Buffer");
+
+  wzg_ibuf_add_page_fields(event, page_id, &page_size);
+  event.emit();
+}
+
+void wzg_emit_ibuf_skip(ibuf_op_t op, ibuf_use_t use,
+                        const dict_index_t *index, const page_id_t &page_id,
+                        const page_size_t &page_size, const char *reason_code,
+                        const char *reason_text, ulint entry_size = 0,
+                        ulint limit_size = 0) {
+  if (!wzg_ibuf_should_log(index)) return;
+
+  wzg_probe::Event event(current_thd, "innodb.change_buffer.skip", "instant");
+  event.message("本次修改没有写入 Change Buffer，将走直接读页或直接处理")
+      .field("table", wzg_ibuf_table_name(index->table))
+      .field("index", wzg_ibuf_index_name(index))
+      .field("operation", wzg_ibuf_op_name(op))
+      .field("change_buffering", wzg_ibuf_use_name(use))
+      .field("reason_code", reason_code)
+      .field("reason", reason_text);
+
+  wzg_ibuf_add_page_fields(event, page_id, &page_size);
+
+  if (entry_size != 0) {
+    event.field("entry_size_bytes", static_cast<std::uint64_t>(entry_size));
+  }
+
+  if (limit_size != 0) {
+    event.field("limit_size_bytes", static_cast<std::uint64_t>(limit_size));
+  }
+
+  event.emit();
+}
+
+void wzg_emit_ibuf_inserted(ibuf_op_t op, ibuf_use_t use,
+                            const dict_index_t *index,
+                            const page_id_t &page_id,
+                            const page_size_t &page_size, ulint entry_size) {
+  if (!wzg_ibuf_should_log(index)) return;
+
+  wzg_probe::Event event(current_thd, "innodb.change_buffer.inserted",
+                         "instant");
+  event.message("修改已经成功写入 Change Buffer，暂时不用读取目标 leaf page")
+      .field("table", wzg_ibuf_table_name(index->table))
+      .field("index", wzg_ibuf_index_name(index))
+      .field("operation", wzg_ibuf_op_name(op))
+      .field("change_buffering", wzg_ibuf_use_name(use))
+      .field("entry_size_bytes", static_cast<std::uint64_t>(entry_size))
+      .field("next_step",
+             "等目标页以后被读入 Buffer Pool 时，再把 Change Buffer 中的记录 merge 到真实二级索引页");
+
+  wzg_ibuf_add_page_fields(event, page_id, &page_size);
+  event.emit();
+}
+
+void wzg_emit_ibuf_merge_start(const buf_block_t *block,
+                               const page_id_t &page_id,
+                               const page_size_t *page_size,
+                               bool update_ibuf_bitmap) {
+  wzg_probe::Event event(current_thd, "innodb.change_buffer.merge_start",
+                         "instant");
+  event.message(block == nullptr ? "开始清理这个页对应的 Change Buffer 记录"
+                                 : "页已读入 Buffer Pool，开始把 Change Buffer 记录合并到真实页")
+      .field("merge_mode", block == nullptr ? "delete_only" : "apply_to_page")
+      .field("update_ibuf_bitmap", update_ibuf_bitmap);
+
+  wzg_ibuf_add_page_fields(event, page_id, page_size);
+  event.emit();
+}
+
+void wzg_emit_ibuf_merge_end(const buf_block_t *block, const page_id_t &page_id,
+                             const page_size_t *page_size,
+                             const ulint *merged_ops,
+                             const ulint *discarded_ops,
+                             bool corruption_noticed) {
+  const ulint merged_total = merged_ops[IBUF_OP_INSERT] +
+                             merged_ops[IBUF_OP_DELETE_MARK] +
+                             merged_ops[IBUF_OP_DELETE];
+  const ulint discarded_total = discarded_ops[IBUF_OP_INSERT] +
+                                discarded_ops[IBUF_OP_DELETE_MARK] +
+                                discarded_ops[IBUF_OP_DELETE];
+
+  wzg_probe::Event event(current_thd, "innodb.change_buffer.merge_end",
+                         "instant");
+  event.message("Change Buffer 处理完成，已统计合并和丢弃的操作数")
+      .field("merge_mode", block == nullptr ? "delete_only" : "apply_to_page")
+      .field("merged_total", static_cast<std::uint64_t>(merged_total))
+      .field("discarded_total", static_cast<std::uint64_t>(discarded_total))
+      .field("merged_insert",
+             static_cast<std::uint64_t>(merged_ops[IBUF_OP_INSERT]))
+      .field("merged_delete_mark",
+             static_cast<std::uint64_t>(merged_ops[IBUF_OP_DELETE_MARK]))
+      .field("merged_delete",
+             static_cast<std::uint64_t>(merged_ops[IBUF_OP_DELETE]))
+      .field("discarded_insert",
+             static_cast<std::uint64_t>(discarded_ops[IBUF_OP_INSERT]))
+      .field("discarded_delete_mark",
+             static_cast<std::uint64_t>(discarded_ops[IBUF_OP_DELETE_MARK]))
+      .field("discarded_delete",
+             static_cast<std::uint64_t>(discarded_ops[IBUF_OP_DELETE]))
+      .field("corruption_noticed", corruption_noticed);
+
+  wzg_ibuf_add_page_fields(event, page_id, page_size);
+  event.emit();
+}
+
+}  // namespace
 
 #ifdef UNIV_IBUF_COUNT_DEBUG
 /** Number of tablespaces in the ibuf_counts array */
@@ -3303,12 +3512,17 @@ bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
 
   auto no_counter = use <= IBUF_USE_INSERT;
 
+  wzg_emit_ibuf_candidate(op, use, entry, index, page_id, page_size);
+
   switch (op) {
     case IBUF_OP_INSERT:
       switch (use) {
         case IBUF_USE_NONE:
         case IBUF_USE_DELETE:
         case IBUF_USE_DELETE_MARK:
+          wzg_emit_ibuf_skip(
+              op, use, index, page_id, page_size, "disabled_by_policy",
+              "当前 innodb_change_buffering 设置不允许缓存 insert 操作");
           return false;
         case IBUF_USE_INSERT:
         case IBUF_USE_INSERT_DELETE_MARK:
@@ -3320,6 +3534,9 @@ bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
       switch (use) {
         case IBUF_USE_NONE:
         case IBUF_USE_INSERT:
+          wzg_emit_ibuf_skip(
+              op, use, index, page_id, page_size, "disabled_by_policy",
+              "当前 innodb_change_buffering 设置不允许缓存 delete-mark 操作");
           return false;
         case IBUF_USE_DELETE_MARK:
         case IBUF_USE_DELETE:
@@ -3334,6 +3551,9 @@ bool ibuf_insert(ibuf_op_t op, const dtuple_t *entry, dict_index_t *index,
         case IBUF_USE_NONE:
         case IBUF_USE_INSERT:
         case IBUF_USE_INSERT_DELETE_MARK:
+          wzg_emit_ibuf_skip(
+              op, use, index, page_id, page_size, "disabled_by_policy",
+              "当前 innodb_change_buffering 设置不允许缓存 purge delete 操作");
           return false;
         case IBUF_USE_DELETE_MARK:
         case IBUF_USE_DELETE:
@@ -3373,6 +3593,9 @@ check_watch:
       is being buffered, have this request executed
       directly on the page in the buffer pool after the
       buffered entries for this page have been merged. */
+      wzg_emit_ibuf_skip(
+          op, use, index, page_id, page_size, "page_or_watch_present",
+          "目标页已经进入 Buffer Pool，或同页已有 purge/watch 保护，不能再把本次修改写入 Change Buffer");
       return false;
     }
   }
@@ -3380,8 +3603,13 @@ check_watch:
 skip_watch:
   entry_size = rec_get_converted_size(index, entry);
 
-  if (entry_size >=
-      page_get_free_space_of_empty(dict_table_is_comp(index->table)) / 2) {
+  const ulint max_entry_size =
+      page_get_free_space_of_empty(dict_table_is_comp(index->table)) / 2;
+
+  if (entry_size >= max_entry_size) {
+    wzg_emit_ibuf_skip(op, use, index, page_id, page_size, "entry_too_large",
+                       "本条二级索引记录太大，超过 Change Buffer 可安全缓存的大小上限",
+                       entry_size, max_entry_size);
     return false;
   }
 
@@ -3400,11 +3628,19 @@ skip_watch:
                             page_no, index->name);
     #endif
     */
+    wzg_emit_ibuf_inserted(op, use, index, page_id, page_size, entry_size);
     return true;
 
   } else {
     ut_a(err == DB_STRONG_FAIL || err == DB_TOO_BIG_RECORD);
 
+    wzg_emit_ibuf_skip(
+        op, use, index, page_id, page_size,
+        err == DB_TOO_BIG_RECORD ? "ibuf_entry_too_big" : "ibuf_insert_failed",
+        err == DB_TOO_BIG_RECORD
+            ? "Change Buffer 内部记录过大，无法安全写入"
+            : "Change Buffer 内部插入失败，需要回退为读取目标页后直接修改",
+        entry_size);
     return false;
   }
 }
@@ -4042,6 +4278,8 @@ void ibuf_merge_or_delete_for_page(buf_block_t *block, const page_id_t &page_id,
     return;
   }
 
+  wzg_emit_ibuf_merge_start(block, page_id, page_size, update_ibuf_bitmap);
+
   heap = mem_heap_create(512, UT_LOCATION_HERE);
 
   search_tuple =
@@ -4266,6 +4504,9 @@ reset_bit:
   ibuf->n_merges.fetch_add(1);
   ibuf_add_ops(ibuf->n_merged_ops, mops);
   ibuf_add_ops(ibuf->n_discarded_ops, dops);
+
+  wzg_emit_ibuf_merge_end(block, page_id, page_size, mops, dops,
+                          corruption_noticed);
 
   if (space != nullptr) {
     fil_space_release(space);

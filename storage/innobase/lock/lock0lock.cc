@@ -964,6 +964,71 @@ void wzg_emit_innodb_table_lock_wait(dict_table_t *table, lock_mode mode,
       .emit();
 }
 
+void wzg_emit_innodb_autoinc_table_lock_result(dict_table_t *table,
+                                               trx_t *trx,
+                                               const lock_t *wait_for,
+                                               dberr_t err) {
+  THD *thd = current_thd;
+  if (!wzg_lock_should_log(thd, table)) return;
+
+  const trx_t *blocking_trx =
+      wait_for != nullptr ? wait_for->trx
+                          : trx == nullptr ? nullptr
+                                           : trx->lock.blocking_trx.load();
+
+  WZG_PROBE_EVENT(thd, "innodb.autoinc_table_lock")
+      .message(err == DB_SUCCESS ? "表级 AUTO-INC lock 已授予当前事务"
+                                 : "表级 AUTO-INC lock 与其他事务冲突，当前事务需要等待或返回错误")
+      .field("table", wzg_lock_table_name(table))
+      .field("innodb_table_id",
+             static_cast<std::uint64_t>(table == nullptr ? 0 : table->id))
+      .field("transaction_id", wzg_lock_trx_id_text(trx))
+      .field("blocking_transaction_id", wzg_lock_trx_id_text(blocking_trx))
+      .field("phase", err == DB_SUCCESS ? "granted_or_already_held"
+                                         : "wait_or_error")
+      .field("lock_mode", "LOCK_AUTO_INC")
+      .field("lock_scope", "table")
+      .field("existing_auto_inc_lock_count",
+             static_cast<std::uint64_t>(
+                 table == nullptr ? 0 : table->count_by_mode[LOCK_AUTO_INC]))
+      .field("request_result", wzg_lock_result_text(err))
+      .field("request_result_meaning", wzg_lock_result_meaning(err))
+      .field("why_lock",
+             "传统自增锁路径用语句级 AUTO-INC lock 串行化这张表的自增区间分配")
+      .field("what_happens_next",
+             err == DB_SUCCESS
+                 ? "事务继续进入 autoinc mutex，读取并预留 AUTO_INCREMENT 区间"
+                 : "事务挂起等待冲突锁释放，或由上层按错误处理")
+      .emit();
+}
+
+void wzg_emit_innodb_autoinc_table_lock_release(const lock_t *lock) {
+  if (lock == nullptr || lock_get_mode(lock) != LOCK_AUTO_INC) return;
+
+  THD *thd = current_thd != nullptr ? current_thd : wzg_lock_event_thd(lock->trx);
+  if (!wzg_lock_should_log_lock(thd, lock)) return;
+
+  const dict_table_t *table = lock->tab_lock.table;
+
+  WZG_PROBE_EVENT(thd, "innodb.autoinc_table_lock_release")
+      .message("语句结束或事务清理阶段释放表级 AUTO-INC lock")
+      .field("table", wzg_lock_table_from_any_lock(lock))
+      .field("innodb_table_id",
+             static_cast<std::uint64_t>(table == nullptr ? 0 : table->id))
+      .field("transaction_id", wzg_lock_trx_id_text(lock->trx))
+      .field("lock_mode", "LOCK_AUTO_INC")
+      .field("lock_scope", "table")
+      .field("was_waiting", lock->is_waiting())
+      .field("auto_inc_lock_count_before_release",
+             static_cast<std::uint64_t>(
+                 table == nullptr ? 0 : table->count_by_mode[LOCK_AUTO_INC]))
+      .field("release_reason",
+             "AUTO-INC lock 只保留到 SQL 语句结束；释放后其他等待自增锁的事务可以继续")
+      .field("what_happens_next",
+             "lock_table_dequeue 会移除锁对象并检查等待队列，可能授予后续等待的 AUTO-INC lock")
+      .emit();
+}
+
 void wzg_emit_innodb_record_lock_wait(const char *record_kind,
                                       const buf_block_t *block,
                                       const rec_t *rec, const ulint *offsets,
@@ -4327,6 +4392,8 @@ static inline void lock_table_remove_low(
   /* Remove the table from the transaction's AUTOINC vector, if
   the lock that is being released is an AUTOINC lock. */
   if (lock_mode == LOCK_AUTO_INC) {
+    wzg_emit_innodb_autoinc_table_lock_release(lock);
+
     /* The table's AUTOINC lock could not be granted to us yet. */
     ut_ad(table->autoinc_trx == trx || lock->is_waiting());
     if (table->autoinc_trx == trx) {
@@ -4553,6 +4620,9 @@ dberr_t lock_table(ulint flags, /*!< in: if BTR_NO_LOCKING_FLAG bit is set,
   ut_ad(err == DB_SUCCESS || err == DB_LOCK_WAIT || err == DB_DEADLOCK);
   wzg_emit_innodb_table_lock_request(table, mode, trx, err);
   wzg_emit_innodb_table_lock_wait(table, mode, trx, wait_for, err);
+  if (mode == LOCK_AUTO_INC) {
+    wzg_emit_innodb_autoinc_table_lock_result(table, trx, wait_for, err);
+  }
   return (err);
 }
 

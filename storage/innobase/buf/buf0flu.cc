@@ -34,6 +34,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <math.h>
 #include <my_dbug.h>
 #include <mysql/service_thd_wait.h>
+#include <atomic>
+#include <cstdint>
 #include <sys/types.h>
 #include <time.h>
 
@@ -50,6 +52,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "arch0arch.h"
 #include "buf0lru.h"
 #include "buf0rea.h"
+#include "current_thd.h"
 #include "fil0fil.h"
 #include "fsp0sysspace.h"
 #include "ibuf0ibuf.h"
@@ -60,6 +63,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0file.h"
 #include "os0thread-create.h"
 #include "page0page.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
@@ -203,6 +208,108 @@ static ut::unique_ptr<page_cleaner_t> page_cleaner;
 #ifdef UNIV_DEBUG
 bool innodb_page_cleaner_disabled_debug;
 #endif /* UNIV_DEBUG */
+
+namespace {
+
+bool wzg_flu_should_log_sql_context() {
+  return current_thd != nullptr && !wzg_probe::raw_sql().empty();
+}
+
+bool wzg_flu_allow_background_flush_batch_event() {
+  static std::atomic<std::uint64_t> background_batch_count{0};
+  const std::uint64_t count = background_batch_count.fetch_add(1);
+  return count < 16 || count % 1024 == 0;
+}
+
+bool wzg_flu_allow_event(std::uint64_t limit, std::uint64_t *last_query_id,
+                         std::uint64_t *count_for_query) {
+  const auto query_id = static_cast<std::uint64_t>(current_thd->query_id);
+  if (query_id != *last_query_id) {
+    *last_query_id = query_id;
+    *count_for_query = 0;
+  }
+
+  return (*count_for_query)++ < limit;
+}
+
+bool wzg_flu_allow_page_dirty_event() {
+  static thread_local std::uint64_t last_query_id = 0;
+  static thread_local std::uint64_t count_for_query = 0;
+  return wzg_flu_allow_event(8, &last_query_id, &count_for_query);
+}
+
+bool wzg_flu_allow_flush_batch_event() {
+  static thread_local std::uint64_t last_query_id = 0;
+  static thread_local std::uint64_t count_for_query = 0;
+  return wzg_flu_allow_event(3, &last_query_id, &count_for_query);
+}
+
+const char *wzg_flush_type_name(buf_flush_t flush_type) {
+  switch (flush_type) {
+    case BUF_FLUSH_LRU:
+      return "BUF_FLUSH_LRU";
+    case BUF_FLUSH_LIST:
+      return "BUF_FLUSH_LIST";
+    case BUF_FLUSH_SINGLE_PAGE:
+      return "BUF_FLUSH_SINGLE_PAGE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void wzg_emit_buffer_pool_page_dirty(const buf_page_t &page, lsn_t oldest_lsn,
+                                     lsn_t newest_lsn,
+                                     std::uint64_t flush_list_bytes) {
+  if (!wzg_flu_should_log_sql_context() ||
+      !wzg_flu_allow_page_dirty_event()) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.buffer_pool.page_dirty")
+      .message("这个 page 第一次变成脏页，已经挂到 flush list 等待刷盘")
+      .field("space_id", static_cast<std::uint64_t>(page.id.space()))
+      .field("page_no", static_cast<std::uint64_t>(page.id.page_no()))
+      .field("page_size_bytes", static_cast<std::uint64_t>(page.size.physical()))
+      .field("oldest_lsn", static_cast<std::uint64_t>(oldest_lsn))
+      .field("newest_lsn", static_cast<std::uint64_t>(newest_lsn))
+      .field("flush_list_bytes", flush_list_bytes)
+      .field("sample_policy", "每条 SQL 最多记录 8 个首次变脏 page")
+      .field("note", "同一个 page 后续继续修改不会重复记录这个事件")
+      .emit();
+}
+
+void wzg_emit_buffer_pool_flush_batch(buf_pool_t *buf_pool,
+                                      buf_flush_t flush_type, ulint min_n,
+                                      lsn_t lsn_limit, ulint page_count) {
+  if (page_count == 0) {
+    return;
+  }
+
+  const bool has_sql_context = wzg_flu_should_log_sql_context();
+  if (has_sql_context) {
+    if (!wzg_flu_allow_flush_batch_event()) return;
+  } else if (!wzg_flu_allow_background_flush_batch_event()) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.buffer_pool.flush_batch")
+      .message("Buffer Pool 完成了一批脏页刷盘调度")
+      .field("buffer_pool_instance",
+             static_cast<std::uint64_t>(buf_pool_index(buf_pool)))
+      .field("flush_type", wzg_flush_type_name(flush_type))
+      .field("min_requested_pages", static_cast<std::uint64_t>(min_n))
+      .field("pages_flushed", static_cast<std::uint64_t>(page_count))
+      .field("lsn_limit", static_cast<std::uint64_t>(lsn_limit))
+      .field("flush_list_bytes",
+             static_cast<std::uint64_t>(buf_pool->stat.flush_list_bytes))
+      .field("sample_policy",
+             has_sql_context
+                 ? "每条 SQL 最多记录 3 个 flush batch"
+                 : "后台刷盘只记录前 16 批，之后每 1024 批记录一次")
+      .emit();
+}
+
+}  // namespace
 
 /** If LRU list of a buf_pool is less than this size then LRU eviction
 should not happen. This is because when we do LRU flushing we also put
@@ -573,6 +680,10 @@ void buf_flush_insert_into_flush_list(
   UT_LIST_ADD_FIRST(buf_pool->flush_list, &block->page);
 
   incr_flush_list_size_in_bytes(block, buf_pool);
+
+  wzg_emit_buffer_pool_page_dirty(
+      block->page, lsn, block->page.get_newest_lsn(),
+      static_cast<std::uint64_t>(buf_pool->stat.flush_list_bytes));
 
 #ifdef UNIV_DEBUG_VALGRIND
   void *p;
@@ -2049,6 +2160,9 @@ bool buf_flush_do_batch(buf_pool_t *buf_pool, buf_flush_t type, ulint min_n,
   ulint page_count = buf_flush_batch(buf_pool, type, min_n, lsn_limit);
 
   buf_flush_end(buf_pool, type);
+
+  wzg_emit_buffer_pool_flush_batch(buf_pool, type, min_n, lsn_limit,
+                                   page_count);
 
   if (n_processed != nullptr) {
     *n_processed = page_count;

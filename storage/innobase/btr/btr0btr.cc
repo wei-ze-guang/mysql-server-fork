@@ -41,6 +41,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "btr0pcur.h"
 #include "btr0sea.h"
 #include "buf0stats.h"
+#include "current_thd.h"
 #include "dict0boot.h"
 #include "fsp0sysspace.h"
 #include "gis0geo.h"
@@ -54,6 +55,12 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0mon.h"
 #include "trx0trx.h"
 #include "ut0new.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
 #endif /* !UNIV_HOTBACKUP */
 
 #ifdef UNIV_DEBUG
@@ -69,6 +76,275 @@ struct Index_details {
 #endif /* UNIV_DEBUG */
 
 #ifndef UNIV_HOTBACKUP
+namespace {
+
+bool wzg_btr_should_log(const dict_index_t *index) {
+  if (current_thd == nullptr || index == nullptr || index->table == nullptr ||
+      index->table->name.m_name == nullptr || index->table->is_system_table ||
+      index->table->is_dd_table || wzg_probe::raw_sql().empty()) {
+    return false;
+  }
+
+  const std::string_view name(index->table->name.m_name);
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_btr_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_btr_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+std::string wzg_btr_index_kind(const dict_index_t *index) {
+  if (index == nullptr) return "未知索引";
+  if (index->is_clustered()) return "聚簇索引，叶子页保存整行数据";
+  return "二级索引，叶子页保存二级索引列和主键值；如果查询列不覆盖，后续可能回表查 PRIMARY";
+}
+
+const char *wzg_btr_page_type(const page_t *page) {
+  return page != nullptr && page_is_leaf(page) ? "leaf" : "internal";
+}
+
+const char *wzg_btr_split_direction(byte direction) {
+  return direction == FSP_DOWN ? "left" : "right";
+}
+
+void wzg_emit_btree_page_split_start(const dict_index_t *index,
+                                     const buf_block_t *block,
+                                     const page_t *page,
+                                     const rec_t *split_rec, byte direction,
+                                     page_no_t hint_page_no,
+                                     bool split_rec_is_tuple,
+                                     ulint n_iterations) {
+  if (!wzg_btr_should_log(index) || block == nullptr || page == nullptr) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_page_split_start")
+      .message("InnoDB 开始分裂一个 B+Tree 页，先确定分裂方向和分裂点")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("space_id", static_cast<std::uint64_t>(block->page.id.space()))
+      .field("source_page_no",
+             static_cast<std::uint64_t>(block->page.id.page_no()))
+      .field("source_page_level",
+             static_cast<std::uint64_t>(btr_page_get_level(page)))
+      .field("source_page_type", wzg_btr_page_type(page))
+      .field("source_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(page)))
+      .field("source_page_data_bytes",
+             static_cast<std::uint64_t>(page_get_data_size(page)))
+      .field("split_direction", wzg_btr_split_direction(direction))
+      .field("hint_page_no", static_cast<std::uint64_t>(hint_page_no))
+      .field("split_record_heap_no",
+             split_rec == nullptr || split_rec_is_tuple
+                 ? 0
+                 : static_cast<std::uint64_t>(page_rec_get_heap_no(split_rec)))
+      .field("split_record_source",
+             split_rec_is_tuple ? "new_tuple" : "existing_record")
+      .field("retry_iteration", static_cast<std::uint64_t>(n_iterations))
+      .field("next_step", "从索引段分配一个新 page，并在父节点插入分隔 key")
+      .emit();
+}
+
+void wzg_emit_btree_page_alloc(const dict_index_t *index,
+                               const buf_block_t *new_block, ulint level,
+                               page_no_t hint_page_no, byte direction,
+                               const char *reason) {
+  if (!wzg_btr_should_log(index) || new_block == nullptr) return;
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_page_alloc")
+      .message("InnoDB 为 B+Tree 分裂分配了一个新的索引页")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("space_id", static_cast<std::uint64_t>(new_block->page.id.space()))
+      .field("new_page_no",
+             static_cast<std::uint64_t>(new_block->page.id.page_no()))
+      .field("new_page_level", static_cast<std::uint64_t>(level))
+      .field("new_page_type", level == 0 ? "leaf" : "internal")
+      .field("hint_page_no", static_cast<std::uint64_t>(hint_page_no))
+      .field("split_direction", wzg_btr_split_direction(direction))
+      .field("compressed_page", new_block->page.size.is_compressed())
+      .field("alloc_reason", reason == nullptr ? "page_split" : reason)
+      .field("next_step", "初始化新 page 的页头、level 和 index id")
+      .emit();
+}
+
+void wzg_emit_btree_parent_separator_insert(const dict_index_t *index,
+                                            const buf_block_t *lower_block,
+                                            const buf_block_t *upper_block,
+                                            const page_t *lower_page,
+                                            const page_t *upper_page,
+                                            ulint child_level) {
+  if (!wzg_btr_should_log(index) || lower_block == nullptr ||
+      upper_block == nullptr || lower_page == nullptr || upper_page == nullptr) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_parent_separator_insert")
+      .message("InnoDB 已把新页的分隔 key 插入父节点，用它把父节点指向分裂后的右半页")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("space_id", static_cast<std::uint64_t>(lower_block->page.id.space()))
+      .field("lower_page_no",
+             static_cast<std::uint64_t>(lower_block->page.id.page_no()))
+      .field("upper_page_no",
+             static_cast<std::uint64_t>(upper_block->page.id.page_no()))
+      .field("child_level", static_cast<std::uint64_t>(child_level))
+      .field("parent_level", static_cast<std::uint64_t>(child_level + 1))
+      .field("lower_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(lower_page)))
+      .field("upper_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(upper_page)))
+      .field("separator_meaning",
+             "父节点新增的记录保存 upper page 的最小 key 前缀和 child page no，搜索时用它决定是否进入 upper page")
+      .field("next_step", "更新同层 page 的 prev/next 链表，然后移动记录")
+      .emit();
+}
+
+void wzg_emit_btree_page_records_moved(
+    const dict_index_t *index, const buf_block_t *source_block,
+    const buf_block_t *new_block, const buf_block_t *left_block,
+    const buf_block_t *right_block, ulint source_records_before,
+    ulint new_records_before, byte direction, bool used_zip_copy_fallback) {
+  if (!wzg_btr_should_log(index) || source_block == nullptr ||
+      new_block == nullptr || left_block == nullptr || right_block == nullptr) {
+    return;
+  }
+
+  const page_t *source_page = buf_block_get_frame(source_block);
+  const page_t *new_page = buf_block_get_frame(new_block);
+  const page_t *left_page = buf_block_get_frame(left_block);
+  const page_t *right_page = buf_block_get_frame(right_block);
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_page_records_moved")
+      .message("InnoDB 已把一部分记录移动到分裂产生的新页，左右两个页现在各保存一段 key 范围")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("space_id",
+             static_cast<std::uint64_t>(source_block->page.id.space()))
+      .field("source_page_no",
+             static_cast<std::uint64_t>(source_block->page.id.page_no()))
+      .field("new_page_no",
+             static_cast<std::uint64_t>(new_block->page.id.page_no()))
+      .field("split_direction", wzg_btr_split_direction(direction))
+      .field("moved_records",
+             static_cast<std::uint64_t>(
+                 page_get_n_recs(new_page) >= new_records_before
+                     ? page_get_n_recs(new_page) - new_records_before
+                     : new_records_before - page_get_n_recs(new_page)))
+      .field("source_records_before",
+             static_cast<std::uint64_t>(source_records_before))
+      .field("source_records_after",
+             static_cast<std::uint64_t>(page_get_n_recs(source_page)))
+      .field("new_records_before",
+             static_cast<std::uint64_t>(new_records_before))
+      .field("new_records_after",
+             static_cast<std::uint64_t>(page_get_n_recs(new_page)))
+      .field("left_page_no",
+             static_cast<std::uint64_t>(left_block->page.id.page_no()))
+      .field("left_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(left_page)))
+      .field("right_page_no",
+             static_cast<std::uint64_t>(right_block->page.id.page_no()))
+      .field("right_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(right_page)))
+      .field("used_zip_copy_fallback", used_zip_copy_fallback)
+      .field("next_step", "在正确半页重新定位 cursor，并把新记录插入进去")
+      .emit();
+}
+
+void wzg_emit_btree_root_raise(const dict_index_t *index,
+                               const buf_block_t *root_block,
+                               const buf_block_t *child_block,
+                               ulint old_root_level, ulint root_records_before,
+                               ulint child_records_after) {
+  if (!wzg_btr_should_log(index) || root_block == nullptr ||
+      child_block == nullptr) {
+    return;
+  }
+
+  const page_t *root = buf_block_get_frame(root_block);
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_root_raise")
+      .message("InnoDB 分裂 root page，把旧 root 的记录搬到新的 child page，并把 root 升高一层")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("space_id", static_cast<std::uint64_t>(root_block->page.id.space()))
+      .field("root_page_no",
+             static_cast<std::uint64_t>(root_block->page.id.page_no()))
+      .field("old_root_level", static_cast<std::uint64_t>(old_root_level))
+      .field("new_root_level",
+             static_cast<std::uint64_t>(btr_page_get_level(root)))
+      .field("old_tree_height",
+             static_cast<std::uint64_t>(old_root_level + 1))
+      .field("new_tree_height",
+             static_cast<std::uint64_t>(btr_page_get_level(root) + 1))
+      .field("child_page_no",
+             static_cast<std::uint64_t>(child_block->page.id.page_no()))
+      .field("root_records_before",
+             static_cast<std::uint64_t>(root_records_before))
+      .field("root_records_after",
+             static_cast<std::uint64_t>(page_get_n_recs(root)))
+      .field("child_records_after",
+             static_cast<std::uint64_t>(child_records_after))
+      .field("next_step", "在新 child page 上继续执行普通 page split，把待插入记录放入合适半页")
+      .emit();
+}
+
+void wzg_emit_btree_page_split_finish(
+    const dict_index_t *index, const buf_block_t *left_block,
+    const buf_block_t *right_block, const buf_block_t *insert_block,
+    const rec_t *rec, bool insert_left, ulint n_iterations) {
+  if (!wzg_btr_should_log(index) || left_block == nullptr ||
+      right_block == nullptr || insert_block == nullptr) {
+    return;
+  }
+
+  const page_t *left_page = buf_block_get_frame(left_block);
+  const page_t *right_page = buf_block_get_frame(right_block);
+  const page_t *insert_page = buf_block_get_frame(insert_block);
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_page_split_finish")
+      .message("InnoDB 页分裂完成，新记录已经插入到分裂后的目标页，相关页会随 mini-transaction 写入 redo 并标记为 dirty")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("space_id", static_cast<std::uint64_t>(left_block->page.id.space()))
+      .field("left_page_no",
+             static_cast<std::uint64_t>(left_block->page.id.page_no()))
+      .field("left_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(left_page)))
+      .field("right_page_no",
+             static_cast<std::uint64_t>(right_block->page.id.page_no()))
+      .field("right_page_records",
+             static_cast<std::uint64_t>(page_get_n_recs(right_page)))
+      .field("insert_page_no",
+             static_cast<std::uint64_t>(insert_block->page.id.page_no()))
+      .field("insert_page_type", wzg_btr_page_type(insert_page))
+      .field("inserted_record_heap_no",
+             rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(rec)))
+      .field("inserted_to", insert_left ? "left_page" : "right_page")
+      .field("retry_iteration", static_cast<std::uint64_t>(n_iterations))
+      .field("redo_dirty_page_note",
+             "分裂过程中的 page create、page link、record move、tuple insert 都在当前 mtr 中记 redo；mtr 提交时这些 buffer page 会进入 dirty page 列表")
+      .emit();
+}
+
+}  // namespace
+
 /** Checks if the page in the cursor can be merged with given page.
  If necessary, re-organize the merge_page.
  @return        true if possible to merge. */
@@ -482,6 +758,8 @@ buf_block_t *btr_page_alloc_priv(
 
   if (new_block) {
     buf_block_dbg_add_level(new_block, SYNC_TREE_NODE_NEW);
+    wzg_emit_btree_page_alloc(index, new_block, level, hint_page_no,
+                              file_direction, "btree_page_split");
   }
 
   return (new_block);
@@ -1503,6 +1781,7 @@ rec_t *btr_root_raise_and_insert(
   page_zip_des_t *new_page_zip;
   buf_block_t *root_block;
   buf_block_t *new_block;
+  ulint root_records_before;
 
   root = btr_cur_get_page(cursor);
   root_block = btr_cur_get_block(cursor);
@@ -1534,6 +1813,7 @@ rec_t *btr_root_raise_and_insert(
   a node pointer to the new page, and then splitting the new page. */
 
   level = btr_page_get_level(root);
+  root_records_before = page_get_n_recs(root);
 
   new_block = btr_page_alloc(index, 0, FSP_NO_DIR, level, mtr, mtr);
 
@@ -1638,6 +1918,9 @@ rec_t *btr_root_raise_and_insert(
   /* The root page should only contain the node pointer
   to new_page at this point.  Thus, the data should fit. */
   ut_a(node_ptr_rec);
+
+  wzg_emit_btree_root_raise(index, root_block, new_block, level,
+                            root_records_before, page_get_n_recs(new_page));
 
   /* We play safe and reset the free bits for the new page */
 
@@ -2108,6 +2391,14 @@ static void btr_attach_half_pages(
   btr_insert_on_non_leaf_level(flags, index, level + 1, node_ptr_upper,
                                UT_LOCATION_HERE, mtr);
 
+  wzg_emit_btree_parent_separator_insert(index, lower_page_no == block->page.id.page_no()
+                                                    ? block
+                                                    : new_block,
+                                         upper_page_no == block->page.id.page_no()
+                                                    ? block
+                                                    : new_block,
+                                         lower_page, upper_page, level);
+
   /* Free the memory heap */
   mem_heap_free(heap);
 
@@ -2331,7 +2622,10 @@ rec_t *btr_page_split_and_insert(
   rec_t *move_limit;
   bool insert_will_fit;
   bool insert_left;
+  bool used_zip_copy_fallback;
   ulint n_iterations = 0;
+  ulint source_records_before;
+  ulint new_records_before;
   rec_t *rec;
   ulint n_uniq;
   dict_index_t *index;
@@ -2420,6 +2714,11 @@ func_start:
     }
   }
 
+  wzg_emit_btree_page_split_start(index, block, page, split_rec, direction,
+                                  hint_page_no,
+                                  split_rec == nullptr && !insert_left,
+                                  n_iterations);
+
   /* 2. Allocate a new page to the index */
   new_block = btr_page_alloc(cursor->index, hint_page_no, direction,
                              btr_page_get_level(page), mtr, mtr);
@@ -2505,6 +2804,10 @@ func_start:
   }
 
   /* 5. Move then the records to the new page */
+  source_records_before = page_get_n_recs(page);
+  new_records_before = page_get_n_recs(new_page);
+  used_zip_copy_fallback = false;
+
   if (direction == FSP_DOWN) {
     /*          fputs("Split left\n", stderr); */
 
@@ -2514,6 +2817,7 @@ func_start:
 #endif /* UNIV_ZIP_COPY */
         || !page_move_rec_list_start(new_block, block, move_limit,
                                      cursor->index, mtr)) {
+      used_zip_copy_fallback = true;
       /* For some reason, compressing new_page failed,
       even though it should contain fewer records than
       the original page.  Copy the page byte for byte
@@ -2556,6 +2860,7 @@ func_start:
 #endif /* UNIV_ZIP_COPY */
         || !page_move_rec_list_end(new_block, block, move_limit, cursor->index,
                                    mtr)) {
+      used_zip_copy_fallback = true;
       /* For some reason, compressing new_page failed,
       even though it should contain fewer records than
       the original page.  Copy the page byte for byte
@@ -2590,6 +2895,10 @@ func_start:
       lock_update_split_right(right_block, left_block);
     }
   }
+
+  wzg_emit_btree_page_records_moved(
+      index, block, new_block, left_block, right_block, source_records_before,
+      new_records_before, direction, used_zip_copy_fallback);
 
 #ifdef UNIV_ZIP_DEBUG
   if (page_zip) {
@@ -2678,6 +2987,8 @@ func_exit:
   ut_ad(page_validate(buf_block_get_frame(right_block), cursor->index));
 
   ut_ad(!rec || rec_offs_validate(rec, cursor->index, *offsets));
+  wzg_emit_btree_page_split_finish(index, left_block, right_block, insert_block,
+                                   rec, insert_left, n_iterations);
   return (rec);
 }
 

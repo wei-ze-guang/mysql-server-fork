@@ -176,6 +176,145 @@ bool wzg_row_sel_should_sample(THD *thd, int limit) {
   return true;
 }
 
+void wzg_emit_back_lookup_start(sel_node_t *node, plan_t *plan,
+                                const rec_t *sec_rec) {
+  THD *thd = current_thd;
+  if (node == nullptr || plan == nullptr ||
+      !wzg_row_sel_should_log(thd, plan->table) ||
+      !wzg_row_sel_should_sample(thd, 6)) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(thd, "innodb.back_lookup_start")
+      .message("二级索引记录已经命中，现在开始用其中保存的主键值回表查询聚簇索引")
+      .field("table", wzg_row_sel_table_name(plan->table))
+      .field("secondary_index", wzg_row_sel_index_name(plan->index))
+      .field("clustered_index", wzg_row_sel_index_name(plan->table->first_index()))
+      .field("secondary_record_heap_no",
+             sec_rec == nullptr ? 0
+                                : static_cast<std::uint64_t>(
+                                      page_rec_get_heap_no(sec_rec)))
+      .field("reason",
+             "当前扫描的是二级索引，但 SQL 层需要的列、锁判断或 MVCC 判断不能只靠二级索引记录完成")
+      .field("internal_operation",
+             "row_build_row_ref_fast 从二级索引记录中取出主键字段，构造 clust_ref")
+      .field("next_step",
+             "用 clust_ref 在 PRIMARY B+Tree 上打开 cursor，定位聚簇索引叶子记录")
+      .emit();
+}
+
+void wzg_emit_back_lookup_finish(sel_node_t *node, plan_t *plan,
+                                 const rec_t *sec_rec, const rec_t *clust_rec,
+                                 ulint low_match, dberr_t err) {
+  THD *thd = current_thd;
+  if (node == nullptr || plan == nullptr ||
+      !wzg_row_sel_should_log(thd, plan->table) ||
+      !wzg_row_sel_should_sample(thd, 6)) {
+    return;
+  }
+
+  const dict_index_t *clust_index = plan->table->first_index();
+  const bool found =
+      err == DB_SUCCESS && clust_rec != nullptr && page_rec_is_user_rec(clust_rec) &&
+      low_match >= dict_index_get_n_unique(clust_index);
+
+  WZG_PROBE_EVENT(thd, "innodb.back_lookup_finish")
+      .message(found ? "回表查询完成，已经找到对应的聚簇索引记录"
+                     : "回表查询完成，但没有得到可用的聚簇索引记录")
+      .field("table", wzg_row_sel_table_name(plan->table))
+      .field("secondary_index", wzg_row_sel_index_name(plan->index))
+      .field("clustered_index", wzg_row_sel_index_name(clust_index))
+      .field("secondary_record_heap_no",
+             sec_rec == nullptr ? 0
+                                : static_cast<std::uint64_t>(
+                                      page_rec_get_heap_no(sec_rec)))
+      .field("clustered_record_heap_no",
+             clust_rec == nullptr ? 0
+                                  : static_cast<std::uint64_t>(
+                                        page_rec_get_heap_no(clust_rec)))
+      .field("clustered_low_match_fields", static_cast<std::uint64_t>(low_match))
+      .field("found_clustered_record", found)
+      .field("result",
+             found ? "二级索引叶子记录里的主键值成功定位到 PRIMARY 叶子记录"
+                   : "可能是聚簇记录在当前 ReadView 中不可见，或二级索引记录已经处于删除清理边界")
+      .field("next_step",
+             found ? "从聚簇索引记录读取 SQL 需要的列，并继续 MVCC/锁/条件判断"
+                   : "跳过这条二级索引记录或返回错误/等待状态")
+      .emit();
+}
+
+void wzg_emit_back_lookup_start_mysql(row_prebuilt_t *prebuilt,
+                                      const dict_index_t *sec_index,
+                                      const rec_t *sec_rec) {
+  THD *thd = current_thd;
+  if (prebuilt == nullptr || sec_index == nullptr ||
+      !wzg_row_sel_should_log(thd, prebuilt->table) ||
+      !wzg_row_sel_should_sample(thd, 8)) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(thd, "innodb.back_lookup_start")
+      .message("二级索引记录已经命中，现在开始用其中保存的主键值回表查询聚簇索引")
+      .field("table", wzg_row_sel_table_name(prebuilt->table))
+      .field("secondary_index", wzg_row_sel_index_name(sec_index))
+      .field("clustered_index",
+             wzg_row_sel_index_name(sec_index->table->first_index()))
+      .field("secondary_record_heap_no",
+             sec_rec == nullptr ? 0
+                                : static_cast<std::uint64_t>(
+                                      page_rec_get_heap_no(sec_rec)))
+      .field("reason",
+             "当前二级索引不能覆盖 SQL 层需要的列，或者需要聚簇记录完成 MVCC/锁判断")
+      .field("internal_operation",
+             "row_build_row_ref_in_tuple 从二级索引记录中取出主键字段，构造 clust_ref")
+      .field("next_step",
+             "用 clust_ref 在 PRIMARY B+Tree 上打开 cursor，定位聚簇索引叶子记录")
+      .emit();
+}
+
+void wzg_emit_back_lookup_finish_mysql(row_prebuilt_t *prebuilt,
+                                       const dict_index_t *sec_index,
+                                       const rec_t *sec_rec,
+                                       const rec_t *clust_rec,
+                                       ulint low_match, dberr_t err) {
+  THD *thd = current_thd;
+  if (prebuilt == nullptr || sec_index == nullptr ||
+      !wzg_row_sel_should_log(thd, prebuilt->table) ||
+      !wzg_row_sel_should_sample(thd, 8)) {
+    return;
+  }
+
+  const dict_index_t *clust_index = sec_index->table->first_index();
+  const bool ok_status = err == DB_SUCCESS || err == DB_SUCCESS_LOCKED_REC;
+  const bool found =
+      ok_status && clust_rec != nullptr && page_rec_is_user_rec(clust_rec) &&
+      low_match >= dict_index_get_n_unique(clust_index);
+
+  WZG_PROBE_EVENT(thd, "innodb.back_lookup_finish")
+      .message(found ? "回表查询完成，已经找到对应的聚簇索引记录"
+                     : "回表查询完成，但没有得到可用的聚簇索引记录")
+      .field("table", wzg_row_sel_table_name(prebuilt->table))
+      .field("secondary_index", wzg_row_sel_index_name(sec_index))
+      .field("clustered_index", wzg_row_sel_index_name(clust_index))
+      .field("secondary_record_heap_no",
+             sec_rec == nullptr ? 0
+                                : static_cast<std::uint64_t>(
+                                      page_rec_get_heap_no(sec_rec)))
+      .field("clustered_record_heap_no",
+             clust_rec == nullptr ? 0
+                                  : static_cast<std::uint64_t>(
+                                        page_rec_get_heap_no(clust_rec)))
+      .field("clustered_low_match_fields", static_cast<std::uint64_t>(low_match))
+      .field("found_clustered_record", found)
+      .field("result",
+             found ? "二级索引叶子记录里的主键值成功定位到 PRIMARY 叶子记录"
+                   : "可能是聚簇记录在当前 ReadView 中不可见、已被删除清理，或回表过程中遇到锁等待/错误")
+      .field("next_step",
+             found ? "从聚簇索引记录读取 SQL 需要的列，并继续 MVCC/锁/条件判断"
+                   : "跳过这条二级索引记录，或把锁等待/错误返回给上层")
+      .emit();
+}
+
 void wzg_emit_mvcc_read_view_reuse_row(row_prebuilt_t *prebuilt,
                                        const ReadView *view) {
   THD *thd = current_thd;
@@ -230,6 +369,88 @@ void wzg_emit_mvcc_current_read(row_prebuilt_t *prebuilt,
                                 : "当前隔离级别或表属性允许跳过间隙锁，主要锁记录本身")
       .field("next_step",
              "进入 InnoDB 锁模块申请表意向锁、记录锁、间隙锁或临键锁，然后读取最新可用版本")
+      .emit();
+}
+
+std::string wzg_row_sel_range_flag_text(enum ha_rkey_function flag) {
+  switch (flag) {
+    case HA_READ_KEY_EXACT:
+      return "HA_READ_KEY_EXACT";
+    case HA_READ_KEY_OR_NEXT:
+      return "HA_READ_KEY_OR_NEXT";
+    case HA_READ_KEY_OR_PREV:
+      return "HA_READ_KEY_OR_PREV";
+    case HA_READ_AFTER_KEY:
+      return "HA_READ_AFTER_KEY";
+    case HA_READ_BEFORE_KEY:
+      return "HA_READ_BEFORE_KEY";
+    case HA_READ_PREFIX:
+      return "HA_READ_PREFIX";
+    case HA_READ_PREFIX_LAST:
+      return "HA_READ_PREFIX_LAST";
+    case HA_READ_PREFIX_LAST_OR_PREV:
+      return "HA_READ_PREFIX_LAST_OR_PREV";
+    case HA_READ_MBR_CONTAIN:
+      return "HA_READ_MBR_CONTAIN";
+    case HA_READ_MBR_INTERSECT:
+      return "HA_READ_MBR_INTERSECT";
+    case HA_READ_MBR_WITHIN:
+      return "HA_READ_MBR_WITHIN";
+    case HA_READ_MBR_DISJOINT:
+      return "HA_READ_MBR_DISJOINT";
+    case HA_READ_MBR_EQUAL:
+      return "HA_READ_MBR_EQUAL";
+    case HA_READ_NEAREST_NEIGHBOR:
+      return "HA_READ_NEAREST_NEIGHBOR";
+    case HA_READ_INVALID:
+      return "HA_READ_INVALID";
+  }
+  return "UNKNOWN_HA_READ_FLAG";
+}
+
+const char *wzg_row_sel_fetch_direction_name(ulint direction) {
+  switch (direction) {
+    case ROW_SEL_NEXT:
+      return "forward";
+    case ROW_SEL_PREV:
+      return "backward";
+    default:
+      return "initial_position";
+  }
+}
+
+void wzg_emit_range_scan_stop(row_prebuilt_t *prebuilt, const rec_t *rec,
+                              bool clust_templ_for_sec) {
+  THD *thd = current_thd;
+  if (prebuilt == nullptr || prebuilt->m_mysql_handler == nullptr ||
+      prebuilt->m_mysql_handler->end_range == nullptr ||
+      !prebuilt->is_reading_range() ||
+      !wzg_row_sel_should_log(thd, prebuilt->table)) {
+    return;
+  }
+
+  const key_range *end_range = prebuilt->m_mysql_handler->end_range;
+  WZG_PROBE_EVENT(thd, "innodb.range_scan_stop")
+      .message("InnoDB 判断当前记录已经超过范围上界，停止本次范围扫描")
+      .field("table", wzg_row_sel_table_name(prebuilt->table))
+      .field("index", wzg_row_sel_index_name(prebuilt->index))
+      .field("direction",
+             wzg_row_sel_fetch_direction_name(prebuilt->fetch_direction))
+      .field("reason", "当前候选记录按 handler end_range 比较已经越过范围上界")
+      .field("end_key_length_bytes",
+             static_cast<std::uint64_t>(end_range->length))
+      .field("end_keypart_map",
+             static_cast<std::uint64_t>(end_range->keypart_map))
+      .field("end_find_flag", wzg_row_sel_range_flag_text(end_range->flag))
+      .field("record_heap_no",
+             rec == nullptr ? 0
+                            : static_cast<std::uint64_t>(
+                                  page_rec_get_heap_no(rec)))
+      .field("record_source",
+             clust_templ_for_sec
+                 ? "二级索引记录按聚簇索引模板转换后做范围上界判断"
+                 : "当前索引记录转换成 MySQL 行格式后做范围上界判断")
+      .field("next_step", "向上返回 DB_RECORD_NOT_FOUND，handler 结束当前范围读取")
       .emit();
 }
 
@@ -981,6 +1202,8 @@ static inline bool row_sel_test_other_conds(
   offsets = rec_get_offsets(rec, plan->pcur.get_btr_cur()->index, offsets,
                             ULINT_UNDEFINED, UT_LOCATION_HERE, &heap);
 
+  wzg_emit_back_lookup_start(node, plan, rec);
+
   row_build_row_ref_fast(plan->clust_ref, plan->clust_map, rec, offsets);
 
   index = plan->table->first_index();
@@ -989,12 +1212,13 @@ static inline bool row_sel_test_other_conds(
                                 BTR_SEARCH_LEAF, 0, mtr, UT_LOCATION_HERE);
 
   clust_rec = plan->clust_pcur.get_rec();
+  const ulint clust_low_match = plan->clust_pcur.get_low_match();
 
   /* Note: only if the search ends up on a non-infimum record is the
   low_match value the real match to the search tuple */
 
   if (!page_rec_is_user_rec(clust_rec) ||
-      plan->clust_pcur.get_low_match() < dict_index_get_n_unique(index)) {
+      clust_low_match < dict_index_get_n_unique(index)) {
     ut_a(rec_get_deleted_flag(rec, dict_table_is_comp(plan->table)));
     ut_a(node->read_view);
 
@@ -1100,6 +1324,7 @@ static inline bool row_sel_test_other_conds(
 func_exit:
   err = DB_SUCCESS;
 err_exit:
+  wzg_emit_back_lookup_finish(node, plan, rec, *out_rec, clust_low_match, err);
   if (UNIV_LIKELY_NULL(heap)) {
     mem_heap_free(heap);
   }
@@ -3302,6 +3527,8 @@ non-clustered index. Does the necessary locking.
   *out_rec = nullptr;
   trx = thr_get_trx(thr);
 
+  wzg_emit_back_lookup_start_mysql(prebuilt, sec_index, rec);
+
   row_build_row_ref_in_tuple(prebuilt->clust_ref, rec, sec_index, *offsets);
 
   clust_index = sec_index->table->first_index();
@@ -3311,6 +3538,7 @@ non-clustered index. Does the necessary locking.
                                      UT_LOCATION_HERE);
 
   clust_rec = prebuilt->clust_pcur->get_rec();
+  const ulint clust_low_match = prebuilt->clust_pcur->get_low_match();
 
   prebuilt->clust_pcur->m_trx_if_known = trx;
 
@@ -3318,8 +3546,7 @@ non-clustered index. Does the necessary locking.
   low_match value the real match to the search tuple */
 
   if (!page_rec_is_user_rec(clust_rec) ||
-      prebuilt->clust_pcur->get_low_match() <
-          dict_index_get_n_unique(clust_index)) {
+      clust_low_match < dict_index_get_n_unique(clust_index)) {
     btr_cur_t *btr_cur = prebuilt->pcur->get_btr_cur();
 
     /* If this is a spatial index scan, and we are reading
@@ -3543,6 +3770,8 @@ func_exit:
   }
 
 err_exit:
+  wzg_emit_back_lookup_finish_mysql(prebuilt, sec_index, rec, *out_rec,
+                                    clust_low_match, err);
   return err;
 }
 
@@ -4061,6 +4290,8 @@ static bool row_search_end_range_check(byte *mysql_rec, const rec_t *rec,
     if (record_buffer != nullptr) {
       record_buffer->set_out_of_range(true);
     }
+
+    wzg_emit_range_scan_stop(prebuilt, rec, clust_templ_for_sec);
 
     return true;
   }

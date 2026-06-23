@@ -39,6 +39,67 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 #include "ut0byte.h"
 
+#ifndef UNIV_HOTBACKUP
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include "current_thd.h"
+#include "sql/wzg_probe/wzg_probe.h"
+#endif /* !UNIV_HOTBACKUP */
+
+#ifndef UNIV_HOTBACKUP
+namespace {
+
+bool wzg_pcur_should_log(const dict_index_t *index) {
+  if (wzg_probe::raw_sql().empty() || index == nullptr ||
+      index->table == nullptr || index->table->name.m_name == nullptr) {
+    return false;
+  }
+  const std::string_view name(index->table->name.m_name);
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_pcur_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_pcur_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+void wzg_emit_range_page_advance(const dict_index_t *index, space_id_t space_id,
+                                 page_no_t from_page_no,
+                                 page_no_t to_page_no,
+                                 const char *direction,
+                                 const char *reason) {
+  if (!wzg_pcur_should_log(index)) return;
+
+  WZG_PROBE_EVENT(current_thd, "innodb.range_page_advance")
+      .message("范围扫描沿 InnoDB 叶子页链表跨到相邻 leaf page")
+      .field("table", wzg_pcur_table_name(index->table))
+      .field("index", wzg_pcur_index_name(index))
+      .field("space_id", static_cast<std::uint64_t>(space_id))
+      .field("from_page_no", static_cast<std::uint64_t>(from_page_no))
+      .field("to_page_no", static_cast<std::uint64_t>(to_page_no))
+      .field("direction", direction == nullptr ? "unknown" : direction)
+      .field("reason", reason == nullptr ? "游标到达当前 leaf page 边界"
+                                          : reason)
+      .field("page_type", "leaf")
+      .field("next_step", "在新的 leaf page 上继续沿记录链表读取候选记录")
+      .emit();
+}
+
+}  // namespace
+#endif /* !UNIV_HOTBACKUP */
+
 void btr_pcur_t::store_position(mtr_t *mtr) {
   ut_ad(m_pos_state == BTR_PCUR_IS_POSITIONED);
   ut_ad(m_latch_mode != BTR_NO_LATCHES);
@@ -304,6 +365,7 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
   m_old_stored = false;
 
   auto page = get_page();
+  auto from_page_no = page_get_page_no(page);
   auto next_page_no = btr_page_get_next(page, mtr);
 
   ut_ad(next_page_no != FIL_NULL);
@@ -354,6 +416,12 @@ void btr_pcur_t::move_to_next_page(mtr_t *mtr) {
 
   page_cur_set_before_first(next_block, get_page_cur());
 
+#ifndef UNIV_HOTBACKUP
+  wzg_emit_range_page_advance(
+      index, block->page.id.space(), from_page_no, next_page_no, "forward",
+      "游标已经越过当前 leaf page 的 supremum，需要沿 B+Tree 叶子页 next 指针继续范围扫描");
+#endif /* !UNIV_HOTBACKUP */
+
   ut_d(page_check_dir(next_page));
 }
 
@@ -384,6 +452,8 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
   restore_position(latch_mode2, mtr, UT_LOCATION_HERE);
 
   auto page = get_page();
+  auto from_page_no = page_get_page_no(page);
+  auto space_id = get_block()->page.id.space();
   auto prev_page_no = btr_page_get_prev(page, mtr);
 
   /* For intrinsic table we don't do optimistic restore and so there is
@@ -399,6 +469,13 @@ void btr_pcur_t::move_backward_from_page(mtr_t *mtr) {
       btr_leaf_page_release(get_block(), old_latch_mode, mtr);
 
       page_cur_set_after_last(prev_block, get_page_cur());
+
+#ifndef UNIV_HOTBACKUP
+      wzg_emit_range_page_advance(
+          get_btr_cur()->index, space_id, from_page_no, prev_page_no,
+          "backward",
+          "游标已经越过当前 leaf page 的 infimum，需要沿 B+Tree 叶子页 prev 指针继续反向范围扫描");
+#endif /* !UNIV_HOTBACKUP */
     } else {
       /* The repositioned cursor did not end on an infimum
       record on a page. Cursor repositioning acquired a latch

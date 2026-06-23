@@ -63,7 +63,212 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "usr0sess.h"
 
 #include <debug_sync.h>
+#include <algorithm>
+#include <cstdint>
+#include <sstream>
+#include <string>
+#include <string_view>
 #include "my_dbug.h"
+#include "sql/wzg_probe/wzg_probe.h"
+
+namespace {
+
+bool wzg_row_ins_should_log(const dict_table_t *table) {
+  if (current_thd == nullptr || wzg_probe::raw_sql().empty() || table == nullptr ||
+      table->name.m_name == nullptr || table->is_system_table ||
+      table->is_dd_table) {
+    return false;
+  }
+
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_row_ins_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_row_ins_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+const char *wzg_row_ins_index_kind(const dict_index_t *index) {
+  if (index == nullptr) return "unknown";
+  if (index->is_clustered()) return "clustered";
+  if (index->is_multi_value()) return "multi_value_secondary";
+  if (dict_index_is_spatial(index)) return "spatial_secondary";
+  if (dict_index_is_unique(index)) return "unique_secondary";
+  return "secondary";
+}
+
+const char *wzg_row_ins_mode_name(ulint mode) {
+  switch (mode & ~BTR_ALREADY_S_LATCHED) {
+    case BTR_MODIFY_LEAF:
+      return "BTR_MODIFY_LEAF";
+    case BTR_MODIFY_TREE:
+      return "BTR_MODIFY_TREE";
+    default:
+      return "BTR_MODIFY_UNKNOWN";
+  }
+}
+
+std::string wzg_row_ins_db_status(dberr_t err) {
+  switch (err) {
+    case DB_SUCCESS:
+      return "DB_SUCCESS";
+    case DB_SUCCESS_LOCKED_REC:
+      return "DB_SUCCESS_LOCKED_REC";
+    case DB_LOCK_WAIT:
+      return "DB_LOCK_WAIT";
+    case DB_DUPLICATE_KEY:
+      return "DB_DUPLICATE_KEY";
+    case DB_FAIL:
+      return "DB_FAIL";
+    default:
+      break;
+  }
+
+  std::ostringstream out;
+  out << err;
+  return out.str();
+}
+
+std::string wzg_row_ins_tuple_summary(const dtuple_t *entry) {
+  if (entry == nullptr) return "无";
+
+  std::ostringstream out;
+  const ulint n_fields = dtuple_get_n_fields(entry);
+  const ulint n_v_fields = dtuple_get_n_v_fields(entry);
+  out << "fields=" << n_fields << ", virtual_fields=" << n_v_fields
+      << ", compare_fields=" << dtuple_get_n_fields_cmp(entry);
+
+  const ulint preview_fields = std::min<ulint>(n_fields, 4);
+  for (ulint i = 0; i < preview_fields; ++i) {
+    const dfield_t *field = dtuple_get_nth_field(entry, i);
+    out << ", f" << i << "_len=";
+    if (dfield_is_null(field)) {
+      out << "NULL";
+    } else {
+      out << dfield_get_len(field);
+    }
+  }
+
+  if (n_fields > preview_fields) {
+    out << ", more_fields=" << (n_fields - preview_fields);
+  }
+
+  return out.str();
+}
+
+void wzg_emit_row_index_entry_begin(dict_index_t *index, const dtuple_t *entry,
+                                    que_thr_t *thr, uint32_t multi_val_pos) {
+  if (index == nullptr || !wzg_row_ins_should_log(index->table)) return;
+
+  trx_t *trx = thr == nullptr ? nullptr : thr_get_trx(thr);
+  THD *thd = trx == nullptr ? current_thd : trx->mysql_thd;
+
+  WZG_PROBE_EVENT(thd, "innodb.row_insert.index_entry.begin")
+      .message("开始把这一行写入一个 InnoDB 索引")
+      .field("table", wzg_row_ins_table_name(index->table))
+      .field("index", wzg_row_ins_index_name(index))
+      .field("index_kind", wzg_row_ins_index_kind(index))
+      .field("unique_index", dict_index_is_unique(index) != 0)
+      .field("multi_value_position", static_cast<std::uint64_t>(multi_val_pos))
+      .field("tuple_summary", wzg_row_ins_tuple_summary(entry))
+      .field("step",
+             "先按当前索引取出 key 字段，随后进入 B-tree 搜索叶子页并执行插入")
+      .emit();
+}
+
+void wzg_emit_row_index_entry_end(dict_index_t *index, const dtuple_t *entry,
+                                  que_thr_t *thr, uint32_t multi_val_pos,
+                                  dberr_t err) {
+  if (index == nullptr || !wzg_row_ins_should_log(index->table)) return;
+
+  trx_t *trx = thr == nullptr ? nullptr : thr_get_trx(thr);
+  THD *thd = trx == nullptr ? current_thd : trx->mysql_thd;
+
+  WZG_PROBE_EVENT(thd, "innodb.row_insert.index_entry.end")
+      .message(err == DB_SUCCESS ? "这个索引条目已经插入完成"
+                                 : "这个索引条目插入返回错误或需要重试")
+      .field("table", wzg_row_ins_table_name(index->table))
+      .field("index", wzg_row_ins_index_name(index))
+      .field("index_kind", wzg_row_ins_index_kind(index))
+      .field("multi_value_position", static_cast<std::uint64_t>(multi_val_pos))
+      .field("db_error", wzg_row_ins_db_status(err))
+      .field("db_error_code", static_cast<std::uint64_t>(err))
+      .field("success", err == DB_SUCCESS)
+      .field("tuple_summary", wzg_row_ins_tuple_summary(entry))
+      .emit();
+}
+
+void wzg_emit_leaf_positioned(btr_cur_t *cursor, const dtuple_t *entry,
+                              que_thr_t *thr, ulint mode,
+                              const char *insert_kind) {
+  if (cursor == nullptr || cursor->index == nullptr ||
+      !wzg_row_ins_should_log(cursor->index->table)) {
+    return;
+  }
+
+  trx_t *trx = thr == nullptr ? nullptr : thr_get_trx(thr);
+  THD *thd = trx == nullptr ? current_thd : trx->mysql_thd;
+  const page_t *page = btr_cur_get_page(cursor);
+  const rec_t *rec = btr_cur_get_rec(cursor);
+
+  WZG_PROBE_EVENT(thd, "innodb.btree_insert.leaf_positioned")
+      .message("B-tree 搜索已经把 cursor 定位到目标叶子页，下一步会做重复检查、锁和物理插入")
+      .field("table", wzg_row_ins_table_name(cursor->index->table))
+      .field("index", wzg_row_ins_index_name(cursor->index))
+      .field("index_kind", wzg_row_ins_index_kind(cursor->index))
+      .field("insert_kind", insert_kind == nullptr ? "unknown" : insert_kind)
+      .field("search_mode", wzg_row_ins_mode_name(mode))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("page_level", static_cast<std::uint64_t>(btr_page_get_level(page)))
+      .field("page_type", page_is_leaf(page) ? "leaf" : "internal")
+      .field("cursor_record_heap_no",
+             rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(rec)))
+      .field("low_match_fields", static_cast<std::uint64_t>(cursor->low_match))
+      .field("up_match_fields", static_cast<std::uint64_t>(cursor->up_match))
+      .field("tuple_summary", wzg_row_ins_tuple_summary(entry))
+      .emit();
+}
+
+void wzg_emit_duplicate_check(dict_index_t *index, const dtuple_t *entry,
+                              que_thr_t *thr, const char *check_scope,
+                              ulint n_unique, ulint low_match, ulint up_match,
+                              bool allow_duplicates, dberr_t err) {
+  if (index == nullptr || !wzg_row_ins_should_log(index->table)) return;
+
+  trx_t *trx = thr == nullptr ? nullptr : thr_get_trx(thr);
+  THD *thd = trx == nullptr ? current_thd : trx->mysql_thd;
+
+  WZG_PROBE_EVENT(thd, "innodb.insert.duplicate_check")
+      .message(err == DB_SUCCESS ? "唯一键重复检查通过，未发现冲突"
+                                 : "唯一键重复检查发现冲突或等待锁")
+      .field("table", wzg_row_ins_table_name(index->table))
+      .field("index", wzg_row_ins_index_name(index))
+      .field("index_kind", wzg_row_ins_index_kind(index))
+      .field("check_scope", check_scope == nullptr ? "unknown" : check_scope)
+      .field("unique_fields", static_cast<std::uint64_t>(n_unique))
+      .field("low_match_fields", static_cast<std::uint64_t>(low_match))
+      .field("up_match_fields", static_cast<std::uint64_t>(up_match))
+      .field("allow_duplicates", allow_duplicates)
+      .field("db_error", wzg_row_ins_db_status(err))
+      .field("db_error_code", static_cast<std::uint64_t>(err))
+      .field("tuple_summary", wzg_row_ins_tuple_summary(entry))
+      .field("note",
+             "InnoDB 根据 cursor 的 low/up match 判断是否可能撞唯一键，并在可能冲突的位置加锁")
+      .emit();
+}
+
+}  // namespace
 
 /*************************************************************************
 IMPORTANT NOTE: Any operation that generates redo MUST check that there
@@ -1948,6 +2153,9 @@ static bool row_allow_duplicates(que_thr_t *thr) {
   if (!index->nulls_equal) {
     for (ulint i = 0; i < n_unique; i++) {
       if (UNIV_SQL_NULL == dfield_get_len(dtuple_get_nth_field(entry, i))) {
+        wzg_emit_duplicate_check(index, entry, thr, "secondary_unique_null",
+                                 n_unique, 0, 0, row_allow_duplicates(thr),
+                                 DB_SUCCESS);
         return DB_SUCCESS;
       }
     }
@@ -2088,6 +2296,10 @@ end_scan:
   dtuple_set_n_fields_cmp(entry, n_fields_cmp);
 
   pcur.close();
+  wzg_emit_duplicate_check(index, entry, thr, "secondary_unique_scan",
+                           n_unique, pcur.get_btr_cur()->low_match,
+                           pcur.get_btr_cur()->up_match, allow_duplicates,
+                           err);
   return err;
 }
 
@@ -2291,6 +2503,9 @@ func_exit:
   if (UNIV_LIKELY_NULL(heap)) {
     mem_heap_free(heap);
   }
+  wzg_emit_duplicate_check(cursor->index, entry, thr, "clustered_unique_cursor",
+                           n_unique, cursor->low_match, cursor->up_match,
+                           row_allow_duplicates(thr), err);
   return (err);
 }
 
@@ -2458,6 +2673,7 @@ dberr_t row_ins_clust_index_entry_low(uint32_t flags, ulint mode,
   pcur.open(index, 0, entry, PAGE_CUR_LE, mode, &mtr, UT_LOCATION_HERE);
   cursor = pcur.get_btr_cur();
   cursor->thr = thr;
+  wzg_emit_leaf_positioned(cursor, entry, thr, mode, "clustered_index");
 
   ut_ad(!index->table->is_intrinsic() ||
         cursor->page_cur.block->made_dirty_with_no_latch);
@@ -2499,8 +2715,11 @@ dberr_t row_ins_clust_index_entry_low(uint32_t flags, ulint mode,
   ut_ad(!index->allow_duplicates ||
         (index->allow_duplicates && index->table->is_intrinsic()));
 
-  if (!index->allow_duplicates && n_uniq &&
-      (cursor->up_match >= n_uniq || cursor->low_match >= n_uniq)) {
+  const bool duplicate_check_needed =
+      !index->allow_duplicates && n_uniq &&
+      (cursor->up_match >= n_uniq || cursor->low_match >= n_uniq);
+
+  if (duplicate_check_needed) {
     if (flags == (BTR_CREATE_FLAG | BTR_NO_LOCKING_FLAG | BTR_NO_UNDO_LOG_FLAG |
                   BTR_KEEP_SYS_FLAG)) {
       /* Set no locks when applying log
@@ -2532,6 +2751,10 @@ dberr_t row_ins_clust_index_entry_low(uint32_t flags, ulint mode,
       mtr.commit();
       goto func_exit;
     }
+  } else if (!index->allow_duplicates && n_uniq) {
+    wzg_emit_duplicate_check(index, entry, thr, "clustered_unique_no_match",
+                             n_uniq, cursor->low_match, cursor->up_match,
+                             row_allow_duplicates(thr), DB_SUCCESS);
   }
 
   if (dup_chk_only) {
@@ -2845,6 +3068,7 @@ dberr_t row_ins_sec_index_entry_low(uint32_t flags, ulint mode,
   ulint *offsets = offsets_;
   rec_offs_init(offsets_);
   rtr_info_t rtr_info;
+  bool duplicate_check_needed = false;
 
   ut_ad(!index->is_clustered());
   ut_ad(mode == BTR_MODIFY_LEAF || mode == BTR_MODIFY_TREE);
@@ -2957,6 +3181,8 @@ dberr_t row_ins_sec_index_entry_low(uint32_t flags, ulint mode,
     goto func_exit;
   }
 
+  wzg_emit_leaf_positioned(&cursor, entry, thr, mode, "secondary_index");
+
 #ifdef UNIV_DEBUG
   {
     page_t *page = btr_cur_get_page(&cursor);
@@ -2969,8 +3195,11 @@ dberr_t row_ins_sec_index_entry_low(uint32_t flags, ulint mode,
 
   n_unique = dict_index_get_n_unique(index);
 
-  if (dict_index_is_unique(index) &&
-      (cursor.low_match >= n_unique || cursor.up_match >= n_unique)) {
+  duplicate_check_needed = dict_index_is_unique(index) &&
+                           (cursor.low_match >= n_unique ||
+                            cursor.up_match >= n_unique);
+
+  if (duplicate_check_needed) {
     mtr_commit(&mtr);
 
     DEBUG_SYNC_C("row_ins_sec_index_unique");
@@ -3033,6 +3262,12 @@ dberr_t row_ins_sec_index_entry_low(uint32_t flags, ulint mode,
           (search_mode & ~(BTR_INSERT | BTR_IGNORE_SEC_UNIQUE)), &cursor, 0,
           __FILE__, __LINE__, &mtr);
     }
+  }
+
+  if (dict_index_is_unique(index) && !duplicate_check_needed) {
+    wzg_emit_duplicate_check(index, entry, thr, "secondary_unique_no_match",
+                             n_unique, cursor.low_match, cursor.up_match,
+                             row_allow_duplicates(thr), DB_SUCCESS);
   }
 
   if (dup_chk_only) {
@@ -3345,20 +3580,26 @@ record.
 static dberr_t row_ins_index_entry(dict_index_t *index, dtuple_t *entry,
                                    uint32_t &multi_val_pos, que_thr_t *thr) {
   ut_ad(thr_get_trx(thr)->id != 0);
+  const uint32_t start_multi_val_pos = multi_val_pos;
 
   DBUG_EXECUTE_IF("row_ins_index_entry_timeout", {
     DBUG_SET("-d,row_ins_index_entry_timeout");
     return (DB_LOCK_WAIT);
   });
 
+  wzg_emit_row_index_entry_begin(index, entry, thr, start_multi_val_pos);
+
+  dberr_t err;
   if (index->is_clustered()) {
-    return (row_ins_clust_index_entry(index, entry, thr, false));
+    err = row_ins_clust_index_entry(index, entry, thr, false);
   } else if (index->is_multi_value()) {
-    return (
-        row_ins_sec_index_multi_value_entry(index, entry, multi_val_pos, thr));
+    err = row_ins_sec_index_multi_value_entry(index, entry, multi_val_pos, thr);
   } else {
-    return (row_ins_sec_index_entry(index, entry, thr, false));
+    err = row_ins_sec_index_entry(index, entry, thr, false);
   }
+
+  wzg_emit_row_index_entry_end(index, entry, thr, multi_val_pos, err);
+  return err;
 }
 
 /** This function generate MBR (Minimum Bounding Box) for spatial objects

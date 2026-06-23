@@ -92,11 +92,13 @@ bool wzg_btr_should_log(const trx_t *trx, const dict_table_t *table) {
   const THD *thd = trx != nullptr ? trx->mysql_thd : current_thd;
   if (thd == nullptr || thd->query().str == nullptr ||
       thd->query().length == 0 || thd->thread_id() == 0 || table == nullptr ||
-      table->name.m_name == nullptr) {
+      table->name.m_name == nullptr || table->is_system_table ||
+      table->is_dd_table) {
     return false;
   }
   const std::string_view name(table->name.m_name);
-  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
          !name.starts_with("performance_schema/") &&
          !name.starts_with("information_schema/");
 }
@@ -111,6 +113,234 @@ std::string wzg_btr_table_name(const dict_table_t *table) {
 std::string wzg_btr_index_name(const dict_index_t *index) {
   if (index == nullptr || index->name() == nullptr) return "无";
   return index->name();
+}
+
+const char *wzg_btr_ibuf_op_name(ibuf_op_t op) {
+  switch (op) {
+    case IBUF_OP_INSERT:
+      return "insert";
+    case IBUF_OP_DELETE_MARK:
+      return "delete_mark";
+    case IBUF_OP_DELETE:
+      return "delete";
+    case IBUF_OP_COUNT:
+      return "unknown";
+  }
+
+  return "unknown";
+}
+
+std::string wzg_btr_index_kind(const dict_index_t *index) {
+  if (index == nullptr) return "未知索引";
+  if (index->is_clustered()) return "聚簇索引，叶子页保存整行数据";
+  return "二级索引，叶子页保存二级索引列和主键值；如果查询列不覆盖，后续可能回表查 PRIMARY";
+}
+
+const char *wzg_btr_page_mode_text(page_cur_mode_t mode) {
+  switch (mode) {
+    case PAGE_CUR_L:
+      return "PAGE_CUR_L，定位到小于 search key 的位置";
+    case PAGE_CUR_LE:
+      return "PAGE_CUR_LE，定位到小于等于 search key 的位置";
+    case PAGE_CUR_G:
+      return "PAGE_CUR_G，定位到大于 search key 的位置";
+    case PAGE_CUR_GE:
+      return "PAGE_CUR_GE，定位到大于等于 search key 的位置";
+    default:
+      return "其他空间索引或内部查找模式";
+  }
+}
+
+bool wzg_btr_should_log_search(const dict_index_t *index) {
+  return !wzg_probe::raw_sql().empty() && index != nullptr &&
+         wzg_btr_should_log(nullptr, index->table);
+}
+
+void wzg_emit_btree_search_start(const dict_index_t *index, ulint target_level,
+                                 page_cur_mode_t mode, page_no_t root_page_no) {
+  if (!wzg_btr_should_log_search(index)) return;
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_search_start")
+      .message("开始在 InnoDB B+Tree 索引中查找目标 page")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("target_level", static_cast<std::uint64_t>(target_level))
+      .field("root_page_no", static_cast<std::uint64_t>(root_page_no))
+      .field("search_mode", wzg_btr_page_mode_text(mode))
+      .field("goal",
+             target_level == 0
+                 ? "目标是找到 leaf page；真正的用户记录都在 leaf page"
+                 : "目标是找到指定层级的 page，通常是内部维护或范围定位")
+      .field("tree_search_algorithm",
+             "从 root page 开始，每一层在页内定位 search key 应该落入的区间；如果不是目标层，就取 node pointer 指向的 child page 继续向下")
+      .field("next_step",
+             "读取 root page，并在每个 B+Tree page 内调用 page cursor 做页内二分定位")
+      .emit();
+}
+
+void wzg_emit_change_buffer_fallback_read(const dict_index_t *index,
+                                          ibuf_op_t op,
+                                          const page_id_t &page_id,
+                                          const page_size_t &page_size) {
+  if (!wzg_btr_should_log_search(index)) return;
+
+  WZG_PROBE_EVENT(current_thd, "innodb.change_buffer.fallback_read_page")
+      .message("Change Buffer 没有接住这次修改，回退为读取目标 leaf page 后直接修改")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("operation", wzg_btr_ibuf_op_name(op))
+      .field("space_id", static_cast<std::uint64_t>(page_id.space()))
+      .field("page_no", static_cast<std::uint64_t>(page_id.page_no()))
+      .field("page_size_bytes",
+             static_cast<std::uint64_t>(page_size.physical()))
+      .field("compressed_page", page_size.is_compressed())
+      .field("next_step",
+             "恢复正常 page fetch，真正读入该 leaf page，再在页上执行二级索引修改")
+      .emit();
+}
+
+void wzg_emit_btree_search_leaf(const dict_index_t *index, const page_t *page,
+                                ulint root_height, ulint height,
+                                page_cur_mode_t mode) {
+  if (!wzg_btr_should_log_search(index) || page == nullptr || height != 0) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_search_leaf")
+      .message("B+Tree 查找已经到达叶子页，接下来在页内定位具体记录")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("tree_height", static_cast<std::uint64_t>(root_height + 1))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("page_level", static_cast<std::uint64_t>(height))
+      .field("page_type", "leaf")
+      .field("page_search_mode", wzg_btr_page_mode_text(mode))
+      .field("leaf_meaning",
+             index->is_clustered()
+                 ? "聚簇索引叶子页的记录就是整行，后续可以直接读列值和隐藏字段"
+                 : "二级索引叶子页只保存二级索引键和主键值；如果返回列不在二级索引中，后续需要用主键回表")
+      .field("next_step",
+             "在 leaf page 内通过 Page Directory 二分定位区间，再沿记录 next pointer 扫描少量记录")
+      .emit();
+}
+
+void wzg_emit_btree_search_child_decision(const dict_index_t *index,
+                                          const page_t *page,
+                                          const rec_t *node_ptr,
+                                          ulint current_level,
+                                          page_no_t child_page_no,
+                                          page_cur_mode_t mode) {
+  if (!wzg_btr_should_log_search(index) || page == nullptr ||
+      node_ptr == nullptr) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_search_child_page")
+      .message("在非叶子页内定位到 node pointer，决定下一步进入哪个 child page")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("current_page_no",
+             static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("current_page_level", static_cast<std::uint64_t>(current_level))
+      .field("node_pointer_heap_no",
+             static_cast<std::uint64_t>(page_rec_get_heap_no(node_ptr)))
+      .field("child_page_no", static_cast<std::uint64_t>(child_page_no))
+      .field("page_search_mode", wzg_btr_page_mode_text(mode))
+      .field("decision_standard",
+             "非叶子页记录保存分隔 key 和 child page no；页内比较 search key 后，cursor 停在应该进入的 node pointer 上")
+      .field("next_step",
+             "读取 child page，重复页内定位；直到 page_level=0 的 leaf page")
+      .emit();
+}
+
+void wzg_emit_btree_search_finish(const dict_index_t *index, const page_t *page,
+                                  const page_cur_t *page_cursor,
+                                  ulint root_height, ulint target_level,
+                                  ulint up_match, ulint low_match,
+                                  page_cur_mode_t mode) {
+  if (!wzg_btr_should_log_search(index) || page == nullptr ||
+      page_cursor == nullptr) {
+    return;
+  }
+
+  const rec_t *rec = page_cur_get_rec(page_cursor);
+  const bool exact_candidate =
+      rec != nullptr && page_rec_is_user_rec(rec) &&
+      (mode == PAGE_CUR_LE || mode == PAGE_CUR_GE) &&
+      (up_match >= dict_index_get_n_unique_in_tree(index) ||
+       low_match >= dict_index_get_n_unique_in_tree(index));
+
+  WZG_PROBE_EVENT(current_thd, "innodb.btree_search_finish")
+      .message("B+Tree 查找完成，cursor 已定位到索引页中的候选记录位置")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("tree_height", static_cast<std::uint64_t>(root_height + 1))
+      .field("target_level", static_cast<std::uint64_t>(target_level))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("page_level", static_cast<std::uint64_t>(btr_page_get_level(page)))
+      .field("cursor_record_heap_no",
+             rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(rec)))
+      .field("cursor_record_kind",
+             rec == nullptr
+                 ? "无记录"
+                 : (page_rec_is_user_rec(rec)
+                        ? "用户记录"
+                        : (page_rec_is_infimum(rec) ? "infimum 伪记录"
+                                                    : "supremum 伪记录")))
+      .field("matched_unique_fields_candidate", exact_candidate)
+      .field("up_match_fields", static_cast<std::uint64_t>(up_match))
+      .field("low_match_fields", static_cast<std::uint64_t>(low_match))
+      .field("search_result_scope",
+             "这里只表示 B+Tree cursor 已经落到一个候选位置，不等于 SQL 最终已经返回该行")
+      .field("match_standard",
+             "等值查找最终还会由 row_search/handler 检查完整 key 是否相等；这里的 up_match/low_match 表示页内比较已有多少索引字段匹配")
+      .field("found_decision_owner",
+             "是否真的找到一行，由后续 row_search_mvcc/handler 返回 DB_SUCCESS、DB_RECORD_NOT_FOUND 或 DB_END_OF_INDEX 来确认")
+      .field("back_lookup_note",
+             index->is_clustered()
+                 ? "当前是聚簇索引，叶子记录包含整行，通常不需要回表"
+                 : "当前是二级索引；如果 Server 需要的列不被该索引覆盖，后续会用叶子记录里的主键值再查 PRIMARY")
+      .field("next_step",
+             "读取候选记录，执行 MVCC 可见性判断、锁判断，或继续范围扫描")
+      .emit();
+}
+
+void wzg_emit_btree_insert_optimistic_fail(
+    const trx_t *trx, const dict_index_t *index, const buf_block_t *block,
+    const page_t *page, ulint rec_size, ulint max_insert_size_after_reorganize,
+    const char *reason) {
+  if (index == nullptr || page == nullptr || block == nullptr ||
+      !wzg_btr_should_log(trx, index->table)) {
+    return;
+  }
+
+  THD *thd = trx != nullptr && trx->mysql_thd != nullptr ? trx->mysql_thd
+                                                         : current_thd;
+  WZG_PROBE_EVENT(thd, "innodb.btree_insert_optimistic_fail")
+      .message("InnoDB 乐观插入发现当前 B+Tree 页放不下新记录，需要改走悲观插入并准备分裂页")
+      .field("table", wzg_btr_table_name(index->table))
+      .field("index", wzg_btr_index_name(index))
+      .field("index_kind", wzg_btr_index_kind(index))
+      .field("space_id", static_cast<std::uint64_t>(block->page.id.space()))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("page_level", static_cast<std::uint64_t>(btr_page_get_level(page)))
+      .field("page_type", page_is_leaf(page) ? "leaf" : "internal")
+      .field("page_records", static_cast<std::uint64_t>(page_get_n_recs(page)))
+      .field("page_data_bytes",
+             static_cast<std::uint64_t>(page_get_data_size(page)))
+      .field("page_max_insert_bytes_before_reorganize",
+             static_cast<std::uint64_t>(page_get_max_insert_size(page, 1)))
+      .field("page_max_insert_bytes_after_reorganize",
+             static_cast<std::uint64_t>(max_insert_size_after_reorganize))
+      .field("record_bytes_needed", static_cast<std::uint64_t>(rec_size))
+      .field("compressed_page", block->page.size.is_compressed())
+      .field("fail_reason", reason == nullptr ? "空间不足" : reason)
+      .field("next_step",
+             "调用 pessimistic insert：先预留空间，再根据当前页是否 root 选择 root 升高或普通 page split")
+      .emit();
 }
 
 void wzg_emit_delete_mark_clustered_record(const trx_t *trx,
@@ -997,6 +1227,8 @@ void btr_cur_search_to_nth_level(
       break;
   }
 
+  wzg_emit_btree_search_start(index, level, mode, page_id.page_no());
+
   /* Loop and search until we arrive at the desired level */
   btr_latch_leaves_t latch_leaves = {{nullptr, nullptr, nullptr}, {0, 0, 0}};
 
@@ -1062,6 +1294,8 @@ retry_page_get:
 
           goto func_exit;
         }
+        wzg_emit_change_buffer_fallback_read(index, IBUF_OP_INSERT, page_id,
+                                             page_size);
         break;
 
       case BTR_DELMARK_OP:
@@ -1074,6 +1308,8 @@ retry_page_get:
 
           goto func_exit;
         }
+        wzg_emit_change_buffer_fallback_read(index, IBUF_OP_DELETE_MARK,
+                                             page_id, page_size);
 
         break;
 
@@ -1090,6 +1326,8 @@ retry_page_get:
           cursor->flag = BTR_CUR_DELETE_IBUF;
         } else {
           /* The purge could not be buffered. */
+          wzg_emit_change_buffer_fallback_read(index, IBUF_OP_DELETE, page_id,
+                                               page_size);
           buf_pool_watch_unset(page_id);
           break;
         }
@@ -1255,6 +1493,7 @@ retry_page_get:
     }
 
     page_mode = mode;
+    wzg_emit_btree_search_leaf(index, page, root_height, height, page_mode);
   }
 
   if (dict_index_is_spatial(index)) {
@@ -1370,6 +1609,11 @@ retry_page_get:
     if (rw_latch == RW_NO_LATCH && height != 0) {
       rw_lock_s_unlock(&(block->lock));
     }
+  }
+
+  if (level == height) {
+    wzg_emit_btree_search_finish(index, page, page_cursor, root_height, level,
+                                 up_match, low_match, page_mode);
   }
 
   if (level != height) {
@@ -1619,7 +1863,10 @@ retry_page_get:
     }
 
     /* Go to the child node */
-    page_id.reset(space, btr_node_ptr_get_child_page_no(node_ptr, offsets));
+    const page_no_t child_page_no = btr_node_ptr_get_child_page_no(node_ptr, offsets);
+    wzg_emit_btree_search_child_decision(index, page, node_ptr, height + 1,
+                                         child_page_no, page_mode);
+    page_id.reset(space, child_page_no);
 
     n_blocks++;
 
@@ -2772,6 +3019,7 @@ dberr_t btr_cur_optimistic_insert(
   bool inherit = true;
   ulint rec_size;
   dberr_t err;
+  const char *optimistic_fail_reason = "当前页可用空间不足";
 
   *big_rec = nullptr;
 
@@ -2830,6 +3078,7 @@ dberr_t btr_cur_optimistic_insert(
     result in too packed up page i.e.: which is likely to
     cause compression failure then don't do an optimistic
     insertion. */
+    optimistic_fail_reason = "压缩页填充策略要求提前分裂，避免页过满导致压缩失败";
   fail:
     err = DB_FAIL;
 
@@ -2839,6 +3088,12 @@ dberr_t btr_cur_optimistic_insert(
       btr_cur_prefetch_siblings(block);
     }
   fail_err:
+    if (err == DB_FAIL) {
+      wzg_emit_btree_insert_optimistic_fail(
+          thr != nullptr ? thr_get_trx(thr) : nullptr, index, block, page,
+          rec_size, page_get_max_insert_size_after_reorganize(page, 1),
+          optimistic_fail_reason);
+    }
 
     if (big_rec_vec) {
       dtuple_convert_back_big_rec(entry, big_rec_vec);
@@ -2853,9 +3108,12 @@ dberr_t btr_cur_optimistic_insert(
     if ((max_size < rec_size || max_size < BTR_CUR_PAGE_REORGANIZE_LIMIT) &&
         page_get_n_recs(page) > 1 &&
         page_get_max_insert_size(page, 1) < rec_size) {
+      optimistic_fail_reason =
+          "页内有已删除记录但回收后仍不足，或重组收益太小，改走分裂";
       goto fail;
     }
   } else if (max_size < rec_size) {
+    optimistic_fail_reason = "页重组后最大可插入空间仍小于新记录大小";
     goto fail;
   }
 
@@ -2869,6 +3127,8 @@ dberr_t btr_cur_optimistic_insert(
       dict_index_get_space_reserve() + rec_size > max_size &&
       (btr_page_get_split_rec_to_right(cursor, &dummy) ||
        btr_page_get_split_rec_to_left(cursor, &dummy))) {
+    optimistic_fail_reason =
+        "聚簇索引叶子页需要保留更新余量，提前进入分裂路径";
     goto fail;
   }
 

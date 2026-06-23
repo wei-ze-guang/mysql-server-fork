@@ -43,6 +43,12 @@ _runtime/mysql-local/logs/wzg-probe.jsonl
 wzg-local-doc/mysql-local-build-report.md
 ```
 
+事件链路怎么阅读、典型 SQL 应该看哪些事件，见：
+
+```text
+wzg-local-doc/wzg-probe-event-guide.md
+```
+
 ## 日志风格要求
 
 ### Key 使用英文

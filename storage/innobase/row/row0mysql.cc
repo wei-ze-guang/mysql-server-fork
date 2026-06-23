@@ -39,8 +39,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sql_const.h>
 #include <sys/types.h>
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <new>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "btr0sea.h"
@@ -84,6 +87,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "current_thd.h"
 #include "my_dbug.h"
 #include "my_io.h"
+#include "sql/wzg_probe/wzg_probe.h"
 
 static const char *MODIFICATIONS_NOT_ALLOWED_MSG_FORCE_RECOVERY =
     "innodb_force_recovery is on. We do not allow database modifications"
@@ -92,6 +96,50 @@ static const char *MODIFICATIONS_NOT_ALLOWED_MSG_FORCE_RECOVERY =
 
 /** Provide optional 4.x backwards compatibility for 5.0 and above */
 bool row_rollback_on_timeout = false;
+
+namespace {
+
+std::string wzg_row_mysql_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+bool wzg_row_mysql_should_log(const dict_table_t *table) {
+  if (wzg_probe::raw_sql().empty() || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+void wzg_emit_row_insert_start(const row_prebuilt_t *prebuilt) {
+  if (prebuilt == nullptr || !wzg_row_mysql_should_log(prebuilt->table)) {
+    return;
+  }
+
+  THD *thd = prebuilt->trx == nullptr ? current_thd : prebuilt->trx->mysql_thd;
+  WZG_PROBE_EVENT(thd, "innodb.row_insert.start")
+      .message("MySQL 层把一行 INSERT 交给 InnoDB，准备转换成聚簇索引和二级索引条目")
+      .field("table", wzg_row_mysql_table_name(prebuilt->table))
+      .field("insert_path",
+             prebuilt->table->is_intrinsic() ? "cursor_direct"
+                                             : "insert_graph")
+      .field("intrinsic_table", prebuilt->table->is_intrinsic())
+      .field("temporary_table", prebuilt->table->is_temporary())
+      .field("has_fts_index", dict_table_has_fts_index(prebuilt->table))
+      .field("note",
+             "这是 InnoDB row insert 入口，后面会按每个索引依次构造并插入 index entry")
+      .emit();
+}
+
+}  // namespace
 
 /** Chain node of the list of tables to drop in the background. */
 struct row_mysql_drop_t {
@@ -122,6 +170,57 @@ static bool row_mysql_drop_list_inited = false;
  @return true if the table was not yet in the drop list, and was added there */
 static bool row_add_table_to_background_drop_list(
     const char *name); /*!< in: table name */
+
+namespace {
+
+bool wzg_row_should_log_autoinc(const dict_table_t *table) {
+  THD *thd = current_thd;
+  if (thd == nullptr || thd->query().str == nullptr ||
+      thd->query().length == 0 || table == nullptr ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+
+  const std::string_view name(table->name.m_name);
+  return !name.starts_with("mysql/") && !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_row_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_row_trx_id_text(const trx_t *trx) {
+  if (trx == nullptr) return "无事务";
+  return std::to_string(static_cast<unsigned long long>(trx_get_id_for_print(trx)));
+}
+
+void wzg_emit_innodb_autoinc_table_lock_begin(row_prebuilt_t *prebuilt) {
+  if (prebuilt == nullptr || !wzg_row_should_log_autoinc(prebuilt->table)) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.autoinc_table_lock")
+      .message("InnoDB row 层准备申请表级 AUTO-INC lock")
+      .field("table", wzg_row_table_name(prebuilt->table))
+      .field("innodb_table_id",
+             static_cast<std::uint64_t>(
+                 prebuilt->table == nullptr ? 0 : prebuilt->table->id))
+      .field("transaction_id", wzg_row_trx_id_text(prebuilt->trx))
+      .field("phase", "before_lock_table")
+      .field("lock_mode", "LOCK_AUTO_INC")
+      .field("lock_scope", "table")
+      .field("why_lock",
+             "传统自增锁路径需要语句级表锁，保证批量插入或 INSERT ... SELECT 的自增区间连续且可复现")
+      .field("next_step", "调用 lock_table(..., LOCK_AUTO_INC, ...) 申请真实锁对象")
+      .emit();
+}
+
+}  // namespace
 
 #ifdef UNIV_DEBUG
 /** Wait for the background drop list to become empty. */
@@ -1184,6 +1283,7 @@ run_again:
 
   trx_start_if_not_started_xa(trx, true, UT_LOCATION_HERE);
 
+  wzg_emit_innodb_autoinc_table_lock_begin(prebuilt);
   err = lock_table(0, prebuilt->table, LOCK_AUTO_INC, thr);
 
   trx->error_state = err;
@@ -1707,6 +1807,8 @@ run_again:
 @param[in,out]  prebuilt        prebuilt struct in MySQL handle
 @return error code or DB_SUCCESS*/
 dberr_t row_insert_for_mysql(const byte *mysql_rec, row_prebuilt_t *prebuilt) {
+  wzg_emit_row_insert_start(prebuilt);
+
   /* For intrinsic tables there a lot of restrictions that can be
   relaxed including locking of table, transaction handling, etc.
   Use direct cursor interface for inserting to intrinsic tables. */

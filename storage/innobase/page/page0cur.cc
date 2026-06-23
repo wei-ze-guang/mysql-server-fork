@@ -35,16 +35,193 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "page0cur.h"
 
 #include "btr0btr.h"
+#include "current_thd.h"
 #include "ha_prototypes.h"
 #include "log0recv.h"
 #include "mtr0log.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
 #include "page0zip.h"
 
 #ifndef UNIV_HOTBACKUP
 #include "gis0rtree.h"
 #include "rem0cmp.h"
+#include "sql/wzg_probe/wzg_probe.h"
+#endif /* !UNIV_HOTBACKUP */
+
+#ifndef UNIV_HOTBACKUP
+namespace {
+
+bool wzg_page_search_should_log(const dict_index_t *index) {
+  if (current_thd == nullptr || wzg_probe::raw_sql().empty() || index == nullptr ||
+      index->table == nullptr || index->table->name.m_name == nullptr ||
+      index->table->is_system_table || index->table->is_dd_table) {
+    return false;
+  }
+  const std::string_view name(index->table->name.m_name);
+  return !name.starts_with("SDI_") && !name.starts_with("mysql/") &&
+         !name.starts_with("sys/") &&
+         !name.starts_with("performance_schema/") &&
+         !name.starts_with("information_schema/");
+}
+
+std::string wzg_page_table_name(const dict_table_t *table) {
+  if (table == nullptr || table->name.m_name == nullptr) return "无";
+  std::string value(table->name.m_name);
+  std::replace(value.begin(), value.end(), '/', '.');
+  return value;
+}
+
+std::string wzg_page_index_name(const dict_index_t *index) {
+  if (index == nullptr || index->name() == nullptr) return "无";
+  return index->name();
+}
+
+const char *wzg_page_mode_text(page_cur_mode_t mode) {
+  switch (mode) {
+    case PAGE_CUR_L:
+      return "PAGE_CUR_L，小于 search key";
+    case PAGE_CUR_LE:
+      return "PAGE_CUR_LE，小于等于 search key";
+    case PAGE_CUR_G:
+      return "PAGE_CUR_G，大于 search key";
+    case PAGE_CUR_GE:
+      return "PAGE_CUR_GE，大于等于 search key";
+    default:
+      return "其他内部查找模式";
+  }
+}
+
+const char *wzg_page_index_kind(const dict_index_t *index) {
+  if (index == nullptr) return "unknown";
+  if (index->is_clustered()) return "clustered";
+  if (dict_index_is_spatial(index)) return "spatial_secondary";
+  if (dict_index_is_unique(index)) return "unique_secondary";
+  return "secondary";
+}
+
+void wzg_emit_page_record_insert(const page_t *page, const dict_index_t *index,
+                                 const rec_t *current_rec,
+                                 const rec_t *insert_rec, ulint rec_size,
+                                 bool reused_free_record, mtr_t *mtr) {
+  if (!wzg_page_search_should_log(index) || page == nullptr ||
+      insert_rec == nullptr || mtr == nullptr) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.page_record.insert")
+      .message("InnoDB 已在 leaf page 的记录链表中插入一条物理 record")
+      .field("table", wzg_page_table_name(index->table))
+      .field("index", wzg_page_index_name(index))
+      .field("index_kind", wzg_page_index_kind(index))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("page_level", static_cast<std::uint64_t>(btr_page_get_level(page)))
+      .field("page_type", page_is_leaf(page) ? "leaf" : "internal")
+      .field("record_size", static_cast<std::uint64_t>(rec_size))
+      .field("inserted_record_heap_no",
+             static_cast<std::uint64_t>(page_rec_get_heap_no(insert_rec)))
+      .field("previous_record_heap_no",
+             current_rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(current_rec)))
+      .field("next_record_heap_no",
+             static_cast<std::uint64_t>(page_rec_get_heap_no(page_rec_get_next_const(insert_rec))))
+      .field("reused_free_record", reused_free_record)
+      .field("page_record_count", static_cast<std::uint64_t>(page_get_n_recs(page)))
+      .field("page_data_size", static_cast<std::uint64_t>(page_get_data_size(page)))
+      .field("redo_record_expected",
+             mtr != nullptr && mtr_get_log_mode(mtr) != MTR_LOG_NO_REDO &&
+                 mtr_get_log_mode(mtr) != MTR_LOG_NONE)
+      .field("note",
+             "此时 record 已接入页内 next pointer 链表；如果 mtr 开启 redo，随后会写入 record insert redo")
+      .emit();
+}
+
+void wzg_emit_page_directory_update(const page_t *page,
+                                    const dict_index_t *index,
+                                    const rec_t *owner_rec,
+                                    const rec_t *insert_rec,
+                                    ulint old_n_owned,
+                                    ulint new_n_owned,
+                                    bool split_directory_slot) {
+  if (!wzg_page_search_should_log(index) || page == nullptr ||
+      owner_rec == nullptr || insert_rec == nullptr) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.page_directory.update")
+      .message(split_directory_slot
+                   ? "新 record 让目录 owner 管理的记录数达到上限，Page Directory 已拆分 slot"
+                   : "新 record 挂到已有 Page Directory owner 下，更新 owner 的 n_owned")
+      .field("table", wzg_page_table_name(index->table))
+      .field("index", wzg_page_index_name(index))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("directory_slot_count",
+             static_cast<std::uint64_t>(page_dir_get_n_slots(page)))
+      .field("owner_record_heap_no",
+             static_cast<std::uint64_t>(page_rec_get_heap_no(owner_rec)))
+      .field("inserted_record_heap_no",
+             static_cast<std::uint64_t>(page_rec_get_heap_no(insert_rec)))
+      .field("old_n_owned", static_cast<std::uint64_t>(old_n_owned))
+      .field("new_n_owned", static_cast<std::uint64_t>(new_n_owned))
+      .field("slot_split", split_directory_slot)
+      .field("note",
+             "Page Directory 是页内稀疏目录；插入 record 后需要维护 owner record 的 n_owned，必要时拆分目录 slot")
+      .emit();
+}
+
+void wzg_emit_page_directory_search(const buf_block_t *block,
+                                    const dict_index_t *index,
+                                    page_cur_mode_t mode, ulint slot_count,
+                                    ulint low_slot, ulint up_slot,
+                                    const rec_t *low_rec,
+                                    const rec_t *up_rec,
+                                    const rec_t *cursor_rec,
+                                    ulint binary_steps,
+                                    ulint linear_steps,
+                                    ulint up_matched_fields,
+                                    ulint low_matched_fields) {
+  if (!wzg_page_search_should_log(index) || block == nullptr) return;
+
+  const page_t *page = buf_block_get_frame(block);
+  WZG_PROBE_EVENT(current_thd, "innodb.page_directory_search")
+      .message("在 InnoDB page 内先二分页目录，再沿记录链表扫描少量记录定位 cursor")
+      .field("table", wzg_page_table_name(index->table))
+      .field("index", wzg_page_index_name(index))
+      .field("page_no", static_cast<std::uint64_t>(page_get_page_no(page)))
+      .field("page_level", static_cast<std::uint64_t>(btr_page_get_level(page)))
+      .field("page_type", page_is_leaf(page) ? "leaf" : "internal")
+      .field("page_search_mode", wzg_page_mode_text(mode))
+      .field("directory_slot_count", static_cast<std::uint64_t>(slot_count))
+      .field("binary_search_steps", static_cast<std::uint64_t>(binary_steps))
+      .field("linear_scan_steps", static_cast<std::uint64_t>(linear_steps))
+      .field("low_slot_after_binary_search",
+             static_cast<std::uint64_t>(low_slot))
+      .field("up_slot_after_binary_search",
+             static_cast<std::uint64_t>(up_slot))
+      .field("low_record_heap_no",
+             low_rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(low_rec)))
+      .field("up_record_heap_no",
+             up_rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(up_rec)))
+      .field("cursor_record_heap_no",
+             cursor_rec == nullptr ? 0 : static_cast<std::uint64_t>(page_rec_get_heap_no(cursor_rec)))
+      .field("up_match_fields", static_cast<std::uint64_t>(up_matched_fields))
+      .field("low_match_fields", static_cast<std::uint64_t>(low_matched_fields))
+      .field("step_1",
+             "先在 Page Directory 的 slot 数组上做二分；slot 是页内稀疏目录，不是每条记录一个 slot")
+      .field("step_2",
+             "二分后得到 low/up 两个 slot，说明 search key 应该落在这两个目录项之间")
+      .field("step_3",
+             "再从 low record 开始沿 record next pointer 顺序扫描少量记录，直到到达 up record 附近或满足 cursor 模式")
+      .field("page_internal_algorithm",
+             "InnoDB page 内记录不是数组，而是 next pointer 链表；Page Directory 是页内稀疏目录。先对 slot 做二分，找到 key 所在区间，再从 low slot 指向的记录开始顺链表扫描到 up record 附近")
+      .field("match_standard",
+             "等值查找最终要求完整 key 相等；如果扫描到更大的 key 或 supremum 仍未相等，则精确匹配不存在。范围查找则把 cursor 定位到第一个满足边界的位置")
+      .emit();
+}
+
+}  // namespace
 #endif /* !UNIV_HOTBACKUP */
 
 #ifdef PAGE_CUR_ADAPT
@@ -344,6 +521,8 @@ void page_cur_search_with_match(const buf_block_t *block,
   ulint up_matched_fields;
   ulint low_matched_fields;
   ulint cur_matched_fields;
+  ulint binary_steps = 0;
+  ulint linear_steps = 0;
   int cmp = 0;
 #ifdef UNIV_ZIP_DEBUG
   const page_zip_des_t *page_zip = buf_block_get_page_zip(block);
@@ -486,6 +665,7 @@ void page_cur_search_with_match(const buf_block_t *block,
   slots come to the distance 1 of each other */
 
   while (up - low > 1) {
+    binary_steps++;
     mid = (low + up) / 2;
     slot = page_dir_get_nth_slot(page, mid);
     mid_rec = page_dir_slot_get_rec(slot);
@@ -533,6 +713,7 @@ void page_cur_search_with_match(const buf_block_t *block,
   distance 1 of each other. */
 
   while (page_rec_get_next_const(low_rec) != up_rec) {
+    linear_steps++;
     mid_rec = page_rec_get_next_const(low_rec);
 
     cur_matched_fields = std::min(low_matched_fields, up_matched_fields);
@@ -589,6 +770,12 @@ void page_cur_search_with_match(const buf_block_t *block,
   } else {
     page_cur_position(low_rec, block, cursor);
   }
+
+  wzg_emit_page_directory_search(block, index, mode,
+                                 page_dir_get_n_slots(page), low, up, low_rec,
+                                 up_rec, page_cur_get_rec(cursor),
+                                 binary_steps, linear_steps,
+                                 up_matched_fields, low_matched_fields);
 
   *iup_matched_fields = up_matched_fields;
   *ilow_matched_fields = low_matched_fields;
@@ -1276,6 +1463,7 @@ rec_t *page_cur_insert_rec_low(
   /* 2. Try to find suitable space from page memory management */
 
   free_rec = page_header_get_ptr(page, PAGE_FREE);
+  bool reused_free_record = false;
   if (UNIV_LIKELY_NULL(free_rec)) {
     /* Try to allocate from the head of the free list. */
     ulint foffsets_[REC_OFFS_NORMAL_SIZE];
@@ -1301,10 +1489,12 @@ rec_t *page_cur_insert_rec_low(
       heap_no = rec_get_heap_no_new(free_rec);
       page_mem_alloc_free(page, nullptr, rec_get_next_ptr(free_rec, true),
                           rec_size);
+      reused_free_record = true;
     } else {
       heap_no = rec_get_heap_no_old(free_rec);
       page_mem_alloc_free(page, nullptr, rec_get_next_ptr(free_rec, false),
                           rec_size);
+      reused_free_record = true;
     }
 
     if (UNIV_LIKELY_NULL(heap)) {
@@ -1386,16 +1576,23 @@ rec_t *page_cur_insert_rec_low(
 
   page_header_set_ptr(page, nullptr, PAGE_LAST_INSERT, insert_rec);
 
+  wzg_emit_page_record_insert(page, index, current_rec, insert_rec, rec_size,
+                              reused_free_record, mtr);
+
   /* 7. It remains to update the owner record. */
   {
     rec_t *owner_rec = page_rec_find_owner_rec(insert_rec);
     ulint n_owned;
+    ulint new_n_owned;
+    bool split_directory_slot = false;
     if (page_is_comp(page)) {
       n_owned = rec_get_n_owned_new(owner_rec);
-      rec_set_n_owned_new(owner_rec, nullptr, n_owned + 1);
+      new_n_owned = n_owned + 1;
+      rec_set_n_owned_new(owner_rec, nullptr, new_n_owned);
     } else {
       n_owned = rec_get_n_owned_old(owner_rec);
-      rec_set_n_owned_old(owner_rec, n_owned + 1);
+      new_n_owned = n_owned + 1;
+      rec_set_n_owned_old(owner_rec, new_n_owned);
     }
 
     /* 8. Now we have incremented the n_owned field of the owner
@@ -1404,7 +1601,17 @@ rec_t *page_cur_insert_rec_low(
 
     if (UNIV_UNLIKELY(n_owned == PAGE_DIR_SLOT_MAX_N_OWNED)) {
       page_dir_split_slot(page, nullptr, page_dir_find_owner_slot(owner_rec));
+      split_directory_slot = true;
     }
+
+    if (page_is_comp(page)) {
+      new_n_owned = rec_get_n_owned_new(owner_rec);
+    } else {
+      new_n_owned = rec_get_n_owned_old(owner_rec);
+    }
+
+    wzg_emit_page_directory_update(page, index, owner_rec, insert_rec, n_owned,
+                                   new_n_owned, split_directory_slot);
   }
 
   /* 9. Write log record of the insert */
@@ -1653,6 +1860,7 @@ rec_t *page_cur_insert_rec_zip(
       rec_size <= page_get_max_insert_size_after_reorganize(page, 1);
 
   /* 2. Try to find suitable space from page memory management */
+  bool reused_free_record = false;
   if (!page_zip_available(page_zip, index->is_clustered(), rec_size, 1) ||
       reorg_before_insert) {
     /* The values can change dynamically. */
@@ -1837,6 +2045,7 @@ rec_t *page_cur_insert_rec_zip(
     heap_no = rec_get_heap_no_new(free_rec);
     page_mem_alloc_free(page, page_zip, rec_get_next_ptr(free_rec, true),
                         rec_size);
+    reused_free_record = true;
 
     if (!page_is_leaf(page)) {
       /* Zero out the node pointer of free_rec,
@@ -1957,13 +2166,19 @@ rec_t *page_cur_insert_rec_zip(
 
   page_header_set_ptr(page, page_zip, PAGE_LAST_INSERT, insert_rec);
 
+  wzg_emit_page_record_insert(page, index, cursor->rec, insert_rec, rec_size,
+                              reused_free_record, mtr);
+
   /* 7. It remains to update the owner record. */
   {
     rec_t *owner_rec = page_rec_find_owner_rec(insert_rec);
     ulint n_owned;
+    ulint new_n_owned;
+    bool split_directory_slot = false;
 
     n_owned = rec_get_n_owned_new(owner_rec);
-    rec_set_n_owned_new(owner_rec, page_zip, n_owned + 1);
+    new_n_owned = n_owned + 1;
+    rec_set_n_owned_new(owner_rec, page_zip, new_n_owned);
 
     /* 8. Now we have incremented the n_owned field of the owner
     record. If the number exceeds PAGE_DIR_SLOT_MAX_N_OWNED,
@@ -1971,7 +2186,12 @@ rec_t *page_cur_insert_rec_zip(
 
     if (UNIV_UNLIKELY(n_owned == PAGE_DIR_SLOT_MAX_N_OWNED)) {
       page_dir_split_slot(page, page_zip, page_dir_find_owner_slot(owner_rec));
+      split_directory_slot = true;
     }
+
+    new_n_owned = rec_get_n_owned_new(owner_rec);
+    wzg_emit_page_directory_update(page, index, owner_rec, insert_rec, n_owned,
+                                   new_n_owned, split_directory_slot);
   }
 
   page_zip_write_rec(page_zip, insert_rec, index, offsets, 1);

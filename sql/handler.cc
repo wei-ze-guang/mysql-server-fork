@@ -566,6 +566,68 @@ void wzg_emit_handler_index_read_finish(TABLE *table, const char *api,
       .emit();
 }
 
+const char *wzg_handler_cursor_fetch_direction(const char *api) {
+  const std::string_view name(api == nullptr ? "" : api);
+  if (name == "ha_index_prev") return "backward";
+  return "forward";
+}
+
+const char *wzg_handler_cursor_fetch_reason(const char *api) {
+  const std::string_view name(api == nullptr ? "" : api);
+  if (name == "ha_index_next_same") {
+    return "SQL 层已经用 index_read 定位到等值 key，现在要求继续读取同一个 key 的下一条记录";
+  }
+  if (name == "ha_index_prev") {
+    return "SQL 层已经定位好索引游标，现在要求按索引反向继续读取上一条记录";
+  }
+  return "SQL 层已经定位好索引游标，现在要求按索引正向继续读取下一条记录";
+}
+
+void wzg_emit_handler_cursor_fetch_start(TABLE *table, const char *api,
+                                         const uchar *key, uint keylen) {
+  if (!wzg_handler_should_log(table)) return;
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "handler.cursor_fetch_start")
+      .message("SQL 层要求沿已定位索引游标继续读下一条")
+      .field("handler_api", api)
+      .field("table", wzg_handler_table_name(table))
+      .field("index", wzg_handler_index_name(table, table->file->active_index))
+      .field("direction", wzg_handler_cursor_fetch_direction(api))
+      .field("reason", wzg_handler_cursor_fetch_reason(api))
+      .field("key_buffer",
+             key == nullptr
+                 ? "这次继续游标读取不额外传入 key"
+                 : "二进制 key 缓冲区，用来要求继续读取相同 key 的记录")
+      .field("key_length_bytes", std::to_string(keylen))
+      .field("record_buffer",
+             "buf 参数，通常是 table->record[0]；成功时存储引擎会把下一行写入这里")
+      .field("return_type", "int 状态码")
+      .field("next_step",
+             "调用具体存储引擎的 index_next/index_prev/index_next_same 实现")
+      .emit();
+}
+
+void wzg_emit_handler_cursor_fetch_finish(TABLE *table, const char *api,
+                                          int result) {
+  if (!wzg_handler_should_log(table)) return;
+  THD *thd = current_thd;
+  WZG_PROBE_EVENT(thd, "handler.cursor_fetch_finish")
+      .message(result == 0 ? "存储引擎游标继续读取已返回，并取到一条记录"
+                           : "存储引擎游标继续读取已返回，但没有更多行或返回了错误")
+      .field("handler_api", api)
+      .field("table", wzg_handler_table_name(table))
+      .field("index", wzg_handler_index_name(table, table->file->active_index))
+      .field("direction", wzg_handler_cursor_fetch_direction(api))
+      .field("return_code", wzg_handler_return_code_text(result))
+      .field("return_meaning", wzg_handler_return_meaning(result))
+      .field("record_buffer", "buf 参数 / table->record[0]")
+      .field("record_buffer_status",
+             result == 0 ? "已填充游标继续读取到的当前行"
+                         : "没有新的有效行可供 SQL 层读取")
+      .field("next_step", wzg_handler_next_step(result))
+      .emit();
+}
+
 void wzg_emit_handler_range_read_start(TABLE *table, const char *api,
                                        const key_range *start_key,
                                        const key_range *end_key, bool eq_range,
@@ -3804,6 +3866,7 @@ int handler::ha_index_next(uchar *buf) {
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
 
+  wzg_emit_handler_cursor_fetch_start(table, "ha_index_next", nullptr, 0);
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_FETCH_ROW, active_index, result,
                       { result = index_next(buf); })
   if (!result && m_update_generated_read_fields) {
@@ -3819,6 +3882,7 @@ int handler::ha_index_next(uchar *buf) {
     result = HA_ERR_KEY_NOT_FOUND;
 
   table->set_row_status_from_handler(result);
+  wzg_emit_handler_cursor_fetch_finish(table, "ha_index_next", result);
   return result;
 }
 
@@ -3849,6 +3913,7 @@ int handler::ha_index_prev(uchar *buf) {
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
 
+  wzg_emit_handler_cursor_fetch_start(table, "ha_index_prev", nullptr, 0);
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_FETCH_ROW, active_index, result,
                       { result = index_prev(buf); })
   if (!result && m_update_generated_read_fields) {
@@ -3861,6 +3926,7 @@ int handler::ha_index_prev(uchar *buf) {
     result = HA_ERR_KEY_NOT_FOUND;
 
   table->set_row_status_from_handler(result);
+  wzg_emit_handler_cursor_fetch_finish(table, "ha_index_prev", result);
   return result;
 }
 
@@ -3958,6 +4024,8 @@ int handler::ha_index_next_same(uchar *buf, const uchar *key, uint keylen) {
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
+  wzg_emit_handler_cursor_fetch_start(table, "ha_index_next_same", key,
+                                      keylen);
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_FETCH_ROW, active_index, result,
                       { result = index_next_same(buf, key, keylen); })
   if (!result && m_update_generated_read_fields) {
@@ -3975,6 +4043,7 @@ int handler::ha_index_next_same(uchar *buf, const uchar *key, uint keylen) {
   }
 
   table->set_row_status_from_handler(result);
+  wzg_emit_handler_cursor_fetch_finish(table, "ha_index_next_same", result);
   return result;
 }
 

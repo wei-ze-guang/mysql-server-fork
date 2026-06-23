@@ -94,6 +94,11 @@ class Event::Impl {
 
   void emit() {
     if (m_emitted) return;
+    if (current_context().suppress_current_sql() &&
+        !m_event.raw_sql.empty()) {
+      m_emitted = true;
+      return;
+    }
     if (m_event.event_phase == "end") {
       const std::uint64_t end_ns = now_ns();
       m_event.duration_ns = end_ns >= m_start_ns ? end_ns - m_start_ns : 0;

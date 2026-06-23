@@ -40,18 +40,23 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "log0meb.h"
 #ifndef UNIV_HOTBACKUP
 #include "clone0clone.h"
+#include "current_thd.h"
 #include "log0buf.h"
 #include "log0chkp.h"
 #include "log0recv.h"
 #include "log0test.h"
 #include "log0write.h"
 #include "mtr0log.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #endif /* !UNIV_HOTBACKUP */
 #include "my_dbug.h"
 #ifndef UNIV_HOTBACKUP
 #include "page0types.h"
 #include "trx0purge.h"
 #endif /* !UNIV_HOTBACKUP */
+
+#include <cstdint>
 
 static_assert(static_cast<int>(MTR_MEMO_PAGE_S_FIX) ==
                   static_cast<int>(RW_S_LATCH),
@@ -64,6 +69,62 @@ static_assert(static_cast<int>(MTR_MEMO_PAGE_X_FIX) ==
 static_assert(static_cast<int>(MTR_MEMO_PAGE_SX_FIX) ==
                   static_cast<int>(RW_SX_LATCH),
               "");
+
+#ifndef UNIV_HOTBACKUP
+namespace {
+
+bool wzg_mtr_should_log_sql_context() {
+  return current_thd != nullptr && !wzg_probe::raw_sql().empty();
+}
+
+bool wzg_mtr_allow_commit_event() {
+  static thread_local std::uint64_t last_query_id = 0;
+  static thread_local std::uint64_t count_for_query = 0;
+
+  const auto query_id = static_cast<std::uint64_t>(current_thd->query_id);
+  if (query_id != last_query_id) {
+    last_query_id = query_id;
+    count_for_query = 0;
+  }
+
+  return count_for_query++ < 3;
+}
+
+const char *wzg_mtr_log_mode_name(mtr_log_t mode) {
+  switch (mode) {
+    case MTR_LOG_ALL:
+      return "MTR_LOG_ALL";
+    case MTR_LOG_NONE:
+      return "MTR_LOG_NONE";
+    case MTR_LOG_NO_REDO:
+      return "MTR_LOG_NO_REDO";
+    case MTR_LOG_SHORT_INSERTS:
+      return "MTR_LOG_SHORT_INSERTS";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void wzg_emit_redo_mtr_commit(mtr_t *mtr, bool has_log_record,
+                              bool has_modification, mtr_log_t log_mode) {
+  if (!wzg_mtr_should_log_sql_context() || !wzg_mtr_allow_commit_event()) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.redo.mtr_commit")
+      .message(has_log_record ? "Mini-transaction 提交，并把 redo 记录交给日志系统"
+                              : "Mini-transaction 提交了无 redo 的页修改")
+      .field("has_log_record", has_log_record)
+      .field("has_modification", has_modification)
+      .field("log_mode", wzg_mtr_log_mode_name(log_mode))
+      .field("redo_buffer_bytes",
+             static_cast<std::uint64_t>(mtr->get_log()->size()))
+      .field("sample_policy", "每条 SQL 最多记录 3 个 mtr commit")
+      .emit();
+}
+
+}  // namespace
+#endif /* !UNIV_HOTBACKUP */
 
 /** Iterate over a memo block in reverse. */
 template <typename Functor>
@@ -666,8 +727,18 @@ void mtr_t::commit() {
 
   Command cmd(this);
 
-  if (has_any_log_record() ||
-      (has_modifications() && m_impl.m_log_mode == MTR_LOG_NO_REDO)) {
+  const bool has_log_record = has_any_log_record();
+  const bool has_modification = has_modifications();
+  const mtr_log_t log_mode = m_impl.m_log_mode;
+
+#ifndef UNIV_HOTBACKUP
+  if (has_log_record ||
+      (has_modification && log_mode == MTR_LOG_NO_REDO)) {
+    wzg_emit_redo_mtr_commit(this, has_log_record, has_modification, log_mode);
+  }
+#endif /* !UNIV_HOTBACKUP */
+
+  if (has_log_record || (has_modification && log_mode == MTR_LOG_NO_REDO)) {
     ut_ad(!srv_read_only_mode || m_impl.m_log_mode == MTR_LOG_NO_REDO);
 
     cmd.execute();

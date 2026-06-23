@@ -66,6 +66,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <stdarg.h>
 #include <sys/types.h>
 #include <time.h>
+#include <cstdint>
 #include <map>
 #include <new>
 #include <sstream>
@@ -74,10 +75,13 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "buf0checksum.h"
 #include "buf0dump.h"
+#include "current_thd.h"
 #include "dict0dict.h"
 #include "log0recv.h"
 #include "os0thread-create.h"
 #include "page0zip.h"
+#include "sql/sql_class.h"
+#include "sql/wzg_probe/wzg_probe.h"
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
@@ -91,6 +95,50 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #ifdef UNIV_DEBUG
 #include "ut0stateful_latching_rules.h"
 #endif /* UNIV_DEBUG */
+
+#ifndef UNIV_HOTBACKUP
+namespace {
+
+bool wzg_buf_should_log_sql_context() {
+  return current_thd != nullptr && !wzg_probe::raw_sql().empty();
+}
+
+bool wzg_buf_allow_page_miss_event() {
+  static thread_local std::uint64_t last_query_id = 0;
+  static thread_local std::uint64_t count_for_query = 0;
+
+  const auto query_id = static_cast<std::uint64_t>(current_thd->query_id);
+  if (query_id != last_query_id) {
+    last_query_id = query_id;
+    count_for_query = 0;
+  }
+
+  return count_for_query++ < 8;
+}
+
+void wzg_emit_buffer_pool_page_miss(const page_id_t &page_id,
+                                    const page_size_t &page_size,
+                                    Page_fetch mode, ulint rw_latch) {
+  if (!wzg_buf_should_log_sql_context() ||
+      !wzg_buf_allow_page_miss_event()) {
+    return;
+  }
+
+  WZG_PROBE_EVENT(current_thd, "innodb.buffer_pool.page_miss")
+      .message("Buffer Pool 里没有找到这个 page，需要从表空间文件读取")
+      .field("space_id", static_cast<std::uint64_t>(page_id.space()))
+      .field("page_no", static_cast<std::uint64_t>(page_id.page_no()))
+      .field("page_size_bytes",
+             static_cast<std::uint64_t>(page_size.physical()))
+      .field("fetch_mode", static_cast<std::uint64_t>(mode))
+      .field("rw_latch", static_cast<std::uint64_t>(rw_latch))
+      .field("sample_policy", "每条 SQL 最多记录 8 个 page miss")
+      .field("next_step", "准备分配 buffer frame，并发起真实磁盘读")
+      .emit();
+}
+
+}  // namespace
+#endif /* !UNIV_HOTBACKUP */
 
 #ifdef HAVE_LIBNUMA
 #include <numa.h>
@@ -4112,6 +4160,8 @@ dberr_t Buf_fetch<T>::check_state(buf_block_t *&block) {
 
 template <typename T>
 void Buf_fetch<T>::read_page() {
+  wzg_emit_buffer_pool_page_miss(m_page_id, m_page_size, m_mode, m_rw_latch);
+
   if (buf_read_page(m_page_id, m_page_size)) {
     /* Avoid doing read-ahead for parallel scans (well, at least currently this
     flag is used only during the parallel scans). This would cause unnecessary
