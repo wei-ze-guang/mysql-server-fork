@@ -1,0 +1,255 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="MySQL Architecture" id="ZKKSpacDdxtZnKi9YWbu">
+    <mxGraphModel dx="2844" dy="1371" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1800" pageHeight="1600" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=24;fontStyle=1;fontColor=#111827;" value="MySQL Architecture / Component Map&#xa;MySQL 架构图：Client - Server - Handler - Storage Engine - OS/Disk" vertex="1">
+          <mxGeometry height="60" width="1640" x="40" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f9fafb;strokeColor=#6b7280;fontSize=14;fontColor=#374151;" value="实线：请求/返回主链路    虚线：日志/刷盘/后台路径    粗边界：Server 层和存储引擎层的分界" vertex="1">
+          <mxGeometry height="44" width="1460" x="170" y="90" as="geometry" />
+        </mxCell>
+        <mxCell id="10" parent="1" style="swimlane;startSize=32;whiteSpace=wrap;html=1;fillColor=#eaf4ff;strokeColor=#2563eb;fontStyle=1;fontSize=15;" value="Client Layer / 客户端层" vertex="1">
+          <mxGeometry height="130" width="1680" x="60" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="11" parent="10" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#2563eb;fontStyle=1;" value="Application&#xa;业务程序" vertex="1">
+          <mxGeometry height="55" width="180" x="100" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="12" parent="10" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#2563eb;fontStyle=1;" value="MySQL Client / Driver&#xa;mysql CLI / JDBC / Go / Python" vertex="1">
+          <mxGeometry height="55" width="230" x="360" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="13" parent="10" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#2563eb;fontStyle=1;" value="MySQL Protocol&#xa;握手、认证、SQL 包、结果集包" vertex="1">
+          <mxGeometry height="55" width="260" x="700" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="14" parent="10" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#2563eb;" value="Network&#xa;TCP / Unix Socket" vertex="1">
+          <mxGeometry height="55" width="190" x="1080" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="20" parent="1" style="swimlane;startSize=32;whiteSpace=wrap;html=1;fillColor=#fff7df;strokeColor=#d97706;fontStyle=1;fontSize=15;" value="MySQL Server Layer / Server 层：连接、SQL 解析优化执行、权限、binlog、事务协调" vertex="1">
+          <mxGeometry height="470" width="1680" x="60" y="330" as="geometry" />
+        </mxCell>
+        <mxCell id="21" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;fontStyle=1;" value="Connection Manager&#xa;线程/连接/会话 THD" vertex="1">
+          <mxGeometry height="60" width="180" x="45" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="22" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Authentication&#xa;账号、密码、插件认证" vertex="1">
+          <mxGeometry height="60" width="180" x="255" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="23" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Privilege / ACL&#xa;库表列权限检查" vertex="1">
+          <mxGeometry height="60" width="180" x="465" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="24" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;fontStyle=1;" value="Parser&#xa;词法、语法、AST" vertex="1">
+          <mxGeometry height="60" width="160" x="695" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="25" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;fontStyle=1;" value="Resolver&#xa;库/表/列/函数绑定" vertex="1">
+          <mxGeometry height="60" width="170" x="885" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="26" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d97706;fontStyle=1;" value="Optimizer&#xa;成本估算、索引选择、join 顺序" vertex="1">
+          <mxGeometry height="60" width="220" x="1085" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="27" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d97706;fontStyle=1;" value="Executor&#xa;Iterator tree 驱动执行" vertex="1">
+          <mxGeometry height="60" width="200" x="1340" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="30" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="SQL Command Dispatch&#xa;SELECT / INSERT / UPDATE / DELETE / DDL / SHOW" vertex="1">
+          <mxGeometry height="62" width="220" x="45" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="31" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Metadata Lock / MDL&#xa;Server 层元数据锁" vertex="1">
+          <mxGeometry height="62" width="190" x="300" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="32" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Table Cache / DD Cache&#xa;表定义、数据字典对象" vertex="1">
+          <mxGeometry height="62" width="200" x="525" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="33" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Query Block / Plan&#xa;查询块、访问路径、执行计划" vertex="1">
+          <mxGeometry height="62" width="210" x="760" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="34" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Temp Table / Sort / Group&#xa;临时表、排序、分组、去重" vertex="1">
+          <mxGeometry height="62" width="220" x="1005" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="35" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Result Sender&#xa;把结果集按协议发回客户端" vertex="1">
+          <mxGeometry height="62" width="220" x="1260" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="40" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontStyle=1;" value="Server Transaction Coordinator&#xa;事务入口、提交/回滚分发、XA / 2PC 协调" vertex="1">
+          <mxGeometry height="72" width="280" x="130" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="41" parent="20" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontStyle=1;" value="Binary Log / Binlog&#xa;Server 层逻辑日志，用于复制和恢复到时间点" vertex="1">
+          <mxGeometry height="84" width="230" x="470" y="278" as="geometry" />
+        </mxCell>
+        <mxCell id="42" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Replication&#xa;Source binlog dump / Replica applier" vertex="1">
+          <mxGeometry height="72" width="230" x="760" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="43" parent="20" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d97706;" value="Performance Schema / Slow Log / General Log&#xa;观测与诊断" vertex="1">
+          <mxGeometry height="72" width="300" x="1050" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="50" parent="1" style="swimlane;startSize=32;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#ea580c;fontStyle=1;fontSize=15;" value="Handler API Boundary / 存储引擎接口层：Server 不直接操作页和 B+Tree，而是调用 handler 契约" vertex="1">
+          <mxGeometry height="165" width="1680" x="60" y="840" as="geometry" />
+        </mxCell>
+        <mxCell id="51" parent="50" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;fontStyle=1;" value="handler::index_read / index_next&#xa;索引定位和继续扫描" vertex="1">
+          <mxGeometry height="62" width="240" x="90" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="52" parent="50" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;" value="handler::rnd_next&#xa;全表扫描读下一行" vertex="1">
+          <mxGeometry height="62" width="210" x="370" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="53" parent="50" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;fontStyle=1;" value="handler::write_row / update_row / delete_row&#xa;增删改入口" vertex="1">
+          <mxGeometry height="62" width="300" x="620" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="54" parent="50" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;" value="Key Buffer / Record Buffer&#xa;Server 和引擎传递 key 与 row 的内存缓冲" vertex="1">
+          <mxGeometry height="62" width="280" x="960" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="55" parent="50" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;" value="Engine Return Code&#xa;成功、EOF、重复键、锁等待、死锁" vertex="1">
+          <mxGeometry height="62" width="270" x="1280" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="60" parent="1" style="swimlane;startSize=32;whiteSpace=wrap;html=1;fillColor=#f4ecfb;strokeColor=#7e22ce;fontStyle=1;fontSize=15;" value="Storage Engine Layer / 存储引擎层" vertex="1">
+          <mxGeometry height="365" width="1680" x="60" y="1045" as="geometry" />
+        </mxCell>
+        <mxCell id="61" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#7e22ce;fontStyle=1;" value="InnoDB Engine&#xa;默认事务型存储引擎" vertex="1">
+          <mxGeometry height="65" width="220" x="50" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="62" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;" value="MyISAM Engine&#xa;非事务，表锁，历史引擎" vertex="1">
+          <mxGeometry height="58" width="220" x="50" y="155" as="geometry" />
+        </mxCell>
+        <mxCell id="63" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;" value="MEMORY / TempTable Engine&#xa;内存表、内部临时表" vertex="1">
+          <mxGeometry height="58" width="220" x="50" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="70" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;fontStyle=1;" value="InnoDB SQL Handler&#xa;接收 handler 调用，转换成 InnoDB 内部操作" vertex="1">
+          <mxGeometry height="65" width="260" x="340" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="71" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;fontStyle=1;" value="Row Layer&#xa;row_search_mvcc / row_insert / row_update" vertex="1">
+          <mxGeometry height="65" width="250" x="650" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="72" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;fontStyle=1;" value="B+Tree Index Layer&#xa;聚簇索引、二级索引、范围扫描、回表" vertex="1">
+          <mxGeometry height="65" width="280" x="950" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="73" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;fontStyle=1;" value="Page Layer&#xa;16KB page、page directory、record chain" vertex="1">
+          <mxGeometry height="65" width="280" x="1280" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="80" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;" value="Transaction System&#xa;trx id、提交、回滚、隔离级别" vertex="1">
+          <mxGeometry height="58" width="240" x="340" y="155" as="geometry" />
+        </mxCell>
+        <mxCell id="81" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;" value="MVCC / ReadView&#xa;可见性判断、版本链" vertex="1">
+          <mxGeometry height="58" width="230" x="620" y="155" as="geometry" />
+        </mxCell>
+        <mxCell id="82" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontStyle=1;" value="Lock System&#xa;意向锁、记录锁、间隙锁、next-key、死锁检测" vertex="1">
+          <mxGeometry height="58" width="310" x="890" y="155" as="geometry" />
+        </mxCell>
+        <mxCell id="83" parent="60" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;" value="Undo Log&#xa;回滚、旧版本、MVCC 版本链" vertex="1">
+          <mxGeometry height="78" width="160" x="1240" y="145" as="geometry" />
+        </mxCell>
+        <mxCell id="84" parent="60" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7e22ce;" value="Redo Log&#xa;崩溃恢复，记录页级物理修改" vertex="1">
+          <mxGeometry height="78" width="160" x="1430" y="145" as="geometry" />
+        </mxCell>
+        <mxCell id="90" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;fontStyle=1;" value="Buffer Pool&#xa;缓存数据页/索引页" vertex="1">
+          <mxGeometry height="58" width="190" x="340" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="91" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;" value="Change Buffer&#xa;缓存二级索引变更" vertex="1">
+          <mxGeometry height="58" width="190" x="570" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="92" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;" value="Adaptive Hash Index&#xa;热点索引页加速查找" vertex="1">
+          <mxGeometry height="58" width="210" x="800" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="93" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;" value="Doublewrite Buffer&#xa;防止部分页写坏" vertex="1">
+          <mxGeometry height="58" width="200" x="1050" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="94" parent="60" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;" value="Background Threads&#xa;page cleaner / purge / IO threads" vertex="1">
+          <mxGeometry height="58" width="240" x="1290" y="250" as="geometry" />
+        </mxCell>
+        <mxCell id="100" parent="1" style="swimlane;startSize=32;whiteSpace=wrap;html=1;fillColor=#f3f4f6;strokeColor=#4b5563;fontStyle=1;fontSize=15;" value="OS / File System / Disk Layer / 操作系统和磁盘层" vertex="1">
+          <mxGeometry height="125" width="1680" x="60" y="1450" as="geometry" />
+        </mxCell>
+        <mxCell id="101" parent="100" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4b5563;" value="File System&#xa;open / read / write / fsync" vertex="1">
+          <mxGeometry height="52" width="210" x="80" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="102" parent="100" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4b5563;" value="OS Page Cache&#xa;操作系统页缓存" vertex="1">
+          <mxGeometry height="52" width="190" x="340" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="103" parent="100" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4b5563;" value=".ibd Tablespace&#xa;表空间文件，存数据页/索引页" vertex="1">
+          <mxGeometry height="70" width="190" x="590" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="104" parent="100" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4b5563;" value="Redo Log Files&#xa;#innodb_redo" vertex="1">
+          <mxGeometry height="70" width="170" x="850" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="105" parent="100" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4b5563;" value="Undo Tablespaces&#xa;undo_001 / undo_002" vertex="1">
+          <mxGeometry height="70" width="180" x="1090" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="106" parent="100" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4b5563;" value="Binlog Files&#xa;mysql-bin.000001" vertex="1">
+          <mxGeometry height="70" width="170" x="1340" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="200" edge="1" parent="1" source="11" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="12" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="201" edge="1" parent="1" source="12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="13" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="202" edge="1" parent="1" source="13" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="14" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="203" edge="1" parent="1" source="14" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="21" value="request">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="204" edge="1" parent="1" source="21" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="22" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="205" edge="1" parent="1" source="22" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="23" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="206" edge="1" parent="1" source="23" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="24" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="207" edge="1" parent="1" source="24" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="25" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="208" edge="1" parent="1" source="25" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="26" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="209" edge="1" parent="1" source="26" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="27" value="plan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="210" edge="1" parent="1" source="27" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="51" value="handler call">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="211" edge="1" parent="1" source="51" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="70" value="engine implementation">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="212" edge="1" parent="1" source="70" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="71" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="213" edge="1" parent="1" source="71" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="72" value="index search">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="214" edge="1" parent="1" source="72" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="73" value="page read/write">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="215" edge="1" parent="1" source="73" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#16a34a;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="90" value="cache page">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="216" edge="1" parent="1" source="90" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="101" value="file IO">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="217" edge="1" parent="1" source="101" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="103" value=".ibd pages">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="218" edge="1" parent="1" source="41" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#d97706;dashed=1;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="106" value="binlog write">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="219" edge="1" parent="1" source="84" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7e22ce;dashed=1;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="104" value="redo write">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="220" edge="1" parent="1" source="83" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7e22ce;dashed=1;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="105" value="undo records">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="221" edge="1" parent="1" source="40" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#d97706;dashed=1;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="41" value="2PC coordinate">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="222" edge="1" parent="1" source="40" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7e22ce;dashed=1;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="80" value="commit/rollback">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="223" edge="1" parent="1" source="35" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#111827;endArrow=block;dashed=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" target="13" value="result rows">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1500" y="270" />
+              <mxPoint x="1500" y="220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
