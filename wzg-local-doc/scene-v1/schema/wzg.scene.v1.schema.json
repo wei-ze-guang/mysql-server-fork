@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wzg.scene.v1",
+  "title": "wzg.scene.v1 Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "event_id",
+    "trace_id",
+    "span_id",
+    "parent_event_id",
+    "caused_by_event_id",
+    "tick",
+    "ts_ns",
+    "layer",
+    "namespace",
+    "event_name",
+    "phase",
+    "actor",
+    "action",
+    "object",
+    "result",
+    "meaning",
+    "runtime_values",
+    "source",
+    "effects"
+  ],
+  "properties": {
+    "schema": {"const": "wzg.scene.v1"},
+    "event_id": {"type": "integer", "minimum": 1},
+    "trace_id": {"type": "string", "minLength": 1},
+    "span_id": {"type": "string", "minLength": 1},
+    "parent_event_id": {"type": ["integer", "null"]},
+    "caused_by_event_id": {"type": ["integer", "null"]},
+    "tick": {"type": "integer", "minimum": 0},
+    "ts_ns": {"type": "integer", "minimum": 0},
+    "layer": {"type": "string", "minLength": 1},
+    "namespace": {"type": "string", "minLength": 1},
+    "event_name": {"type": "string", "minLength": 1},
+    "phase": {
+      "type": "string",
+      "enum": ["begin", "step", "instant", "end", "error"]
+    },
+    "actor": {"type": "object"},
+    "action": {"type": "string", "minLength": 1},
+    "object": {"type": "object"},
+    "result": {"type": "object"},
+    "meaning": {"type": "string"},
+    "runtime_values": {"type": "object"},
+    "source": {
+      "type": "object",
+      "required": ["source_namespace", "source_file", "source_line", "source_function"],
+      "properties": {
+        "source_namespace": {"type": "string"},
+        "source_file": {"type": "string"},
+        "source_line": {"type": ["integer", "null"]},
+        "source_function": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "effects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["op"],
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "create_entity",
+              "set_component",
+              "add_edge",
+              "append_timeline_marker",
+              "focus_entity",
+              "mark_decision",
+              "mark_wait",
+              "mark_error"
+            ]
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

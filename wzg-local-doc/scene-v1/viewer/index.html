@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wzg.scene.v1 MVP Viewer</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #64748b;
+      --line: #d8dee9;
+      --blue: #2563eb;
+      --orange: #d97706;
+      --purple: #7e22ce;
+      --green: #16a34a;
+      --red: #dc2626;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    .summary {
+      color: var(--muted);
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .intro {
+      margin: 12px;
+      padding: 10px 12px;
+      border: 1px solid #c7d2fe;
+      border-radius: 8px;
+      background: #eef2ff;
+      color: #1e293b;
+    }
+
+    .intro strong {
+      color: #312e81;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: 370px minmax(520px, 1fr) 440px;
+      gap: 12px;
+      padding: 12px;
+      min-height: calc(100vh - 58px);
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    section h2 {
+      margin: 0;
+      padding: 10px 12px;
+      font-size: 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfdff;
+    }
+
+    .section-note {
+      margin: 0;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      background: #fff;
+    }
+
+    .scroll {
+      overflow: auto;
+      padding: 10px;
+    }
+
+    .timeline-item,
+    .entity-item,
+    .edge-item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 6px;
+      padding: 9px;
+      margin-bottom: 8px;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .timeline-item:hover,
+    .entity-item:hover,
+    .edge-item:hover,
+    .selected {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      color: var(--muted);
+      background: #f8fafc;
+      font-size: 12px;
+    }
+
+    .lane {
+      border-left: 4px solid var(--blue);
+      padding-left: 8px;
+      margin-bottom: 14px;
+    }
+
+    .lane h3 {
+      font-size: 13px;
+      margin: 0 0 8px;
+      color: #334155;
+    }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .subpanel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      min-height: 220px;
+      background: #fff;
+    }
+
+    .subpanel h3 {
+      margin: 0;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfdff;
+      font-size: 13px;
+    }
+
+    .entity-type {
+      font-weight: 700;
+      color: var(--purple);
+    }
+
+    .edge-parent {
+      border-left: 4px solid var(--green);
+    }
+
+    .edge-relation {
+      border-left: 4px solid var(--orange);
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .concept {
+      color: #334155;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      margin-bottom: 10px;
+    }
+
+    .ordered-list-title {
+      margin: 2px 0 10px;
+      font-weight: 700;
+      color: #334155;
+    }
+
+    pre {
+      margin: 0;
+      padding: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 240px;
+      border-radius: 0 0 8px 8px;
+      font-size: 12px;
+    }
+
+    .detail-body {
+      padding: 12px;
+      overflow: auto;
+    }
+
+    .detail-block {
+      margin-bottom: 14px;
+    }
+
+    .detail-block h3 {
+      margin: 0 0 6px;
+      font-size: 13px;
+    }
+
+    @media (max-width: 1200px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>wzg.scene.v1 MVP Viewer</h1>
+    <div class="summary" id="summary">loading world-state.json...</div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Timeline / Lane</h2>
+      <p class="section-note">Timeline 看“先后顺序”；Lane 看“发生在哪一层”。这里先按 tick/event_id 全局排序，再按 namespace 分组。</p>
+      <div class="scroll" id="timeline"></div>
+    </section>
+
+    <section>
+      <h2>ECS World</h2>
+      <p class="section-note">Event 通过 effects 改变世界；Entity 是对象，Component 是对象状态，Edge 表示对象之间的关系。</p>
+      <div class="scroll">
+        <div class="concept">
+          <strong>读法：</strong>
+          先点左侧事件理解“发生了什么”，再点中间实体看“世界状态如何变化”。
+          parent edge 是包含关系，relation edge 是引用、使用、指向、产出等关系。
+        </div>
+        <div class="grid2">
+          <div class="subpanel">
+            <h3>Entity List</h3>
+            <div class="scroll" id="entities"></div>
+          </div>
+          <div class="subpanel">
+            <h3>Scene Graph: parent edges</h3>
+            <div class="scroll" id="parentEdges"></div>
+          </div>
+        </div>
+        <div class="subpanel" style="margin-top: 12px;">
+          <h3>Relation Graph</h3>
+          <div class="scroll" id="relationEdges"></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Detail</h2>
+      <p class="section-note">默认重点看 meaning 和 runtime_values；source 是调试用，帮助反查源码位置。</p>
+      <div class="detail-body" id="detail">
+        <p class="muted">Click an event, entity, or edge.</p>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      world: null,
+      selectedKind: null,
+      selectedId: null,
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function fmt(value) {
+      return JSON.stringify(value, null, 2);
+    }
+
+    function labelForEntity(entity) {
+      return entity.label || entity.entity_id;
+    }
+
+    function setSelected(kind, id) {
+      state.selectedKind = kind;
+      state.selectedId = id;
+      renderAll();
+    }
+
+    function renderSummary() {
+      const summary = state.world.summary || {};
+      $("summary").innerHTML = [
+        `events ${summary.event_count || 0}`,
+        `entities ${summary.entity_count || 0}`,
+        `edges ${summary.edge_count || 0}`,
+        `lanes ${summary.lane_count || 0}`,
+        `markers ${summary.marker_count || 0}`,
+      ].map((item) => `<span>${item}</span>`).join("");
+    }
+
+    function renderTimeline() {
+      const lanes = state.world.lanes || {};
+      const eventById = new Map(state.world.events.map((event) => [event.event_id, event]));
+      const orderedEvents = [...state.world.events]
+        .sort((a, b) => a.tick - b.tick || a.event_id - b.event_id);
+
+      const orderedHtml = orderedEvents.map((event) => `
+        <button class="timeline-item ${state.selectedKind === "event" && state.selectedId === event.event_id ? "selected" : ""}"
+                onclick="setSelected('event', ${event.event_id})">
+          <strong>${event.tick}. #${event.event_id} ${event.event_name}</strong>
+          <div class="muted">${event.meaning}</div>
+          <div class="pill-row">
+            <span class="pill">${event.namespace}</span>
+            <span class="pill">${event.phase}</span>
+            <span class="pill">${event.action}</span>
+          </div>
+        </button>
+      `).join("");
+
+      const laneHtml = Object.keys(lanes).sort().map((lane) => {
+        const events = lanes[lane]
+          .map((eventId) => eventById.get(eventId))
+          .filter(Boolean)
+          .sort((a, b) => a.tick - b.tick || a.event_id - b.event_id);
+        const items = events.map((event) => `
+          <button class="timeline-item ${state.selectedKind === "event" && state.selectedId === event.event_id ? "selected" : ""}"
+                  onclick="setSelected('event', ${event.event_id})">
+            <strong>#${event.event_id} ${event.event_name}</strong>
+            <div class="muted">${event.meaning}</div>
+            <div class="pill-row">
+              <span class="pill">tick ${event.tick}</span>
+              <span class="pill">${event.phase}</span>
+              <span class="pill">${event.action}</span>
+            </div>
+          </button>
+        `).join("");
+        return `<div class="lane"><h3>${lane}</h3>${items}</div>`;
+      }).join("");
+
+      $("timeline").innerHTML = `
+        <div class="concept">
+          <strong>Event：</strong>一条已经发生的事实。
+          <strong>Effect：</strong>这条事实如何改变 ECS 世界。
+        </div>
+        <div class="ordered-list-title">全局执行顺序</div>
+        ${orderedHtml}
+        <div class="ordered-list-title" style="margin-top: 18px;">按 Lane 分组</div>
+        ${laneHtml}
+      `;
+    }
+
+    function renderEntities() {
+      const entities = Object.values(state.world.entities || {})
+        .sort((a, b) => a.entity_type.localeCompare(b.entity_type) || a.entity_id.localeCompare(b.entity_id));
+      $("entities").innerHTML = entities.map((entity) => `
+        <button class="entity-item ${state.selectedKind === "entity" && state.selectedId === entity.entity_id ? "selected" : ""}"
+                onclick="setSelected('entity', '${entity.entity_id.replaceAll("'", "\\'")}')">
+          <div><span class="entity-type">${entity.entity_type}</span> ${labelForEntity(entity)}</div>
+          <div class="muted">${entity.entity_id}</div>
+          <div class="pill-row">
+            ${Object.keys(entity.components || {}).map((name) => `<span class="pill">${name}</span>`).join("")}
+          </div>
+        </button>
+      `).join("");
+    }
+
+    function edgeHtml(edge) {
+      const cls = edge.edge_type === "parent" ? "edge-parent" : "edge-relation";
+      return `
+        <button class="edge-item ${cls} ${state.selectedKind === "edge" && state.selectedId === edge.edge_id ? "selected" : ""}"
+                onclick="setSelected('edge', '${edge.edge_id.replaceAll("'", "\\'")}')">
+          <strong>${edge.label || edge.edge_type}</strong>
+          <div class="muted">${edge.from} -> ${edge.to}</div>
+          <div class="pill-row">
+            <span class="pill">${edge.edge_type}</span>
+            <span class="pill">event ${edge.created_by_event_id}</span>
+          </div>
+        </button>
+      `;
+    }
+
+    function renderEdges() {
+      const edges = Object.values(state.world.edges || {});
+      $("parentEdges").innerHTML = edges
+        .filter((edge) => edge.edge_type === "parent")
+        .map(edgeHtml)
+        .join("");
+      $("relationEdges").innerHTML = edges
+        .filter((edge) => edge.edge_type !== "parent")
+        .map(edgeHtml)
+        .join("");
+    }
+
+    function renderDetail() {
+      if (!state.selectedKind) {
+        $("detail").innerHTML = `
+          <div class="concept">
+            <strong>Entity</strong> 是世界里的对象，比如 Query、BTreePage、Record。
+            <br />
+            <strong>Component</strong> 是对象当前状态，比如 RecordIdentity、MvccVisibility。
+            <br />
+            <strong>Edge</strong> 是对象关系，parent 表示归属，relation 表示运行时引用。
+          </div>
+          <p class="muted">Click an event, entity, or edge.</p>
+        `;
+        return;
+      }
+
+      if (state.selectedKind === "event") {
+        const event = state.world.events.find((item) => item.event_id === state.selectedId);
+        $("detail").innerHTML = `
+          <div class="detail-block">
+            <h3>Event #${event.event_id}</h3>
+            <p><strong>${event.event_name}</strong></p>
+            <p>${event.meaning}</p>
+            <p class="muted">这条事件是事实记录；真正修改前端世界的是它在 adapter 中应用过的 effects。</p>
+            <div class="pill-row">
+              <span class="pill">${event.namespace}</span>
+              <span class="pill">${event.phase}</span>
+              <span class="pill">${event.action}</span>
+            </div>
+          </div>
+          <div class="detail-block"><h3>runtime_values</h3><pre>${fmt(event.runtime_values)}</pre></div>
+          <div class="detail-block"><h3>source debug</h3><pre>${fmt(event.source)}</pre></div>
+          <div class="detail-block"><h3>full event</h3><pre>${fmt(event)}</pre></div>
+        `;
+        return;
+      }
+
+      if (state.selectedKind === "entity") {
+        const entity = state.world.entities[state.selectedId];
+        $("detail").innerHTML = `
+          <div class="detail-block">
+            <h3>${entity.entity_type}: ${labelForEntity(entity)}</h3>
+            <p class="muted">${entity.entity_id}</p>
+            <p class="muted">这个实体由事件流创建，components 是 replay 到当前 tick 后留下的状态。</p>
+          </div>
+          <div class="detail-block"><h3>components</h3><pre>${fmt(entity.components || {})}</pre></div>
+          <div class="detail-block"><h3>entity</h3><pre>${fmt(entity)}</pre></div>
+        `;
+        return;
+      }
+
+      if (state.selectedKind === "edge") {
+        const edge = state.world.edges[state.selectedId];
+        $("detail").innerHTML = `
+          <div class="detail-block">
+            <h3>${edge.edge_type} edge</h3>
+            <p><strong>${edge.label}</strong></p>
+            <p class="muted">${edge.from} -> ${edge.to}</p>
+            <p class="muted">${edge.edge_type === "parent" ? "parent edge 表示场景树里的包含关系。" : "relation edge 表示运行时引用、使用、指向或产出关系。"}</p>
+          </div>
+          <pre>${fmt(edge)}</pre>
+        `;
+      }
+    }
+
+    function renderAll() {
+      renderSummary();
+      renderTimeline();
+      renderEntities();
+      renderEdges();
+      renderDetail();
+    }
+
+    async function boot() {
+      try {
+        const response = await fetch("world-state.json", {cache: "no-store"});
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        state.world = await response.json();
+        renderAll();
+      } catch (error) {
+        $("summary").textContent = "world-state.json not loaded";
+        $("detail").innerHTML = `
+          <p><strong>Failed to load world-state.json</strong></p>
+          <p class="muted">${String(error)}</p>
+          <pre>python3 wzg-local-doc/scene-v1/tools/replay_scene.py \\
+  wzg-local-doc/scene-v1/samples/select-secondary-index.scene.jsonl \\
+  wzg-local-doc/scene-v1/viewer/world-state.json
+
+python3 -m http.server 8088 -d wzg-local-doc/scene-v1/viewer</pre>
+        `;
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>
