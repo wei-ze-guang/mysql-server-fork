@@ -1,0 +1,163 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="MySQL优化器执行流程" id="lZoqpsWwRJv58z1c85vo">
+    <mxGraphModel dx="10427" dy="5027" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="2600" pageHeight="5200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#111827;strokeColor=#111827;fontColor=#ffffff;fontSize=22;fontStyle=1;align=center;verticalAlign=middle;spacing=12;" value="MySQL 优化器如何把解析后的查询块转换为执行计划&#xa;围绕一个具体 SQL 展示：对象是什么、为什么分析、分析后变成什么" vertex="1">
+          <mxGeometry height="95" width="2160" x="120" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="sql_card" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#64748b;fontColor=#0f172a;fontSize=14;align=left;verticalAlign=middle;spacing=12;" value="示例 SQL 和假设索引&#xa;SQL：SELECT u.id, u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age &gt; 18 AND o.status = &#39;PAID&#39; ORDER BY o.created_at DESC LIMIT 10;&#xa;users：PRIMARY(id)，idx_age(age)&#xa;orders：PRIMARY(id)，idx_user_status(user_id, status)，idx_created_at(created_at)&#xa;本图用示例统计信息讲清优化器思路，不代表真实库上的唯一结果。" vertex="1">
+          <mxGeometry height="155" width="2160" x="120" y="165" as="geometry" />
+        </mxCell>
+        <mxCell id="band_input" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e0f2fe;strokeColor=#0284c7;fontColor=#0c4a6e;fontSize=18;fontStyle=1;align=left;verticalAlign=top;spacing=12;" value="阶段一：优化器入口，parser / resolver 已经把 SQL 变成 Query_block" vertex="1">
+          <mxGeometry height="540" width="2160" x="120" y="360" as="geometry" />
+        </mxCell>
+        <mxCell id="input_qb" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#0284c7;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="阶段：创建 JOIN 优化上下文&#xa;具体对象：Query_block 已包含 Table_ref、Item 条件树、ORDER、LIMIT&#xa;为什么：优化器不直接处理原始 SQL 字符串，需要在结构化对象上估算路径和成本。&#xa;输入：Query_block，THD，finalize_access_paths&#xa;输出：Query_block::join 指向新建 JOIN；后续所有候选计划挂在 JOIN 上。&#xa;源码：sql/sql_select.cc :: Query_block::optimize(THD *thd, bool finalize_access_paths)&#xa;数据结构：Query_block、JOIN、THD" vertex="1">
+          <mxGeometry height="200" width="680" x="180" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="input_tables" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f9ff;strokeColor=#0284c7;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="对象快照：Table_ref 表列表&#xa;users u：候选索引 PRIMARY(id)、idx_age(age)&#xa;orders o：候选索引 PRIMARY(id)、idx_user_status(user_id,status)、idx_created_at(created_at)&#xa;为什么：后面每个表都要生成访问路径，join 顺序也围绕这些 Table_ref 排列。&#xa;输出：JOIN_TAB 数组可表示每张表的候选访问方式。&#xa;源码：sql/sql_optimizer.cc :: JOIN::make_join_plan()&#xa;数据结构：Table_ref、JOIN_TAB、TABLE、KEY" vertex="1">
+          <mxGeometry height="200" width="570" x="940" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="input_items" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f9ff;strokeColor=#0284c7;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="对象快照：WHERE / ON / ORDER / LIMIT&#xa;WHERE Item：u.age &gt; 18 AND o.status = &#39;PAID&#39;&#xa;ON Item：u.id = o.user_id&#xa;ORDER Item：o.created_at DESC&#xa;LIMIT：10&#xa;为什么：这些对象会分别影响过滤行数、索引选择、join 顺序、排序成本。&#xa;输出：可拆分条件、排序需求、行数上限。&#xa;源码：sql/sql_optimizer.cc :: JOIN::optimize(bool finalize_access_paths)&#xa;数据结构：Item、ORDER、JOIN::where_cond、JOIN::order" vertex="1">
+          <mxGeometry height="220" width="640" x="1580" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="input_transform" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#bae6fd;strokeColor=#0284c7;fontColor=#0c4a6e;fontSize=13;fontStyle=1;align=left;spacing=10;" value="变化结果：SQL 字符串不再是主角&#xa;进入优化器后的画面：&#xa;Query_block&#xa;  Table_ref：users u、orders o&#xa;  Item 条件树：三个可分析谓词&#xa;  ORDER：o.created_at DESC&#xa;  LIMIT：10&#xa;为什么：后续不是解释文字，而是在这些对象上做候选计划搜索。" vertex="1">
+          <mxGeometry height="150" width="1360" x="520" y="700" as="geometry" />
+        </mxCell>
+        <mxCell id="band_cond" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ecfdf5;strokeColor=#16a34a;fontColor=#14532d;fontSize=18;fontStyle=1;align=left;verticalAlign=top;spacing=12;" value="阶段二：拆条件，找出单表过滤、连接条件、可使用索引的 keyuse" vertex="1">
+          <mxGeometry height="680" width="2160" x="120" y="950" as="geometry" />
+        </mxCell>
+        <mxCell id="cond_why" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#16a34a;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="阶段：WHERE / ON 条件拆分&#xa;具体分析对象：u.age &gt; 18、o.status = &#39;PAID&#39;、u.id = o.user_id&#xa;为什么：一个完整 WHERE 条件不能直接决定计划，必须拆成“能过滤哪张表”和“能连接哪两张表”。&#xa;输入：JOIN::where_cond、join_tab[i].join_cond()&#xa;输出：Key_field、SARGABLE_PARAM、Key_use_array，为 range/ref access 提供依据。&#xa;源码：sql/sql_optimizer.cc :: update_ref_and_keys(THD *thd, Key_use_array *keyuse, JOIN_TAB *join_tab, uint tables, Item *cond, table_map normal_tables, Query_block *query_block, SARGABLE_PARAM **sargables)&#xa;数据结构：Item、Key_field、SARGABLE_PARAM、KEYUSE" vertex="1">
+          <mxGeometry height="165" width="2040" x="180" y="1025" as="geometry" />
+        </mxCell>
+        <mxCell id="cond_users" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0fdf4;strokeColor=#16a34a;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="条件卡片：u.age &gt; 18&#xa;分析对象：users.age 与 idx_age(age)&#xa;为什么：age 是 idx_age 的首列，可以尝试 range scan，减少 users 扫描行数。&#xa;输入：Item_func_gt(u.age, 18)，TABLE users，KEY idx_age&#xa;输出：users.idx_age range 候选；rows estimate 会低于全表扫描的候选值。&#xa;源码：sql/sql_optimizer.cc :: JOIN::estimate_rowcount()&#xa;数据结构：AccessPath、range scan、JOIN_TAB::found_records" vertex="1">
+          <mxGeometry height="180" width="640" x="180" y="1235" as="geometry" />
+        </mxCell>
+        <mxCell id="cond_orders" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0fdf4;strokeColor=#16a34a;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="条件卡片：o.status = &#39;PAID&#39;&#xa;分析对象：orders.status 与 idx_user_status(user_id,status)&#xa;为什么：status 是联合索引第二列，orders 先驱动时无法只靠 status 精确使用此前缀；如果 users 先驱动，user_id 来自 u.id，status 可和 user_id 一起缩小 orders 范围。&#xa;输入：Item_func_equal(o.status, &#39;PAID&#39;)，TABLE orders，KEY idx_user_status&#xa;输出：orders 的过滤条件；在 users -&gt; orders 顺序里成为 ref access 的一部分。&#xa;源码：sql/sql_optimizer.cc :: update_ref_and_keys(THD *thd, Key_use_array *keyuse, JOIN_TAB *join_tab, uint tables, Item *cond, table_map normal_tables, Query_block *query_block, SARGABLE_PARAM **sargables)&#xa;数据结构：KEYUSE、Key_field、JOIN_TAB" vertex="1">
+          <mxGeometry height="220" width="640" x="880" y="1235" as="geometry" />
+        </mxCell>
+        <mxCell id="cond_join" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0fdf4;strokeColor=#16a34a;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="条件卡片：u.id = o.user_id&#xa;分析对象：users.PRIMARY(id) 与 orders.idx_user_status(user_id,status)&#xa;为什么：这是两表相等连接，决定内表能否用外表当前行的值做 ref access。&#xa;输入：Item_func_equal(u.id, o.user_id)，Table_ref users u，Table_ref orders o&#xa;输出：join keyuse；当 users 在外层时，orders 可以用 user_id 前缀定位。&#xa;源码：sql/sql_optimizer.cc :: add_key_fields(THD *thd, JOIN *join, Key_field **key_fields, uint *and_level, Item *cond, table_map usable_tables, SARGABLE_PARAM **sargables)&#xa;源码：sql/sql_optimizer.cc :: add_key_part(keyuse, field)&#xa;数据结构：KEYUSE、table_map、JOIN_TAB" vertex="1">
+          <mxGeometry height="200" width="640" x="1580" y="1235" as="geometry" />
+        </mxCell>
+        <mxCell id="cond_out" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#bbf7d0;strokeColor=#16a34a;fontColor=#14532d;fontSize=13;fontStyle=1;align=left;spacing=10;" value="变化结果：条件树变成可用于计划搜索的信号&#xa;u.age &gt; 18 → users.idx_age range 候选&#xa;o.status = &#39;PAID&#39; → orders 过滤条件，可能结合 user_id 使用联合索引&#xa;u.id = o.user_id → join keyuse，支撑 orders ref access&#xa;为什么：join order 和 access path 需要这些信号计算 rows 与 cost。" vertex="1">
+          <mxGeometry height="105" width="1360" x="520" y="1490" as="geometry" />
+        </mxCell>
+        <mxCell id="band_access" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#7c2d12;fontSize=18;fontStyle=1;align=left;verticalAlign=top;spacing=12;" value="阶段三：为每张表生成候选访问路径，并估算 rows / cost" vertex="1">
+          <mxGeometry height="730" width="2160" x="120" y="1680" as="geometry" />
+        </mxCell>
+        <mxCell id="access_users_scan" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="users 候选 1：全表扫描&#xa;分析对象：TABLE users 的全部记录&#xa;为什么：任何表都要有兜底路径，哪怕没有可用索引也能执行。&#xa;输入：TABLE users，统计信息 records，table_scan_cost()&#xa;输出：AccessPath(table scan)，rows≈users 总行数，cost≈扫描整表成本。&#xa;源码：sql/sql_optimizer.cc :: JOIN::estimate_rowcount()&#xa;数据结构：JOIN_TAB::records、Cost_estimate、AccessPath" vertex="1">
+          <mxGeometry height="185" width="500" x="180" y="1755" as="geometry" />
+        </mxCell>
+        <mxCell id="access_users_idx" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#ea580c;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="users 候选 2：idx_age range scan&#xa;分析对象：idx_age(age) 与条件 u.age &gt; 18&#xa;为什么：索引范围扫描只访问 age 大于 18 的区间，通常比扫完整 users 少。&#xa;输入：KEY idx_age，range predicate age &gt; 18&#xa;输出：AccessPath(range)，rows≈满足 age 条件的用户数，cost≈索引范围成本加回表成本。&#xa;源码：sql/sql_optimizer.cc :: JOIN::estimate_rowcount()&#xa;数据结构：range_scan、AccessPath、JOIN_TAB" vertex="1">
+          <mxGeometry height="200" width="500" x="730" y="1755" as="geometry" />
+        </mxCell>
+        <mxCell id="access_orders_scan" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ea580c;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="orders 候选 1：全表扫描&#xa;分析对象：TABLE orders 的全部记录&#xa;为什么：如果索引代价更高，优化器仍可能选择顺序扫描。&#xa;输入：TABLE orders，统计信息 records，table_scan_cost()&#xa;输出：AccessPath(table scan)，rows≈orders 总行数，cost≈扫描整表成本。&#xa;源码：sql/sql_optimizer.cc :: JOIN::estimate_rowcount()&#xa;数据结构：JOIN_TAB::records、Cost_estimate、AccessPath" vertex="1">
+          <mxGeometry height="185" width="440" x="1280" y="1755" as="geometry" />
+        </mxCell>
+        <mxCell id="access_orders_ref" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#ea580c;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="orders 候选 2：idx_user_status ref access&#xa;分析对象：idx_user_status(user_id,status)，连接值 u.id，过滤值 &#39;PAID&#39;&#xa;为什么：当 users 先产出一行，orders 可以用 user_id 定位，再用 status 缩小匹配订单。&#xa;输入：KEYUSE(user_id = u.id)、KEYUSE(status = &#39;PAID&#39;)&#xa;输出：AccessPath(ref/range)，rows≈每个用户的 PAID 订单数，cost≈外层行数乘单次索引查找成本。&#xa;源码：sql/sql_planner.cc :: best_access_path() 被 join order 搜索调用&#xa;数据结构：KEYUSE、POSITION、AccessPath" vertex="1">
+          <mxGeometry height="220" width="450" x="1770" y="1755" as="geometry" />
+        </mxCell>
+        <mxCell id="access_orders_order" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#ea580c;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="orders 候选 3：idx_created_at 顺序扫描&#xa;分析对象：idx_created_at(created_at) 与 ORDER BY o.created_at DESC&#xa;为什么：如果从 orders 开始并按 created_at 逆序读取，可能减少 filesort；但还要过滤 status 并连接 users。&#xa;输入：KEY idx_created_at，ORDER o.created_at DESC，LIMIT 10&#xa;输出：AccessPath(index order scan) 候选；排序成本可能下降，过滤和 join 成本可能上升。&#xa;源码：sql/sql_optimizer.cc :: JOIN::test_skip_sort()&#xa;数据结构：ORDER、AccessPath、JOIN_TAB::range_scan()" vertex="1">
+          <mxGeometry height="175" width="940" x="1280" y="2025" as="geometry" />
+        </mxCell>
+        <mxCell id="access_out" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fed7aa;strokeColor=#ea580c;fontColor=#7c2d12;fontSize=13;fontStyle=1;align=left;spacing=10;" value="变化结果：每张表不再只有“读表”一种做法&#xa;users：table scan 与 idx_age range 进入候选集合&#xa;orders：table scan、idx_user_status ref、idx_created_at order scan 进入候选集合&#xa;为什么：join 顺序搜索不是凭感觉选表顺序，而是组合这些候选路径并计算前缀成本。&#xa;源码：sql/sql_optimizer.cc :: JOIN::make_join_plan()&#xa;数据结构：JOIN_TAB、POSITION、AccessPath、Key_use_array" vertex="1">
+          <mxGeometry height="120" width="1360" x="520" y="2250" as="geometry" />
+        </mxCell>
+        <mxCell id="band_join" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef9c3;strokeColor=#ca8a04;fontColor=#713f12;fontSize=18;fontStyle=1;align=left;verticalAlign=top;spacing=12;" value="阶段四：比较 join 顺序候选，选择估算成本更低的计划前缀" vertex="1">
+          <mxGeometry height="820" width="2160" x="120" y="2460" as="geometry" />
+        </mxCell>
+        <mxCell id="join_intro" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ca8a04;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="阶段：join order 搜索&#xa;具体分析对象：users 与 orders 两张表的排列顺序，以及每个顺序下的访问路径组合。&#xa;为什么：同样的 SQL，先读哪张表会改变内表能否用索引，也会改变中间结果行数。&#xa;输入：best_ref、KEYUSE、表统计信息、候选 access path&#xa;输出：best_positions、best_read、best_rowcount。&#xa;源码：sql/sql_planner.cc :: Optimize_table_order::choose_table_order()&#xa;数据结构：POSITION、JOIN_TAB、table_map" vertex="1">
+          <mxGeometry height="145" width="2040" x="180" y="2535" as="geometry" />
+        </mxCell>
+        <mxCell id="join_a" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fefce8;strokeColor=#ca8a04;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="候选 A：users 先驱动，orders 做内表&#xa;步骤 1：users 使用 idx_age range 找 age &gt; 18 的用户。&#xa;步骤 2：每个 users.id 驱动 orders.idx_user_status(user_id,status)。&#xa;为什么可能好：先过滤 users，再用连接键精确访问 orders，内表扫描范围小。&#xa;输入：users.idx_age range 候选，orders.idx_user_status ref 候选，KEYUSE(u.id = o.user_id)。&#xa;输出：join order 候选 A；示例估算 rows 较少，cost 较低；可能需要后续 filesort。&#xa;源码：sql/sql_planner.cc :: Optimize_table_order::best_extension_by_limited_search(table_map remaining_tables, uint idx, uint current_search_depth)" vertex="1">
+          <mxGeometry height="260" width="900" x="180" y="2730" as="geometry" />
+        </mxCell>
+        <mxCell id="join_b" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fefce8;strokeColor=#ca8a04;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="候选 B：orders 先驱动，users 做内表&#xa;步骤 1：orders 可考虑 idx_created_at 顺序读取，或扫描后过滤 status = &#39;PAID&#39;。&#xa;步骤 2：每个 orders.user_id 用 users.PRIMARY(id) 找用户，再检查 u.age &gt; 18。&#xa;为什么可能好：如果 PAID 订单很少，或者 ORDER BY 能直接利用 idx_created_at，排序成本可能降低。&#xa;输入：orders.idx_created_at order scan 候选，orders 过滤条件，users.PRIMARY ref 候选。&#xa;输出：join order 候选 B；示例估算排序成本低，但过滤和连接成本可能更高。&#xa;源码：sql/sql_planner.cc :: Optimize_table_order::greedy_search(table_map remaining_tables)" vertex="1">
+          <mxGeometry height="280" width="900" x="1320" y="2730" as="geometry" />
+        </mxCell>
+        <mxCell id="join_decision" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fef08a;strokeColor=#ca8a04;fontColor=#713f12;fontSize=12;align=center;spacing=8;" value="判断：哪个候选前缀 cost 更低？&#xa;分析对象：候选 A 的 prefix cost 与候选 B 的 prefix cost&#xa;为什么：优化器用统计信息估算，不读取所有真实行。&#xa;输入：best_read、best_rowcount、POSITION 数组&#xa;输出：示例选择候选 A：users -&gt; orders，因为 idx_age 先过滤后，orders 可用 user_id,status 联合索引。&#xa;源码：sql/sql_planner.cc :: Optimize_table_order::choose_table_order()" vertex="1">
+          <mxGeometry height="180" width="400" x="1000" y="3055" as="geometry" />
+        </mxCell>
+        <mxCell id="band_sort" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce7f3;strokeColor=#db2777;fontColor=#831843;fontSize=18;fontStyle=1;align=left;verticalAlign=top;spacing=12;" value="阶段五：ORDER BY / LIMIT 决定是否需要 filesort、临时表或利用索引顺序" vertex="1">
+          <mxGeometry height="640" width="2160" x="120" y="3330" as="geometry" />
+        </mxCell>
+        <mxCell id="sort_need" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#db2777;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="阶段：检查 ORDER BY 是否能跳过排序&#xa;分析对象：ORDER BY o.created_at DESC，当前示例 join order 为 users -&gt; orders&#xa;为什么：如果输出顺序已经符合 ORDER，就不需要 filesort；如果 join 过程打乱顺序，就要额外排序。&#xa;输入：best_ref[const_tables]、JOIN::order、m_select_limit=10&#xa;输出：示例判断为需要 filesort，因为 users 先驱动时结果不是天然按 o.created_at 排序。&#xa;源码：sql/sql_optimizer.cc :: JOIN::test_skip_sort()&#xa;数据结构：ORDER、JOIN_TAB、m_ordered_index_usage" vertex="1">
+          <mxGeometry height="210" width="920" x="180" y="3405" as="geometry" />
+        </mxCell>
+        <mxCell id="sort_branch" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdf2f8;strokeColor=#db2777;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="替代路径提醒：orders.idx_created_at&#xa;分析对象：如果 orders 先驱动并按 idx_created_at 逆序读取。&#xa;为什么：可能直接满足 ORDER BY，LIMIT 10 可以较早停止；但 status 过滤和 users 连接可能让扫描行数变大。&#xa;输入：idx_created_at、ORDER DESC、LIMIT 10、WHERE status = &#39;PAID&#39;&#xa;输出：成为候选 B 的优势项，但示例中整体 cost 没有胜过候选 A。&#xa;源码：sql/sql_optimizer.cc :: JOIN::test_skip_sort()&#xa;数据结构：AccessPath、ORDER、JOIN::m_select_limit" vertex="1">
+          <mxGeometry height="230" width="920" x="1300" y="3405" as="geometry" />
+        </mxCell>
+        <mxCell id="tmp_table" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdf2f8;strokeColor=#db2777;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="阶段：检查临时表需求&#xa;分析对象：当前 SELECT list、ORDER BY、GROUP BY、DISTINCT、窗口函数状态。&#xa;为什么：某些后处理必须先物化中间结果；本示例没有 GROUP BY、DISTINCT、窗口函数，主要关注 filesort 与 LIMIT。&#xa;输入：JOIN::fields、JOIN::order、JOIN::group_list、m_windows、m_select_limit&#xa;输出：示例不强调临时表；最终计划保留 sort 与 limit 信息。&#xa;源码：sql/sql_select.cc :: JOIN::make_tmp_tables_info()&#xa;数据结构：QEP_TAB、Temp_table_param、ORDER" vertex="1">
+          <mxGeometry height="180" width="1360" x="520" y="3705" as="geometry" />
+        </mxCell>
+        <mxCell id="band_plan" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#7c3aed;fontColor=#4c1d95;fontSize=18;fontStyle=1;align=left;verticalAlign=top;spacing=12;" value="阶段六：生成执行器可消费的计划，优化器到此仍然没有读取真实数据行" vertex="1">
+          <mxGeometry height="700" width="2160" x="120" y="4020" as="geometry" />
+        </mxCell>
+        <mxCell id="plan_shape" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#7c3aed;fontColor=#0f172a;fontSize=13;fontStyle=1;align=left;spacing=10;" value="最终计划画面：示例选择候选 A&#xa;Nested Loop Join&#xa;outer：users，access = idx_age range，condition = u.age &gt; 18&#xa;inner：orders，access = idx_user_status ref，key parts = user_id + status，condition = o.status = &#39;PAID&#39;&#xa;post step：filesort by o.created_at DESC&#xa;limit：10&#xa;为什么这样输出：它让执行器知道先读谁、怎么读、每层用哪个条件、哪里排序、何时停止。&#xa;注意：这是基于示例统计信息的讲解计划，真实 MySQL 会按真实统计信息、版本开关和成本模型选择。" vertex="1">
+          <mxGeometry height="285" width="980" x="180" y="4100" as="geometry" />
+        </mxCell>
+        <mxCell id="plan_source" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f3ff;strokeColor=#7c3aed;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="源码输出位置&#xa;阶段：把 planner 结果变成执行器结构&#xa;输入：best_positions、best_ref、QEP_TAB、m_root_access_path、filesort info、limit info&#xa;输出：AccessPath 根节点、QEP_TAB、JOIN::m_root_access_path、PLAN_READY。&#xa;源码：sql/sql_optimizer.cc :: JOIN::get_best_combination()&#xa;源码：sql/sql_executor.cc :: JOIN::create_access_paths()&#xa;源码：sql/sql_optimizer.cc :: JOIN::set_plan_state(PLAN_READY)&#xa;数据结构：AccessPath、JOIN_TAB、QEP_TAB、POSITION" vertex="1">
+          <mxGeometry height="240" width="980" x="1240" y="4100" as="geometry" />
+        </mxCell>
+        <mxCell id="iterator" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f3ff;strokeColor=#7c3aed;fontColor=#0f172a;fontSize=12;align=left;spacing=8;" value="交给执行器之前的最后一跳&#xa;阶段：Query_expression 创建 iterator&#xa;为什么：执行器通过 iterator 拉取行；优化器只准备计划和成本信息。&#xa;输入：m_root_access_path、JOIN、eligible_for_batch_mode=true&#xa;输出：m_root_iterator；真正读取 users 和 orders 数据发生在执行阶段。&#xa;源码：sql/sql_union.cc :: Query_expression::optimize(THD *thd, TABLE *materialize_destination, bool create_iterators, bool finalize_access_paths)&#xa;源码：sql/sql_union.cc :: CreateIteratorFromAccessPath(thd, m_root_access_path, join, true)&#xa;数据结构：AccessPath、RowIterator、JOIN" vertex="1">
+          <mxGeometry height="190" width="1360" x="520" y="4460" as="geometry" />
+        </mxCell>
+        <mxCell id="note" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fafc;strokeColor=#64748b;fontColor=#0f172a;fontSize=13;align=left;spacing=10;" value="本图没有展开的内部细节&#xa;1. hypergraph optimizer 的子图动态规划和 AccessPath 候选枚举：原因是本图用具体 SQL 解释对象变化，完整枚举会遮住主线。涉及源码：sql/join_optimizer/join_optimizer.cc :: FindBestQueryPlan(THD *thd, Query_block *query_block)。&#xa;2. range optimizer 的每个区间构造细节：原因是这里重点说明 u.age &gt; 18 如何成为 idx_age range 候选，不展开区间树内部实现。&#xa;3. InnoDB 真实页读取和索引查找：原因是本图限定 Server 层优化器，执行器和存储引擎在优化器之后工作。" vertex="1">
+          <mxGeometry height="155" width="2040" x="180" y="4770" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="sql_card" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#0284c7;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="input_qb" value="结构化输入">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="input_qb" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#0284c7;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="input_tables" value="表对象">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="input_tables" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#0284c7;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="input_items" value="条件对象">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="input_transform" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#16a34a;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="cond_why" value="进入条件拆分">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="cond_why" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#16a34a;endArrow=block;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" target="cond_users" value="拆出 users 条件">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="cond_why" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#16a34a;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="cond_orders" value="拆出 orders 条件">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="cond_why" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#16a34a;endArrow=block;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" target="cond_join" value="拆出连接条件">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="cond_out" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ea580c;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="access_users_idx" value="keyuse 与 range 信号">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="access_out" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ca8a04;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="join_intro" value="候选路径集合">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="join_intro" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ca8a04;endArrow=block;exitX=0.3;exitY=1;entryX=0.5;entryY=0;" target="join_a" value="候选 A">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="join_intro" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ca8a04;endArrow=block;exitX=0.7;exitY=1;entryX=0.5;entryY=0;" target="join_b" value="候选 B">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="join_a" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ca8a04;endArrow=block;exitX=1;exitY=0.7;entryX=0;entryY=0.35;" target="join_decision" value="比较 cost">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="1" source="join_b" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ca8a04;endArrow=block;exitX=0;exitY=0.7;entryX=1;entryY=0.35;" target="join_decision" value="比较 cost">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" edge="1" parent="1" source="join_decision" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#db2777;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="sort_need" value="选定示例 join order">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" parent="1" source="tmp_table" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7c3aed;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="plan_shape" value="排序与 LIMIT 信息进入计划">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" edge="1" parent="1" source="plan_shape" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7c3aed;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="plan_source" value="生成 AccessPath / QEP_TAB">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" edge="1" parent="1" source="plan_source" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7c3aed;endArrow=block;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="iterator" value="创建 iterator">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

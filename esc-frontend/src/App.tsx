@@ -1,8 +1,9 @@
-import { Boxes, FlaskConical } from "lucide-react"
+import { Boxes, FlaskConical, Workflow } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
+import { ParserEcsDemoPage } from "@/demos/parser-ecs-demo"
 import { ComponentLab } from "@/pages/ComponentLab"
 
 function HomePage() {
@@ -26,7 +27,7 @@ function HomePage() {
 
         <Separator />
 
-        <section className="grid gap-4 md:grid-cols-2">
+        <section className="grid gap-4 md:grid-cols-3">
           <Card>
             <CardHeader>
               <CardTitle>组件实验室</CardTitle>
@@ -37,6 +38,21 @@ function HomePage() {
                 <a href="/component-lab">
                   <FlaskConical data-icon="inline-start" aria-hidden="true" />
                   打开测试页面
+                </a>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Parser ECS 小演示</CardTitle>
+              <CardDescription>用一条 SQL 看事件如何回放成 ECS world。</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button asChild variant="secondary">
+                <a href="/demos/parser-ecs">
+                  <Workflow data-icon="inline-start" aria-hidden="true" />
+                  打开小演示
                 </a>
               </Button>
             </CardContent>
@@ -63,6 +79,10 @@ function App() {
   // 先用轻量路径判断，避免为了一个测试页过早引入完整路由方案。
   if (pathname === "/component-lab") {
     return <ComponentLab />
+  }
+
+  if (pathname === "/demos/parser-ecs") {
+    return <ParserEcsDemoPage />
   }
 
   return <HomePage />
